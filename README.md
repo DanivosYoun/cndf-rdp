@@ -55,6 +55,8 @@ The bridge currently provides:
 - `RDPSecureString` for vault-supplied transient passwords
 - reconnect API using retained connection options
 - session statistics for frames, clipboard, file transfer, and activity timestamps
+- serialized `RDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
+- hardened FreeRDP teardown that waits for the event-loop thread before freeing native session state
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
@@ -124,7 +126,8 @@ counts, file bytes, session start, and last activity.
 Threading contract:
 
 - `RDPConnectionView.connect(_:)`, `disconnect()`, and view mutation should be called from the main thread.
-- `RDPSession.connect(_:)` and `disconnect()` may be called by the owner that created the session.
+- `RDPSession.connect(_:)`, `disconnect()`, `reconnect()`, input dispatch, resize, clipboard polling, and file offering are internally serialized around the FreeRDP bridge.
+- `RDPSession.disconnect()` waits up to five seconds for the FreeRDP event-loop thread to exit before returning an error; `RDPSession` destruction waits until native teardown is complete before freeing bridge state.
 - `RDPSessionDelegate` callbacks are delivered from the FreeRDP worker thread unless explicitly noted by the view wrapper.
 - `RDPConnectionViewDelegate` frame display is marshalled to the main thread by `RDPConnectionView`; other callbacks should dispatch to the main thread before mutating UI.
 
@@ -156,6 +159,7 @@ Verified against a Windows RDP test host on 2026-05-21:
 - WLog debug/filter options were applied during live connection testing
 - per-session log file creation was verified at `/tmp/rdp-session-followup.log`
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
+- session teardown hardening was verified with live connect/disconnect and no new macOS crash report
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
 - `swift test` passes all package tests
 
