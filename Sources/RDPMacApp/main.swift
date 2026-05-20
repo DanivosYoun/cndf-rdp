@@ -137,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
         DispatchQueue.global(qos: .utility).async { [weak self, weak session] in
             guard let self, let session else { return }
             let testURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("rdp-mac-autotest-file-copy.txt")
+                .appendingPathComponent("한글테스트.txt".decomposedStringWithCanonicalMapping)
             do {
                 try "RDP Mac automated file copy test\n".write(to: testURL, atomically: true, encoding: .utf8)
                 Thread.sleep(forTimeInterval: 1.0)

@@ -23,7 +23,8 @@ public enum WindowsFileGroupDescriptor {
             let high = UInt64(data.readUInt32LE(at: offset + fileSizeHighOffset))
             let low = UInt64(data.readUInt32LE(at: offset + fileSizeLowOffset))
             let nameData = data.subdata(in: (offset + fileNameOffset)..<(offset + fileNameOffset + fileNameByteLength))
-            let fileName = decodeUTF16LECString(nameData) ?? "remote-file-\(index)"
+            let decodedFileName = decodeUTF16LECString(nameData) ?? "remote-file-\(index)"
+            let fileName = FileNameNormalization.normalizeForTransfer(decodedFileName)
             return RDPFileListEntry(
                 fileName: fileName,
                 byteCount: (high << 32) | low,

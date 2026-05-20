@@ -56,7 +56,7 @@ public final class FileTransferStaging {
             return StagedFile(
                 sourceURL: sourceURL,
                 stagedURL: sourceURL,
-                fileName: sourceURL.lastPathComponent,
+                fileName: FileNameNormalization.normalizeForTransfer(sourceURL.lastPathComponent),
                 byteCount: UInt64(size)
             )
         }
@@ -68,7 +68,8 @@ public final class FileTransferStaging {
     }
 
     private func availableStagedURL(for fileName: String) -> URL {
-        let safeName = fileName.isEmpty ? "untitled" : fileName
+        let normalizedName = FileNameNormalization.normalizeForTransfer(fileName)
+        let safeName = normalizedName.isEmpty ? "untitled" : normalizedName
         let baseURL = rootURL.appendingPathComponent(safeName, isDirectory: false)
         guard fileManager.fileExists(atPath: baseURL.path) else {
             return baseURL

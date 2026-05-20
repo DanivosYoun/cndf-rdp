@@ -45,6 +45,7 @@ The bridge currently provides:
 - Mac-to-RDP file paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
 - RDP-to-Mac file paste materialization using remote range requests and local staged file URLs
 - Finder file drag/drop into the RDP surface with automatic remote paste trigger
+- NFC filename normalization at Mac/Windows file-transfer boundaries for Korean filenames
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
@@ -75,6 +76,7 @@ Verified against a Windows RDP test host on 2026-05-21:
 - dynamic resize sent through DisplayControl after the remote desktop connected
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
 - RDP-to-Mac copy-back materialized the remote file to the macOS pasteboard
+- decomposed Korean filenames are normalized to NFC before being advertised to Windows
 - `swift test` passes all package tests
 
 Manual checklist for future changes:
@@ -85,6 +87,7 @@ Manual checklist for future changes:
 4. Select a remote file in Explorer, copy it, then paste into Finder on macOS.
 5. Enable a redirected folder and confirm it appears in the remote session.
 6. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
+7. Copy or drag a Korean-named file and confirm the name stays composed on Windows.
 
 ## Verify
 

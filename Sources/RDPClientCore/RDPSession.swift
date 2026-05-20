@@ -261,9 +261,12 @@ public final class RDPSession {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.clipboardCoordinator?.receiveRemoteFiles(urls)
+                    let fileNames = urls
+                        .map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
+                        .joined(separator: ", ")
                     self.delegate?.rdpSession(
                         self,
-                        didLog: "Remote files materialized to local pasteboard: \(urls.map(\.lastPathComponent).joined(separator: ", "))."
+                        didLog: "Remote files materialized to local pasteboard: \(fileNames)."
                     )
                 }
             } catch {
