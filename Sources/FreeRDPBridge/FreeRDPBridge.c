@@ -1,0 +1,1154 @@
+#include "FreeRDPBridge.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(RDP_FREERDP_REAL)
+#include <freerdp/freerdp.h>
+#include <freerdp/client/cmdline.h>
+#include <freerdp/client/channels.h>
+#include <freerdp/client/cliprdr.h>
+#include <freerdp/client/disp.h>
+#include <freerdp/channels/channels.h>
+#include <freerdp/event.h>
+#include <freerdp/gdi/gdi.h>
+#include <freerdp/input.h>
+#include <freerdp/scancode.h>
+#include <freerdp/settings.h>
+#include <freerdp/settings_keys.h>
+#include <freerdp/utils/cliprdr_utils.h>
+#include <winpr/file.h>
+#include <winpr/shell.h>
+#include <winpr/string.h>
+#include <winpr/synch.h>
+#include <winpr/thread.h>
+#include <winpr/user.h>
+#endif
+
+#define RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW 0xC001
+#define RDP_BRIDGE_FORMAT_FILECONTENTS 0xC002
+
+struct RDPBridgeSession {
+    RDPBridgeCallbacks callbacks;
+    bool connected;
+#if defined(RDP_FREERDP_REAL)
+    freerdp *instance;
+    HANDLE thread;
+    volatile bool stop_requested;
+    uint32_t desktop_width;
+    uint32_t desktop_height;
+    double desktop_scale;
+    DispClientContext *disp;
+    CliprdrClientContext *cliprdr;
+    char *local_text;
+    size_t local_text_length;
+    RDPBridgeLocalFile *local_files;
+    size_t local_file_count;
+#endif
+};
+
+#if defined(RDP_FREERDP_REAL)
+typedef struct RDPBridgeContext {
+    rdpContext _p;
+    RDPBridgeSession *session;
+} RDPBridgeContext;
+#endif
+
+static void bridge_log(RDPBridgeSession *session, const char *message) {
+    if ((session != NULL) && (session->callbacks.log != NULL)) {
+        session->callbacks.log(message, session->callbacks.context);
+    }
+}
+
+static void bridge_logf(RDPBridgeSession *session, const char *format, ...) {
+    if ((session == NULL) || (session->callbacks.log == NULL)) {
+        return;
+    }
+
+    char message[256] = { 0 };
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    session->callbacks.log(message, session->callbacks.context);
+}
+
+RDPBridgeSession *rdp_bridge_session_create(const RDPBridgeCallbacks *callbacks) {
+    RDPBridgeSession *session = (RDPBridgeSession *)calloc(1, sizeof(RDPBridgeSession));
+    if (session == NULL) {
+        return NULL;
+    }
+
+    if (callbacks != NULL) {
+        session->callbacks = *callbacks;
+    }
+
+    return session;
+}
+
+void rdp_bridge_session_destroy(RDPBridgeSession *session) {
+    if (session == NULL) {
+        return;
+    }
+
+    rdp_bridge_disconnect(session);
+    free(session);
+}
+
+#if defined(RDP_FREERDP_REAL)
+static RDPBridgeSession *session_from_context(rdpContext *context) {
+    if (context == NULL) {
+        return NULL;
+    }
+    return ((RDPBridgeContext *)context)->session;
+}
+
+static BOOL bridge_begin_paint(rdpContext *context) {
+    if ((context == NULL) || (context->gdi == NULL) || (context->gdi->primary == NULL) ||
+        (context->gdi->primary->hdc == NULL) || (context->gdi->primary->hdc->hwnd == NULL) ||
+        (context->gdi->primary->hdc->hwnd->invalid == NULL)) {
+        return TRUE;
+    }
+    context->gdi->primary->hdc->hwnd->invalid->null = TRUE;
+    return TRUE;
+}
+
+static BOOL bridge_end_paint(rdpContext *context) {
+    RDPBridgeSession *session = session_from_context(context);
+    if ((session == NULL) || (session->callbacks.frame == NULL) || (context == NULL) || (context->gdi == NULL)) {
+        return TRUE;
+    }
+
+    rdpGdi *gdi = context->gdi;
+    if ((gdi->primary_buffer == NULL) || (gdi->width <= 0) || (gdi->height <= 0)) {
+        return TRUE;
+    }
+
+    session->callbacks.frame(
+        gdi->primary_buffer,
+        (uint32_t)gdi->width,
+        (uint32_t)gdi->height,
+        gdi->stride,
+        session->callbacks.context);
+    return TRUE;
+}
+
+static BOOL bridge_desktop_resize(rdpContext *context) {
+    if ((context == NULL) || (context->gdi == NULL) || (context->settings == NULL)) {
+        return FALSE;
+    }
+    const UINT32 width = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+    const UINT32 height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+    bridge_logf(session_from_context(context), "Desktop resize received: %ux%u.", width, height);
+    return gdi_resize(context->gdi, width, height);
+}
+
+static void bridge_clear_local_files(RDPBridgeSession *session) {
+    if (session == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < session->local_file_count; index++) {
+        free((void *)session->local_files[index].path);
+        free((void *)session->local_files[index].fileName);
+    }
+    free(session->local_files);
+    session->local_files = NULL;
+    session->local_file_count = 0;
+}
+
+static UINT bridge_send_client_format_list(RDPBridgeSession *session) {
+    if ((session == NULL) || (session->cliprdr == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    CLIPRDR_FORMAT formats[3] = { 0 };
+    UINT32 count = 0;
+
+    if (session->local_text != NULL) {
+        formats[count].formatId = CF_UNICODETEXT;
+        count++;
+    }
+    if (session->local_file_count > 0) {
+        formats[count].formatId = RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW;
+        formats[count].formatName = "FileGroupDescriptorW";
+        count++;
+        formats[count].formatId = RDP_BRIDGE_FORMAT_FILECONTENTS;
+        formats[count].formatName = "FileContents";
+        count++;
+    }
+
+    CLIPRDR_FORMAT_LIST list = { 0 };
+    list.common.msgType = CB_FORMAT_LIST;
+    list.numFormats = count;
+    list.formats = formats;
+    bridge_logf(
+        session,
+        "Clipboard local formats advertised: text=%s files=%zu.",
+        session->local_text != NULL ? "yes" : "no",
+        session->local_file_count);
+    return session->cliprdr->ClientFormatList(session->cliprdr, &list);
+}
+
+static UINT bridge_send_file_group_descriptor(
+    CliprdrClientContext *cliprdr,
+    RDPBridgeSession *session) {
+    FILEDESCRIPTORW *descriptors = (FILEDESCRIPTORW *)calloc(
+        session->local_file_count,
+        sizeof(FILEDESCRIPTORW));
+    if (descriptors == NULL) {
+        return CHANNEL_RC_NO_MEMORY;
+    }
+
+    for (size_t index = 0; index < session->local_file_count; index++) {
+        descriptors[index].dwFlags = FD_ATTRIBUTES | FD_FILESIZE | FD_UNICODE;
+        descriptors[index].dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        descriptors[index].nFileSizeHigh = (DWORD)(session->local_files[index].size >> 32);
+        descriptors[index].nFileSizeLow = (DWORD)(session->local_files[index].size & 0xFFFFFFFF);
+
+        size_t wchar_count = 0;
+        WCHAR *name = ConvertUtf8ToWCharAlloc(session->local_files[index].fileName, &wchar_count);
+        if (name != NULL) {
+            const size_t copy_count = (wchar_count < 259) ? wchar_count : 259;
+            memcpy(descriptors[index].cFileName, name, copy_count * sizeof(WCHAR));
+            descriptors[index].cFileName[copy_count] = 0;
+            free(name);
+        }
+    }
+
+    BYTE *data = NULL;
+    UINT32 data_length = 0;
+    UINT status = cliprdr_serialize_file_list(
+        descriptors,
+        (UINT32)session->local_file_count,
+        &data,
+        &data_length);
+    free(descriptors);
+    if (status != CHANNEL_RC_OK) {
+        bridge_logf(session, "Clipboard local file descriptor serialization failed: %u.", status);
+        return status;
+    }
+
+    CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
+    response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_OK;
+    response.common.dataLen = data_length;
+    response.requestedFormatData = data;
+    status = cliprdr->ClientFormatDataResponse(cliprdr, &response);
+    bridge_logf(session, "Clipboard sent local file descriptor list: files=%zu bytes=%u.", session->local_file_count, data_length);
+    free(data);
+    return status;
+}
+
+static UINT bridge_cliprdr_server_format_data_request(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FORMAT_DATA_REQUEST *request) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (request == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    if (request->requestedFormatId == RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW) {
+        bridge_log(session, "Clipboard server requested local file descriptor list.");
+        return bridge_send_file_group_descriptor(cliprdr, session);
+    }
+
+    if ((request->requestedFormatId != CF_UNICODETEXT) || (session->local_text == NULL)) {
+        bridge_logf(session, "Clipboard server requested unsupported local format: id=%u.", request->requestedFormatId);
+        CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
+        response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+        response.common.msgFlags = CB_RESPONSE_FAIL;
+        response.common.dataLen = 0;
+        return cliprdr->ClientFormatDataResponse(cliprdr, &response);
+    }
+
+    size_t wchar_count = 0;
+    WCHAR *wide = ConvertUtf8NToWCharAlloc(session->local_text, session->local_text_length, &wchar_count);
+    if (wide == NULL) {
+        return CHANNEL_RC_NO_MEMORY;
+    }
+
+    CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
+    response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_OK;
+    response.common.dataLen = (UINT32)((wchar_count + 1) * sizeof(WCHAR));
+    response.requestedFormatData = (const BYTE *)wide;
+    UINT status = cliprdr->ClientFormatDataResponse(cliprdr, &response);
+    bridge_logf(session, "Clipboard sent local text: utf8Bytes=%zu utf16Bytes=%u.", session->local_text_length, response.common.dataLen);
+    free(wide);
+    return status;
+}
+
+static UINT bridge_cliprdr_server_format_data_response(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FORMAT_DATA_RESPONSE *response) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL) ||
+        (response->common.msgFlags != CB_RESPONSE_OK) || (response->requestedFormatData == NULL) ||
+        (response->common.dataLen == 0)) {
+        return CHANNEL_RC_OK;
+    }
+
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    if (cliprdr->lastRequestedFormatId != CF_UNICODETEXT) {
+        if (cliprdr->lastRequestedFormatId == RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW &&
+            session->callbacks.remoteFileList != NULL) {
+            bridge_logf(session, "Clipboard received remote file descriptor list: bytes=%u.", response->common.dataLen);
+            session->callbacks.remoteFileList(
+                response->requestedFormatData,
+                response->common.dataLen,
+                session->callbacks.context);
+        }
+        return CHANNEL_RC_OK;
+    }
+
+    const size_t wchar_count = response->common.dataLen / sizeof(WCHAR);
+    char *utf8 = ConvertWCharNToUtf8Alloc((const WCHAR *)response->requestedFormatData, wchar_count, NULL);
+    if (utf8 == NULL) {
+        return CHANNEL_RC_NO_MEMORY;
+    }
+
+    if (session->callbacks.remoteText != NULL) {
+        bridge_logf(session, "Clipboard received remote text: utf16Bytes=%u.", response->common.dataLen);
+        session->callbacks.remoteText((const uint8_t *)utf8, strlen(utf8), session->callbacks.context);
+    }
+    free(utf8);
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_cliprdr_server_format_list_response(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FORMAT_LIST_RESPONSE *response) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    bridge_logf(session, "Clipboard remote acknowledged local format list: flags=0x%04x.", response->common.msgFlags);
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_cliprdr_server_capabilities(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_CAPABILITIES *capabilities) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (capabilities == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    for (UINT32 index = 0; index < capabilities->cCapabilitiesSets; index++) {
+        const CLIPRDR_CAPABILITY_SET *capability = &capabilities->capabilitySets[index];
+        if ((capability->capabilitySetType == CB_CAPSTYPE_GENERAL) &&
+            (capability->capabilitySetLength >= CB_CAPSTYPE_GENERAL_LEN)) {
+            const CLIPRDR_GENERAL_CAPABILITY_SET *general =
+                (const CLIPRDR_GENERAL_CAPABILITY_SET *)capability;
+            bridge_logf(
+                session,
+                "Clipboard server capabilities: version=%u flags=0x%08x.",
+                general->version,
+                general->generalFlags);
+        }
+    }
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_cliprdr_monitor_ready(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_MONITOR_READY *monitor_ready) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    CLIPRDR_GENERAL_CAPABILITY_SET general = { 0 };
+    CLIPRDR_CAPABILITIES capabilities = { 0 };
+    general.capabilitySetType = CB_CAPSTYPE_GENERAL;
+    general.capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN;
+    general.version = CB_CAPS_VERSION_2;
+    general.generalFlags = CB_USE_LONG_FORMAT_NAMES |
+                           CB_STREAM_FILECLIP_ENABLED |
+                           CB_FILECLIP_NO_FILE_PATHS |
+                           CB_HUGE_FILE_SUPPORT_ENABLED;
+    capabilities.common.msgType = CB_CLIP_CAPS;
+    capabilities.cCapabilitiesSets = 1;
+    capabilities.capabilitySets = (CLIPRDR_CAPABILITY_SET *)&general;
+
+    bridge_log(session, "Clipboard monitor ready; sending client capabilities.");
+    UINT status = cliprdr->ClientCapabilities(cliprdr, &capabilities);
+    if (status != CHANNEL_RC_OK) {
+        return status;
+    }
+
+    if ((session->local_text != NULL) || (session->local_file_count > 0)) {
+        return bridge_send_client_format_list(session);
+    }
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_cliprdr_server_format_list(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FORMAT_LIST *format_list) {
+    if ((cliprdr == NULL) || (format_list == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    CLIPRDR_FORMAT_LIST_RESPONSE list_response = { 0 };
+    list_response.common.msgType = CB_FORMAT_LIST_RESPONSE;
+    list_response.common.msgFlags = CB_RESPONSE_OK;
+    cliprdr->ClientFormatListResponse(cliprdr, &list_response);
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    bridge_logf(session, "Clipboard remote format list received: count=%u.", format_list->numFormats);
+
+    for (UINT32 index = 0; index < format_list->numFormats; index++) {
+        bridge_logf(
+            session,
+            "Clipboard remote format[%u]: id=%u name=%s.",
+            index,
+            format_list->formats[index].formatId,
+            format_list->formats[index].formatName != NULL ? format_list->formats[index].formatName : "(null)");
+        if (format_list->formats[index].formatName != NULL &&
+            strcmp(format_list->formats[index].formatName, "FileGroupDescriptorW") == 0) {
+            CLIPRDR_FORMAT_DATA_REQUEST request = { 0 };
+            request.common.msgType = CB_FORMAT_DATA_REQUEST;
+            request.requestedFormatId = format_list->formats[index].formatId;
+            cliprdr->lastRequestedFormatId = RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW;
+            bridge_logf(session, "Clipboard requesting remote file descriptor format: id=%u.", request.requestedFormatId);
+            return cliprdr->ClientFormatDataRequest(cliprdr, &request);
+        }
+        if (format_list->formats[index].formatId == CF_UNICODETEXT) {
+            CLIPRDR_FORMAT_DATA_REQUEST request = { 0 };
+            request.common.msgType = CB_FORMAT_DATA_REQUEST;
+            request.requestedFormatId = CF_UNICODETEXT;
+            cliprdr->lastRequestedFormatId = CF_UNICODETEXT;
+            bridge_log(session, "Clipboard requesting remote text format.");
+            return cliprdr->ClientFormatDataRequest(cliprdr, &request);
+        }
+    }
+
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_cliprdr_server_file_contents_request(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FILE_CONTENTS_REQUEST *request) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (request == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    if (request->listIndex >= session->local_file_count) {
+        bridge_logf(session, "Clipboard local file request rejected: listIndex=%u count=%zu.", request->listIndex, session->local_file_count);
+        return CHANNEL_RC_OK;
+    }
+
+    const RDPBridgeLocalFile *file = &session->local_files[request->listIndex];
+    BYTE size_data[8] = { 0 };
+    BYTE *buffer = NULL;
+    UINT32 response_size = 0;
+
+    if (request->dwFlags & FILECONTENTS_SIZE) {
+        UINT64 size = file->size;
+        memcpy(size_data, &size, sizeof(size));
+        buffer = size_data;
+        response_size = sizeof(size_data);
+        bridge_logf(session, "Clipboard server requested local file size: index=%u size=%llu.", request->listIndex, (unsigned long long)file->size);
+    } else if (request->dwFlags & FILECONTENTS_RANGE) {
+        FILE *handle = fopen(file->path, "rb");
+        if (handle == NULL) {
+            bridge_logf(session, "Clipboard local file open failed: %s.", file->path);
+            return CHANNEL_RC_OK;
+        }
+        const UINT64 offset = ((UINT64)request->nPositionHigh << 32) | request->nPositionLow;
+        if (fseeko(handle, (off_t)offset, SEEK_SET) != 0) {
+            fclose(handle);
+            return CHANNEL_RC_OK;
+        }
+        response_size = request->cbRequested;
+        buffer = (BYTE *)malloc(response_size);
+        if (buffer == NULL) {
+            fclose(handle);
+            return CHANNEL_RC_NO_MEMORY;
+        }
+        response_size = (UINT32)fread(buffer, 1, response_size, handle);
+        fclose(handle);
+        bridge_logf(
+            session,
+            "Clipboard server requested local file range: index=%u offset=%llu requested=%u sent=%u.",
+            request->listIndex,
+            (unsigned long long)offset,
+            request->cbRequested,
+            response_size);
+    } else {
+        return CHANNEL_RC_OK;
+    }
+
+    CLIPRDR_FILE_CONTENTS_RESPONSE response = { 0 };
+    response.common.msgType = CB_FILECONTENTS_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_OK;
+    response.common.dataLen = response_size;
+    response.streamId = request->streamId;
+    response.cbRequested = response_size;
+    response.requestedData = buffer;
+    UINT status = cliprdr->ClientFileContentsResponse(cliprdr, &response);
+    if (buffer != size_data) {
+        free(buffer);
+    }
+    return status;
+}
+
+static UINT bridge_cliprdr_server_file_contents_response(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FILE_CONTENTS_RESPONSE *response) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL) ||
+        (response->common.msgFlags != CB_RESPONSE_OK) || (response->requestedData == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    if (session->callbacks.remoteFileContents != NULL) {
+        bridge_logf(session, "Clipboard received remote file contents: stream=%u bytes=%u.", response->streamId, response->cbRequested);
+        session->callbacks.remoteFileContents(
+            response->streamId,
+            response->requestedData,
+            response->cbRequested,
+            session->callbacks.context);
+    }
+    return CHANNEL_RC_OK;
+}
+
+static void bridge_channel_connected(void *context, const ChannelConnectedEventArgs *event) {
+    freerdp_client_OnChannelConnectedEventHandler(context, event);
+
+    rdpContext *rdp_context = (rdpContext *)context;
+    RDPBridgeSession *session = session_from_context(rdp_context);
+    if ((session == NULL) || (event == NULL) || (event->name == NULL)) {
+        return;
+    }
+
+    char message[128] = { 0 };
+    snprintf(message, sizeof(message), "FreeRDP channel connected: %s", event->name);
+    bridge_log(session, message);
+
+    if (event->pInterface == NULL) {
+        return;
+    }
+
+    if ((strcmp(event->name, DISP_CHANNEL_NAME) == 0) ||
+        (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0)) {
+        session->disp = (DispClientContext *)event->pInterface;
+        session->disp->custom = session;
+        bridge_log(session, "Display control channel connected.");
+        return;
+    }
+
+    if (strcmp(event->name, CLIPRDR_CHANNEL_NAME) == 0) {
+        session->cliprdr = (CliprdrClientContext *)event->pInterface;
+        session->cliprdr->custom = session;
+        session->cliprdr->ServerCapabilities = bridge_cliprdr_server_capabilities;
+        session->cliprdr->MonitorReady = bridge_cliprdr_monitor_ready;
+        session->cliprdr->ServerFormatList = bridge_cliprdr_server_format_list;
+        session->cliprdr->ServerFormatListResponse = bridge_cliprdr_server_format_list_response;
+        session->cliprdr->ServerFormatDataRequest = bridge_cliprdr_server_format_data_request;
+        session->cliprdr->ServerFormatDataResponse = bridge_cliprdr_server_format_data_response;
+        session->cliprdr->ServerFileContentsRequest = bridge_cliprdr_server_file_contents_request;
+        session->cliprdr->ServerFileContentsResponse = bridge_cliprdr_server_file_contents_response;
+        bridge_log(session, "Clipboard channel connected.");
+    }
+}
+
+static void bridge_attach_cliprdr(RDPBridgeSession *session) {
+    if ((session == NULL) || (session->instance == NULL) || (session->instance->context == NULL) ||
+        (session->instance->context->channels == NULL)) {
+        return;
+    }
+    CliprdrClientContext *cliprdr = (CliprdrClientContext *)freerdp_channels_get_static_channel_interface(
+        session->instance->context->channels,
+        CLIPRDR_CHANNEL_NAME);
+    if (cliprdr == NULL) {
+        bridge_log(session, "Clipboard channel unavailable.");
+        return;
+    }
+
+    session->cliprdr = cliprdr;
+    session->cliprdr->custom = session;
+    session->cliprdr->ServerCapabilities = bridge_cliprdr_server_capabilities;
+    session->cliprdr->MonitorReady = bridge_cliprdr_monitor_ready;
+    session->cliprdr->ServerFormatList = bridge_cliprdr_server_format_list;
+    session->cliprdr->ServerFormatListResponse = bridge_cliprdr_server_format_list_response;
+    session->cliprdr->ServerFormatDataRequest = bridge_cliprdr_server_format_data_request;
+    session->cliprdr->ServerFormatDataResponse = bridge_cliprdr_server_format_data_response;
+    session->cliprdr->ServerFileContentsRequest = bridge_cliprdr_server_file_contents_request;
+    session->cliprdr->ServerFileContentsResponse = bridge_cliprdr_server_file_contents_response;
+    bridge_log(session, "Clipboard channel attached.");
+}
+
+static void bridge_channel_disconnected(void *context, const ChannelDisconnectedEventArgs *event) {
+    freerdp_client_OnChannelDisconnectedEventHandler(context, event);
+
+    rdpContext *rdp_context = (rdpContext *)context;
+    RDPBridgeSession *session = session_from_context(rdp_context);
+    if ((session == NULL) || (event == NULL) || (event->name == NULL)) {
+        return;
+    }
+    if ((strcmp(event->name, DISP_CHANNEL_NAME) == 0) ||
+        (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0)) {
+        session->disp = NULL;
+    } else if (strcmp(event->name, CLIPRDR_CHANNEL_NAME) == 0) {
+        session->cliprdr = NULL;
+    }
+}
+
+static BOOL bridge_load_channels(freerdp *instance) {
+    if ((instance == NULL) || (instance->context == NULL) || (instance->context->settings == NULL)) {
+        return FALSE;
+    }
+    if (!freerdp_client_load_addins(instance->context->channels, instance->context->settings)) {
+        return FALSE;
+    }
+    bridge_log(session_from_context(instance->context), "FreeRDP channel addins loaded.");
+    return TRUE;
+}
+
+static BOOL bridge_pre_connect(freerdp *instance) {
+    if ((instance == NULL) || (instance->context == NULL) || (instance->context->settings == NULL)) {
+        return FALSE;
+    }
+    if (!freerdp_settings_set_bool(instance->context->settings, FreeRDP_CertificateCallbackPreferPEM, TRUE)) {
+        return FALSE;
+    }
+    if (freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) != CHANNEL_RC_OK) {
+        return FALSE;
+    }
+    PubSub_SubscribeChannelConnected(instance->context->pubSub, bridge_channel_connected);
+    PubSub_SubscribeChannelDisconnected(instance->context->pubSub, bridge_channel_disconnected);
+    return TRUE;
+}
+
+static BOOL bridge_post_connect(freerdp *instance) {
+    if ((instance == NULL) || (instance->context == NULL)) {
+        return FALSE;
+    }
+    if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) {
+        return FALSE;
+    }
+    instance->context->update->BeginPaint = bridge_begin_paint;
+    instance->context->update->EndPaint = bridge_end_paint;
+    instance->context->update->DesktopResize = bridge_desktop_resize;
+    return TRUE;
+}
+
+static void bridge_post_disconnect(freerdp *instance) {
+    if ((instance != NULL) && (instance->context != NULL) && (instance->context->gdi != NULL)) {
+        gdi_free(instance);
+    }
+}
+
+static BOOL set_string(rdpSettings *settings, FreeRDP_Settings_Keys_String key, const char *value) {
+    if (value == NULL) {
+        return TRUE;
+    }
+    return freerdp_settings_set_string(settings, key, value);
+}
+
+static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
+    freerdp *instance = session->instance;
+    rdpSettings *settings = instance->context->settings;
+
+    if (!set_string(settings, FreeRDP_ServerHostname, options->host)) {
+        return FALSE;
+    }
+    if (!freerdp_settings_set_uint32(settings, FreeRDP_ServerPort, options->port)) {
+        return FALSE;
+    }
+    if (!set_string(settings, FreeRDP_Username, options->username)) {
+        return FALSE;
+    }
+    if (!set_string(settings, FreeRDP_Password, options->password)) {
+        return FALSE;
+    }
+    if (!set_string(settings, FreeRDP_Domain, options->domain)) {
+        return FALSE;
+    }
+
+    session->desktop_width = session->desktop_width == 0 ? 1440 : session->desktop_width;
+    session->desktop_height = session->desktop_height == 0 ? 900 : session->desktop_height;
+
+    return freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, session->desktop_width) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session->desktop_height) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32) &&
+           freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, options->enableClipboard) &&
+           freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, options->enableDriveRedirection) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectDrives, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectHomeDrive, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectSmartCards, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectPrinters, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectSerialPorts, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RedirectParallelPorts, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_DesktopResize, TRUE) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor, 100) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_DeviceScaleFactor, 100) &&
+           freerdp_settings_set_bool(settings, FreeRDP_AsyncChannels, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_AsyncUpdate, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_FastPathInput, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE);
+}
+
+static DWORD WINAPI rdp_event_loop(LPVOID arg) {
+    RDPBridgeSession *session = (RDPBridgeSession *)arg;
+    HANDLE events[64] = { 0 };
+
+    if (!freerdp_connect(session->instance)) {
+        bridge_log(session, "FreeRDP connect failed.");
+        session->connected = false;
+        return 1;
+    }
+
+    session->connected = true;
+    bridge_attach_cliprdr(session);
+    bridge_log(session, "FreeRDP connected.");
+
+    while (!session->stop_requested && !freerdp_shall_disconnect_context(session->instance->context)) {
+        DWORD count = freerdp_get_event_handles(session->instance->context, events, 64);
+        if (count == 0) {
+            break;
+        }
+
+        DWORD status = WaitForMultipleObjects(count, events, FALSE, 50);
+        if (status == WAIT_FAILED) {
+            break;
+        }
+
+        if (!freerdp_check_event_handles(session->instance->context)) {
+            break;
+        }
+    }
+
+    freerdp_disconnect(session->instance);
+    session->connected = false;
+    bridge_log(session, "FreeRDP disconnected.");
+    return 0;
+}
+#endif
+
+RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
+    if ((session == NULL) || (options == NULL) || (options->host == NULL) || (strlen(options->host) == 0)) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    if (session->instance != NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+
+    session->instance = freerdp_new();
+    if (session->instance == NULL) {
+        return RDPBridgeStatusInternalError;
+    }
+    session->instance->ContextSize = sizeof(RDPBridgeContext);
+    session->instance->PreConnect = bridge_pre_connect;
+    session->instance->PostConnect = bridge_post_connect;
+    session->instance->PostDisconnect = bridge_post_disconnect;
+    session->instance->LoadChannels = bridge_load_channels;
+    if (!freerdp_context_new(session->instance)) {
+        freerdp_free(session->instance);
+        session->instance = NULL;
+        return RDPBridgeStatusInternalError;
+    }
+    ((RDPBridgeContext *)session->instance->context)->session = session;
+    if (!configure_instance(session, options)) {
+        freerdp_context_free(session->instance);
+        freerdp_free(session->instance);
+        session->instance = NULL;
+        return RDPBridgeStatusInvalidArgument;
+    }
+
+    session->stop_requested = false;
+    session->thread = CreateThread(NULL, 0, rdp_event_loop, session, 0, NULL);
+    if (session->thread == NULL) {
+        freerdp_context_free(session->instance);
+        freerdp_free(session->instance);
+        session->instance = NULL;
+        return RDPBridgeStatusInternalError;
+    }
+    return RDPBridgeStatusOK;
+#elif defined(RDP_FREERDP_STUB)
+    session->connected = true;
+    bridge_log(session, "FreeRDP stub backend connected. Link real FreeRDP in FreeRDPBridge.c.");
+    return RDPBridgeStatusOK;
+#else
+    return RDPBridgeStatusBackendUnavailable;
+#endif
+}
+
+RDPBridgeStatus rdp_bridge_disconnect(RDPBridgeSession *session) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    session->stop_requested = true;
+    if (session->instance != NULL) {
+        freerdp_abort_connect_context(session->instance->context);
+        freerdp_disconnect(session->instance);
+    }
+    if (session->thread != NULL) {
+        WaitForSingleObject(session->thread, 5000);
+        CloseHandle(session->thread);
+        session->thread = NULL;
+    }
+    if (session->instance != NULL) {
+        freerdp_context_free(session->instance);
+        freerdp_free(session->instance);
+        session->instance = NULL;
+    }
+    free(session->local_text);
+    session->local_text = NULL;
+    session->local_text_length = 0;
+    bridge_clear_local_files(session);
+    session->disp = NULL;
+    session->cliprdr = NULL;
+#endif
+    session->connected = false;
+    return RDPBridgeStatusOK;
+}
+
+bool rdp_bridge_is_connected(const RDPBridgeSession *session) {
+    return (session != NULL) && session->connected;
+}
+
+RDPBridgeStatus rdp_bridge_send_local_text(RDPBridgeSession *session, const uint8_t *utf8, size_t length) {
+    if ((session == NULL) || ((utf8 == NULL) && (length > 0))) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    if (session->cliprdr == NULL) {
+        return RDPBridgeStatusNotConnected;
+    }
+    bridge_clear_local_files(session);
+    free(session->local_text);
+    session->local_text = NULL;
+    session->local_text_length = length;
+    if (length > 0) {
+        session->local_text = (char *)malloc(length + 1);
+        if (session->local_text == NULL) {
+            return RDPBridgeStatusInternalError;
+        }
+        memcpy(session->local_text, utf8, length);
+        session->local_text[length] = '\0';
+    }
+
+    if (bridge_send_client_format_list(session) != CHANNEL_RC_OK) {
+        return RDPBridgeStatusInternalError;
+    }
+    return RDPBridgeStatusOK;
+#elif defined(RDP_FREERDP_STUB)
+    if (session->callbacks.remoteText != NULL) {
+        session->callbacks.remoteText(utf8, length, session->callbacks.context);
+    }
+    return RDPBridgeStatusOK;
+#else
+    return RDPBridgeStatusBackendUnavailable;
+#endif
+}
+
+RDPBridgeStatus rdp_bridge_send_local_file_list(RDPBridgeSession *session, const uint8_t *payload, size_t length) {
+    if ((session == NULL) || ((payload == NULL) && (length > 0))) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+
+#ifdef RDP_FREERDP_STUB
+    if (session->callbacks.remoteFileList != NULL) {
+        session->callbacks.remoteFileList(payload, length, session->callbacks.context);
+    }
+    return RDPBridgeStatusOK;
+#else
+    return RDPBridgeStatusBackendUnavailable;
+#endif
+}
+
+RDPBridgeStatus rdp_bridge_send_local_files(
+    RDPBridgeSession *session,
+    const RDPBridgeLocalFile *files,
+    size_t count) {
+    if ((session == NULL) || ((files == NULL) && (count > 0))) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    if (session->cliprdr == NULL) {
+        return RDPBridgeStatusNotConnected;
+    }
+    free(session->local_text);
+    session->local_text = NULL;
+    session->local_text_length = 0;
+    bridge_clear_local_files(session);
+    if (count > 0) {
+        session->local_files = (RDPBridgeLocalFile *)calloc(count, sizeof(RDPBridgeLocalFile));
+        if (session->local_files == NULL) {
+            return RDPBridgeStatusInternalError;
+        }
+        session->local_file_count = count;
+
+        for (size_t index = 0; index < count; index++) {
+            if ((files[index].path == NULL) || (files[index].fileName == NULL)) {
+                bridge_clear_local_files(session);
+                return RDPBridgeStatusInvalidArgument;
+            }
+            session->local_files[index].path = strdup(files[index].path);
+            session->local_files[index].fileName = strdup(files[index].fileName);
+            session->local_files[index].size = files[index].size;
+            if ((session->local_files[index].path == NULL) || (session->local_files[index].fileName == NULL)) {
+                bridge_clear_local_files(session);
+                return RDPBridgeStatusInternalError;
+            }
+        }
+    }
+
+    if (bridge_send_client_format_list(session) != CHANNEL_RC_OK) {
+        return RDPBridgeStatusInternalError;
+    }
+    return RDPBridgeStatusOK;
+#elif defined(RDP_FREERDP_STUB)
+    (void)files;
+    (void)count;
+    return RDPBridgeStatusOK;
+#else
+    return RDPBridgeStatusBackendUnavailable;
+#endif
+}
+
+RDPBridgeStatus rdp_bridge_request_remote_file_contents(
+    RDPBridgeSession *session,
+    uint32_t stream_id,
+    uint64_t offset,
+    uint32_t length) {
+    return rdp_bridge_request_remote_file_range(session, stream_id, 0, offset, length);
+}
+
+RDPBridgeStatus rdp_bridge_request_remote_file_range(
+    RDPBridgeSession *session,
+    uint32_t stream_id,
+    uint32_t list_index,
+    uint64_t offset,
+    uint32_t length) {
+    if ((session == NULL) || (length == 0)) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    if ((session->cliprdr == NULL) || (session->cliprdr->ClientFileContentsRequest == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+
+    CLIPRDR_FILE_CONTENTS_REQUEST request = { 0 };
+    request.common.msgType = CB_FILECONTENTS_REQUEST;
+    request.streamId = stream_id;
+    request.listIndex = list_index;
+    request.dwFlags = FILECONTENTS_RANGE;
+    request.nPositionLow = (UINT32)(offset & 0xFFFFFFFF);
+    request.nPositionHigh = (UINT32)(offset >> 32);
+    request.cbRequested = length;
+
+    if (session->cliprdr->ClientFileContentsRequest(session->cliprdr, &request) != CHANNEL_RC_OK) {
+        return RDPBridgeStatusInternalError;
+    }
+    return RDPBridgeStatusOK;
+#else
+    (void)stream_id;
+    (void)list_index;
+    (void)offset;
+    (void)length;
+    return RDPBridgeStatusBackendUnavailable;
+#endif
+}
+
+RDPBridgeStatus rdp_bridge_update_desktop_size(RDPBridgeSession *session, uint32_t width, uint32_t height, double scale) {
+    if ((session == NULL) || (width == 0) || (height == 0)) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    session->desktop_width = width;
+    session->desktop_height = height;
+    session->desktop_scale = scale;
+    if (session->instance != NULL) {
+        rdpSettings *settings = session->instance->context->settings;
+        freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, width);
+        freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height);
+    }
+
+    if ((session->disp != NULL) && (session->disp->SendMonitorLayout != NULL)) {
+        UINT32 scale_factor = (UINT32)(scale * 100.0);
+        if (scale_factor < 100) {
+            scale_factor = 100;
+        }
+        DISPLAY_CONTROL_MONITOR_LAYOUT monitor = { 0 };
+        monitor.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
+        monitor.Left = 0;
+        monitor.Top = 0;
+        monitor.Width = width;
+        monitor.Height = height;
+        monitor.PhysicalWidth = width;
+        monitor.PhysicalHeight = height;
+        monitor.Orientation = 0;
+        monitor.DesktopScaleFactor = scale_factor;
+        monitor.DeviceScaleFactor = 100;
+        UINT status = session->disp->SendMonitorLayout(session->disp, 1, &monitor);
+        if (status == CHANNEL_RC_OK) {
+            bridge_logf(session, "Display resize sent: %ux%u scale=%u.", width, height, scale_factor);
+        } else {
+            bridge_logf(session, "Display resize failed: %ux%u scale=%u status=%u.", width, height, scale_factor, status);
+            return RDPBridgeStatusInternalError;
+        }
+    } else {
+        bridge_logf(session, "Display resize deferred without display channel: %ux%u scale=%.2f.", width, height, scale);
+    }
+    return RDPBridgeStatusOK;
+#elif defined(RDP_FREERDP_STUB)
+    bridge_log(session, "FreeRDP stub backend accepted desktop resize.");
+    return RDPBridgeStatusOK;
+#else
+    return RDPBridgeStatusBackendUnavailable;
+#endif
+}
+
+RDPBridgeStatus rdp_bridge_send_pointer_move(RDPBridgeSession *session, uint32_t x, uint32_t y) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+#if defined(RDP_FREERDP_REAL)
+    if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+    if (!freerdp_input_send_mouse_event(session->instance->context->input, PTR_FLAGS_MOVE, (UINT16)x, (UINT16)y)) {
+        return RDPBridgeStatusInternalError;
+    }
+#else
+    (void)x;
+    (void)y;
+#endif
+    return RDPBridgeStatusOK;
+}
+
+RDPBridgeStatus rdp_bridge_send_pointer_button(
+    RDPBridgeSession *session,
+    uint32_t x,
+    uint32_t y,
+    RDPBridgePointerButton button,
+    bool pressed) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+#if defined(RDP_FREERDP_REAL)
+    if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+    UINT16 flags = pressed ? PTR_FLAGS_DOWN : 0;
+    switch (button) {
+        case RDPBridgePointerButtonLeft:
+            flags |= PTR_FLAGS_BUTTON1;
+            break;
+        case RDPBridgePointerButtonRight:
+            flags |= PTR_FLAGS_BUTTON2;
+            break;
+        case RDPBridgePointerButtonMiddle:
+            flags |= PTR_FLAGS_BUTTON3;
+            break;
+    }
+    if (!freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y)) {
+        return RDPBridgeStatusInternalError;
+    }
+#else
+    (void)x;
+    (void)y;
+    (void)button;
+    (void)pressed;
+#endif
+    return RDPBridgeStatusOK;
+}
+
+RDPBridgeStatus rdp_bridge_send_scroll(RDPBridgeSession *session, int32_t delta_x, int32_t delta_y) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+#if defined(RDP_FREERDP_REAL)
+    if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+    if (delta_y != 0) {
+        UINT16 flags = PTR_FLAGS_WHEEL | (abs(delta_y) & WheelRotationMask);
+        if (delta_y < 0) {
+            flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+        }
+        freerdp_input_send_mouse_event(session->instance->context->input, flags, 0, 0);
+    }
+    if (delta_x != 0) {
+        UINT16 flags = PTR_FLAGS_HWHEEL | (abs(delta_x) & WheelRotationMask);
+        if (delta_x < 0) {
+            flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+        }
+        freerdp_input_send_mouse_event(session->instance->context->input, flags, 0, 0);
+    }
+#else
+    (void)delta_x;
+    (void)delta_y;
+#endif
+    return RDPBridgeStatusOK;
+}
+
+RDPBridgeStatus rdp_bridge_send_key(RDPBridgeSession *session, uint16_t key_code, bool pressed) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+#if defined(RDP_FREERDP_REAL)
+    if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+    if (!freerdp_input_send_keyboard_event_ex(session->instance->context->input, pressed ? TRUE : FALSE, FALSE, key_code)) {
+        return RDPBridgeStatusInternalError;
+    }
+#else
+    (void)key_code;
+    (void)pressed;
+#endif
+    return RDPBridgeStatusOK;
+}

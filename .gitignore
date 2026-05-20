@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserdata/
+.DS_Store
+Vendor/FreeRDP/src/
+Vendor/FreeRDP/build/
+Vendor/FreeRDP/install/
