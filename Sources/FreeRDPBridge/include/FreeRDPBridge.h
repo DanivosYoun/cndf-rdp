@@ -30,6 +30,12 @@ typedef enum RDPBridgePointerButton {
     RDPBridgePointerButtonMiddle = 2
 } RDPBridgePointerButton;
 
+typedef enum RDPBridgeAudioPlaybackMode {
+    RDPBridgeAudioPlaybackDisabled = 0,
+    RDPBridgeAudioPlaybackLocal = 1,
+    RDPBridgeAudioPlaybackRemote = 2
+} RDPBridgeAudioPlaybackMode;
+
 typedef void (*RDPBridgeLogCallback)(const char *message, void *context);
 typedef void (*RDPBridgeRemoteTextCallback)(const uint8_t *utf8, size_t length, void *context);
 typedef void (*RDPBridgeRemoteFileListCallback)(const uint8_t *payload, size_t length, void *context);
@@ -62,6 +68,9 @@ typedef struct RDPBridgeConnectionOptions {
     const char *domain;
     bool enableClipboard;
     bool enableDriveRedirection;
+    const char *redirectedFolderPath;
+    const char *redirectedFolderName;
+    RDPBridgeAudioPlaybackMode audioPlaybackMode;
 } RDPBridgeConnectionOptions;
 
 typedef struct RDPBridgeLocalFile {

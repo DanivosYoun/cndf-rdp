@@ -127,16 +127,23 @@ public final class RDPSession {
             withOptionalCString(options.username) { usernamePointer in
                 withOptionalCString(options.password) { passwordPointer in
                     withOptionalCString(options.domain) { domainPointer in
-                        var bridgeOptions = RDPBridgeConnectionOptions(
-                            host: hostPointer,
-                            port: options.port,
-                            username: usernamePointer,
-                            password: passwordPointer,
-                            domain: domainPointer,
-                            enableClipboard: options.enableClipboard,
-                            enableDriveRedirection: options.enableDriveRedirection
-                        )
-                        return rdp_bridge_connect(bridgeSession, &bridgeOptions)
+                        withOptionalCString(options.redirectedFolderPath) { folderPathPointer in
+                            withOptionalCString(options.redirectedFolderName) { folderNamePointer in
+                                var bridgeOptions = RDPBridgeConnectionOptions(
+                                    host: hostPointer,
+                                    port: options.port,
+                                    username: usernamePointer,
+                                    password: passwordPointer,
+                                    domain: domainPointer,
+                                    enableClipboard: options.enableClipboard,
+                                    enableDriveRedirection: options.enableDriveRedirection || options.redirectedFolderPath != nil,
+                                    redirectedFolderPath: folderPathPointer,
+                                    redirectedFolderName: folderNamePointer,
+                                    audioPlaybackMode: RDPBridgeAudioPlaybackMode(rawValue: options.audioPlaybackMode.rawValue)
+                                )
+                                return rdp_bridge_connect(bridgeSession, &bridgeOptions)
+                            }
+                        }
                     }
                 }
             }

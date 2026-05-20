@@ -8,6 +8,9 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let domain: String?
     public let enableClipboard: Bool
     public let enableDriveRedirection: Bool
+    public let redirectedFolderPath: String?
+    public let redirectedFolderName: String?
+    public let audioPlaybackMode: RDPAudioPlaybackMode
 
     public init(
         host: String,
@@ -16,7 +19,10 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         password: String? = nil,
         domain: String? = nil,
         enableClipboard: Bool = true,
-        enableDriveRedirection: Bool = false
+        enableDriveRedirection: Bool = false,
+        redirectedFolderPath: String? = nil,
+        redirectedFolderName: String? = nil,
+        audioPlaybackMode: RDPAudioPlaybackMode = .disabled
     ) {
         self.host = host
         self.port = port
@@ -25,5 +31,14 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.domain = domain
         self.enableClipboard = enableClipboard
         self.enableDriveRedirection = enableDriveRedirection
+        self.redirectedFolderPath = redirectedFolderPath
+        self.redirectedFolderName = redirectedFolderName
+        self.audioPlaybackMode = audioPlaybackMode
     }
+}
+
+public enum RDPAudioPlaybackMode: UInt32, Equatable, Sendable {
+    case disabled = 0
+    case playLocally = 1
+    case playOnRemote = 2
 }

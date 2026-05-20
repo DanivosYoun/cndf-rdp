@@ -32,6 +32,8 @@ The bridge currently provides:
 - `rdp_bridge_send_local_file_list`
 - `rdp_bridge_request_remote_file_contents`
 - `rdp_bridge_update_desktop_size`
+- optional local folder redirection through FreeRDP `rdpdr`
+- optional audio playback through FreeRDP `rdpsnd`
 - pointer, scroll, and keyboard input dispatch
 - GDI framebuffer delivery to Swift as BGRA frames
 - Metal-backed frame presentation through `MTKView`
@@ -106,12 +108,19 @@ try rdpView.connect(
         port: 3389,
         username: username,
         password: password,
-        domain: domain
+        domain: domain,
+        redirectedFolderPath: "/Users/me/RDPShare",
+        redirectedFolderName: "RemoteShare",
+        audioPlaybackMode: .playLocally
     )
 )
 ```
 
 `RDPConnectionView` owns the `RDPSession`, renders frames through Metal, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
+
+`redirectedFolderPath` mounts one macOS folder into the remote session using the provided
+`redirectedFolderName` share name. Leave it `nil` to disable local folder mounting.
+`audioPlaybackMode` supports `.playLocally`, `.playOnRemote`, and `.disabled`.
 
 ## External Credentials
 
@@ -123,11 +132,15 @@ RDP_MAC_PORT=3389 \
 RDP_MAC_USERNAME=user \
 RDP_MAC_PASSWORD=secret \
 RDP_MAC_DOMAIN=DOMAIN \
+RDP_MAC_REDIRECT_FOLDER_PATH=/Users/me/RDPShare \
+RDP_MAC_REDIRECT_FOLDER_NAME=RemoteShare \
+RDP_MAC_AUDIO_MODE=local \
 RDP_MAC_AUTOCONNECT=1 \
 swift run rdp-mac
 ```
 
-`RDP_MAC_AUTOCONNECT` is optional. Without it, injected values are only prefilled in the connection bar.
+`RDP_MAC_AUDIO_MODE` accepts `local`, `remote`, or `off`. `RDP_MAC_AUTOCONNECT` is optional.
+Without it, visible credential fields are only prefilled in the connection bar.
 
 ## Test Hook
 

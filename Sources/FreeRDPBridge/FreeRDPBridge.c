@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #if defined(RDP_FREERDP_REAL)
 #include <freerdp/freerdp.h>
@@ -649,6 +650,31 @@ static BOOL set_string(rdpSettings *settings, FreeRDP_Settings_Keys_String key, 
     return freerdp_settings_set_string(settings, key, value);
 }
 
+static BOOL bridge_add_redirected_folder(
+    rdpSettings *settings,
+    const char *path,
+    const char *name) {
+    if ((settings == NULL) || (path == NULL) || (strlen(path) == 0)) {
+        return TRUE;
+    }
+    struct stat path_stat = { 0 };
+    if ((stat(path, &path_stat) != 0) || !S_ISDIR(path_stat.st_mode)) {
+        return FALSE;
+    }
+
+    const char *share_name = ((name != NULL) && (strlen(name) > 0)) ? name : "RemoteShare";
+    const char *args[] = { share_name, path };
+    RDPDR_DEVICE *device = freerdp_device_new(RDPDR_DTYP_FILESYSTEM, 2, args);
+    if (device == NULL) {
+        return FALSE;
+    }
+    if (!freerdp_device_collection_add(settings, device)) {
+        freerdp_device_free(device);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
@@ -671,6 +697,16 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
 
     session->desktop_width = session->desktop_width == 0 ? 1440 : session->desktop_width;
     session->desktop_height = session->desktop_height == 0 ? 900 : session->desktop_height;
+    const BOOL has_redirected_folder =
+        (options->redirectedFolderPath != NULL) && (strlen(options->redirectedFolderPath) > 0);
+    const BOOL enable_device_redirection = options->enableDriveRedirection || has_redirected_folder ||
+                                           (options->audioPlaybackMode == RDPBridgeAudioPlaybackLocal);
+    const BOOL audio_playback = options->audioPlaybackMode == RDPBridgeAudioPlaybackLocal;
+    const BOOL remote_console_audio = options->audioPlaybackMode == RDPBridgeAudioPlaybackRemote;
+
+    if (!bridge_add_redirected_folder(settings, options->redirectedFolderPath, options->redirectedFolderName)) {
+        return FALSE;
+    }
 
     return freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, session->desktop_width) &&
            freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session->desktop_height) &&
@@ -678,9 +714,12 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, options->enableClipboard) &&
-           freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, options->enableDriveRedirection) &&
+           freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, enable_device_redirection) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectDrives, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectHomeDrive, FALSE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, audio_playback) &&
+           freerdp_settings_set_bool(settings, FreeRDP_RemoteConsoleAudio, remote_console_audio) &&
+           freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectSmartCards, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectPrinters, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectSerialPorts, FALSE) &&

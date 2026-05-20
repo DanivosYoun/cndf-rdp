@@ -8,6 +8,9 @@ struct ExternalCredentialProvider {
         static let username = "RDP_MAC_USERNAME"
         static let password = "RDP_MAC_PASSWORD"
         static let domain = "RDP_MAC_DOMAIN"
+        static let redirectedFolderPath = "RDP_MAC_REDIRECT_FOLDER_PATH"
+        static let redirectedFolderName = "RDP_MAC_REDIRECT_FOLDER_NAME"
+        static let audioPlaybackMode = "RDP_MAC_AUDIO_MODE"
         static let autoConnect = "RDP_MAC_AUTOCONNECT"
     }
 
@@ -32,7 +35,10 @@ struct ExternalCredentialProvider {
             port: parsedPort(environment[Key.port]),
             username: nilIfEmpty(trimmed(environment[Key.username])),
             password: nilIfEmpty(environment[Key.password]),
-            domain: nilIfEmpty(trimmed(environment[Key.domain]))
+            domain: nilIfEmpty(trimmed(environment[Key.domain])),
+            redirectedFolderPath: nilIfEmpty(trimmed(environment[Key.redirectedFolderPath])),
+            redirectedFolderName: nilIfEmpty(trimmed(environment[Key.redirectedFolderName])),
+            audioPlaybackMode: parsedAudioPlaybackMode(environment[Key.audioPlaybackMode])
         )
     }
 
@@ -52,5 +58,16 @@ struct ExternalCredentialProvider {
             return nil
         }
         return value
+    }
+
+    private func parsedAudioPlaybackMode(_ value: String?) -> RDPAudioPlaybackMode {
+        switch trimmed(value)?.lowercased() {
+        case "local", "play-locally", "playlocally", "mac", "1":
+            return .playLocally
+        case "remote", "play-on-remote", "playonremote", "server", "2":
+            return .playOnRemote
+        default:
+            return .disabled
+        }
     }
 }
