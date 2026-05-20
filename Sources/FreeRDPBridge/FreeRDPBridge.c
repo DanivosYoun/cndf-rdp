@@ -27,6 +27,7 @@
 #include <winpr/synch.h>
 #include <winpr/thread.h>
 #include <winpr/user.h>
+#include <winpr/wlog.h>
 #endif
 
 #define RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW 0xC001
@@ -696,6 +697,55 @@ static BOOL set_string(rdpSettings *settings, FreeRDP_Settings_Keys_String key, 
     return freerdp_settings_set_string(settings, key, value);
 }
 
+static void bridge_apply_log_filter(const char *name, size_t name_length, const char *level, size_t level_length) {
+    if ((name == NULL) || (level == NULL) || (name_length == 0) || (level_length == 0)) {
+        return;
+    }
+
+    char *filter_name = (char *)calloc(name_length + 1, 1);
+    char *filter_level = (char *)calloc(level_length + 1, 1);
+    if ((filter_name == NULL) || (filter_level == NULL)) {
+        free(filter_name);
+        free(filter_level);
+        return;
+    }
+
+    memcpy(filter_name, name, name_length);
+    memcpy(filter_level, level, level_length);
+    WLog_SetStringLogLevel(WLog_Get(filter_name), filter_level);
+    free(filter_name);
+    free(filter_level);
+}
+
+static void bridge_apply_log_options(const RDPBridgeConnectionOptions *options) {
+    if ((options == NULL) || (options->logLevel == NULL) || (strlen(options->logLevel) == 0)) {
+        WLog_SetStringLogLevel(WLog_GetRoot(), "INFO");
+    } else {
+        WLog_SetStringLogLevel(WLog_GetRoot(), options->logLevel);
+    }
+
+    if ((options == NULL) || (options->logFilters == NULL) || (strlen(options->logFilters) == 0)) {
+        return;
+    }
+
+    const char *cursor = options->logFilters;
+    while (*cursor != '\0') {
+        const char *entry_end = strchr(cursor, '\n');
+        if (entry_end == NULL) {
+            entry_end = cursor + strlen(cursor);
+        }
+        const char *separator = memchr(cursor, '=', (size_t)(entry_end - cursor));
+        if (separator != NULL) {
+            bridge_apply_log_filter(
+                cursor,
+                (size_t)(separator - cursor),
+                separator + 1,
+                (size_t)(entry_end - separator - 1));
+        }
+        cursor = *entry_end == '\0' ? entry_end : entry_end + 1;
+    }
+}
+
 static BOOL bridge_add_redirected_folder(
     rdpSettings *settings,
     const char *path,
@@ -725,6 +775,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
     instance->VerifyCertificateEx = bridge_verify_certificate_ex;
+    bridge_apply_log_options(options);
 
     if (!set_string(settings, FreeRDP_ServerHostname, options->host)) {
         return FALSE;
@@ -958,9 +1009,8 @@ RDPBridgeStatus rdp_bridge_disconnect(RDPBridgeSession *session) {
 
 #if defined(RDP_FREERDP_REAL)
     session->stop_requested = true;
-    if (session->instance != NULL) {
+    if ((session->instance != NULL) && (session->instance->context != NULL)) {
         freerdp_abort_connect_context(session->instance->context);
-        freerdp_disconnect(session->instance);
     }
     if (session->thread != NULL) {
         WaitForSingleObject(session->thread, 5000);

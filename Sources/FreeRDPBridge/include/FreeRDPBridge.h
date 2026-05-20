@@ -104,6 +104,8 @@ typedef struct RDPBridgeConnectionOptions {
     const char *redirectedFolderPath;
     const char *redirectedFolderName;
     RDPBridgeAudioPlaybackMode audioPlaybackMode;
+    const char *logLevel;
+    const char *logFilters;
 } RDPBridgeConnectionOptions;
 
 typedef struct RDPBridgeLocalFile {

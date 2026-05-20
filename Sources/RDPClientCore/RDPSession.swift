@@ -21,6 +21,19 @@ public enum RDPDisconnectReason: Equatable, Sendable {
     case error
 }
 
+public struct RDPConnectionStatistics: Equatable, Sendable {
+    public let framesReceived: UInt64
+    public let frameBytesReceived: UInt64
+    public let remoteClipboardTextsReceived: UInt64
+    public let remoteFilesReceived: UInt64
+    public let remoteFileBytesReceived: UInt64
+    public let localClipboardTextsSent: UInt64
+    public let localFilesOffered: UInt64
+    public let localFileBytesOffered: UInt64
+    public let startedAt: Date?
+    public let lastActivityAt: Date?
+}
+
 public protocol RDPSessionDelegate: AnyObject {
     func rdpSession(_ session: RDPSession, didLog message: String)
     func rdpSession(
@@ -60,6 +73,9 @@ public final class RDPSession {
     private var callbacks: RDPBridgeCallbacks
     private var logFileURL: URL?
     private let logLock = NSLock()
+    private let statisticsLock = NSLock()
+    private var statisticsStorage = MutableRDPConnectionStatistics()
+    private var lastConnectionOptions: RDPConnectionOptions?
 
     public init(
         staging: FileTransferStaging = FileTransferStaging(),
@@ -107,6 +123,10 @@ public final class RDPSession {
                 data = Data(bytes: bytes, count: length)
             }
             let text = String(data: data, encoding: .utf8) ?? ""
+            session.updateStatistics { stats in
+                stats.remoteClipboardTextsReceived += 1
+                stats.lastActivityAt = Date()
+            }
             session.clipboardCoordinator?.receiveRemoteText(text)
             session.delegate?.rdpSession(session, didReceiveRemoteText: text)
         }
@@ -118,6 +138,11 @@ public final class RDPSession {
                 ?? (try? WindowsFileGroupDescriptor.decode(data))
                 ?? []
             let files = decoded.map(RDPRemoteFile.init(entry:))
+            session.updateStatistics { stats in
+                stats.remoteFilesReceived += UInt64(files.count)
+                stats.remoteFileBytesReceived += files.reduce(UInt64(0)) { $0 + $1.byteCount }
+                stats.lastActivityAt = Date()
+            }
             session.delegate?.rdpSession(session, didReceiveRemoteFiles: files)
             session.materializeRemoteFiles(decoded)
         }
@@ -144,6 +169,11 @@ public final class RDPSession {
                 height: Int(height),
                 stride: Int(stride)
             )
+            session.updateStatistics { stats in
+                stats.framesReceived += 1
+                stats.frameBytesReceived += UInt64(byteCount)
+                stats.lastActivityAt = Date()
+            }
             session.delegate?.rdpSession(session, didReceiveFrame: frame)
         }
 
@@ -173,6 +203,12 @@ public final class RDPSession {
         return rdp_bridge_is_connected(bridgeSession)
     }
 
+    public var statistics: RDPConnectionStatistics {
+        statisticsLock.lock()
+        defer { statisticsLock.unlock() }
+        return statisticsStorage.snapshot()
+    }
+
     public func connect(_ options: RDPConnectionOptions) throws {
         guard let bridgeSession else {
             throw RDPSessionError.unableToCreateBridgeSession
@@ -183,25 +219,34 @@ public final class RDPSession {
             try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
 
+        resetStatistics()
+        lastConnectionOptions = options
+
         let status = options.host.withCString { hostPointer in
             withOptionalCString(options.username) { usernamePointer in
-                withOptionalCString(options.password) { passwordPointer in
+                withPasswordCString(options) { passwordPointer in
                     withOptionalCString(options.domain) { domainPointer in
                         withOptionalCString(options.redirectedFolderPath) { folderPathPointer in
                             withOptionalCString(options.redirectedFolderName) { folderNamePointer in
-                                var bridgeOptions = RDPBridgeConnectionOptions(
-                                    host: hostPointer,
-                                    port: options.port,
-                                    username: usernamePointer,
-                                    password: passwordPointer,
-                                    domain: domainPointer,
-                                    enableClipboard: options.enableClipboard,
-                                    enableDriveRedirection: options.enableDriveRedirection || options.redirectedFolderPath != nil,
-                                    redirectedFolderPath: folderPathPointer,
-                                    redirectedFolderName: folderNamePointer,
-                                    audioPlaybackMode: RDPBridgeAudioPlaybackMode(rawValue: options.audioPlaybackMode.rawValue)
-                                )
-                                return rdp_bridge_connect(bridgeSession, &bridgeOptions)
+                                withLogFilterCString(options.logFilters) { logFiltersPointer in
+                                    options.logLevel.rawValue.uppercased().withCString { logLevelPointer in
+                                        var bridgeOptions = RDPBridgeConnectionOptions(
+                                            host: hostPointer,
+                                            port: options.port,
+                                            username: usernamePointer,
+                                            password: passwordPointer,
+                                            domain: domainPointer,
+                                            enableClipboard: options.enableClipboard,
+                                            enableDriveRedirection: options.enableDriveRedirection || options.redirectedFolderPath != nil,
+                                            redirectedFolderPath: folderPathPointer,
+                                            redirectedFolderName: folderNamePointer,
+                                            audioPlaybackMode: RDPBridgeAudioPlaybackMode(rawValue: options.audioPlaybackMode.rawValue),
+                                            logLevel: logLevelPointer,
+                                            logFilters: logFiltersPointer
+                                        )
+                                        return rdp_bridge_connect(bridgeSession, &bridgeOptions)
+                                    }
+                                }
                             }
                         }
                     }
@@ -210,6 +255,14 @@ public final class RDPSession {
         }
 
         try throwIfNeeded(status)
+    }
+
+    public func reconnect() throws {
+        guard let lastConnectionOptions else {
+            throw RDPSessionError.configurationInvalid(reason: "No previous RDP connection options are available.")
+        }
+        try disconnect()
+        try connect(lastConnectionOptions)
     }
 
     public func disconnect() throws {
@@ -233,7 +286,16 @@ public final class RDPSession {
     public func sendLocalFiles(_ urls: [URL]) throws {
         delegate?.rdpSession(self, didLog: "Local files offered to remote clipboard: \(urls.count).")
         do {
+            let offeredBytes = try urls.reduce(UInt64(0)) { total, url in
+                let values = try url.resourceValues(forKeys: [.fileSizeKey])
+                return total + UInt64(values.fileSize ?? 0)
+            }
             try remoteClipboardSink?.sendLocalFiles(urls)
+            updateStatistics { stats in
+                stats.localFilesOffered += UInt64(urls.count)
+                stats.localFileBytesOffered += offeredBytes
+                stats.lastActivityAt = Date()
+            }
         } catch {
             delegate?.rdpSession(self, didLog: "Local file offer failed: \(error)")
             throw error
@@ -242,6 +304,10 @@ public final class RDPSession {
 
     public func sendLocalText(_ text: String) throws {
         try remoteClipboardSink?.sendLocalText(text)
+        updateStatistics { stats in
+            stats.localClipboardTextsSent += 1
+            stats.lastActivityAt = Date()
+        }
     }
 
     public func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool = false) throws {
@@ -347,6 +413,18 @@ public final class RDPSession {
         return resultQueue.sync { trusted }
     }
 
+    private func resetStatistics() {
+        statisticsLock.lock()
+        statisticsStorage = MutableRDPConnectionStatistics(startedAt: Date(), lastActivityAt: Date())
+        statisticsLock.unlock()
+    }
+
+    private func updateStatistics(_ update: (inout MutableRDPConnectionStatistics) -> Void) {
+        statisticsLock.lock()
+        update(&statisticsStorage)
+        statisticsLock.unlock()
+    }
+
     private func materializeRemoteFiles(_ entries: [RDPFileListEntry]) {
         guard !entries.isEmpty, let remoteFileDownloadManager else {
             return
@@ -421,11 +499,61 @@ private extension RDPDisconnectReason {
     }
 }
 
+private struct MutableRDPConnectionStatistics {
+    var framesReceived: UInt64 = 0
+    var frameBytesReceived: UInt64 = 0
+    var remoteClipboardTextsReceived: UInt64 = 0
+    var remoteFilesReceived: UInt64 = 0
+    var remoteFileBytesReceived: UInt64 = 0
+    var localClipboardTextsSent: UInt64 = 0
+    var localFilesOffered: UInt64 = 0
+    var localFileBytesOffered: UInt64 = 0
+    var startedAt: Date?
+    var lastActivityAt: Date?
+
+    func snapshot() -> RDPConnectionStatistics {
+        RDPConnectionStatistics(
+            framesReceived: framesReceived,
+            frameBytesReceived: frameBytesReceived,
+            remoteClipboardTextsReceived: remoteClipboardTextsReceived,
+            remoteFilesReceived: remoteFilesReceived,
+            remoteFileBytesReceived: remoteFileBytesReceived,
+            localClipboardTextsSent: localClipboardTextsSent,
+            localFilesOffered: localFilesOffered,
+            localFileBytesOffered: localFileBytesOffered,
+            startedAt: startedAt,
+            lastActivityAt: lastActivityAt
+        )
+    }
+}
+
 private func withOptionalCString<T>(_ string: String?, _ body: (UnsafePointer<CChar>?) -> T) -> T {
     guard let string else {
         return body(nil)
     }
     return string.withCString(body)
+}
+
+private func withPasswordCString<T>(_ options: RDPConnectionOptions, _ body: (UnsafePointer<CChar>?) -> T) -> T {
+    if let securePassword = options.securePassword {
+        return securePassword.withCString(body)
+    }
+    return withOptionalCString(options.password, body)
+}
+
+private func withLogFilterCString<T>(
+    _ filters: [String: RDPLogLevel],
+    _ body: (UnsafePointer<CChar>?) -> T
+) -> T {
+    guard !filters.isEmpty else {
+        return body(nil)
+    }
+
+    let serialized = filters
+        .sorted { $0.key < $1.key }
+        .map { "\($0.key)=\($0.value.rawValue.uppercased())" }
+        .joined(separator: "\n")
+    return serialized.withCString(body)
 }
 
 public struct RDPRemoteFile: Equatable, Sendable {

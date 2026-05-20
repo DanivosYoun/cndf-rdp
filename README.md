@@ -50,7 +50,11 @@ The bridge currently provides:
 - typed connection failure callback for user-facing diagnostics and audit codes
 - disconnect reason callback for audit/reconnect policy
 - optional per-session log file writing
+- WLog root level and per-category filter control
 - package and FreeRDP build info through `RDPMacInfo`
+- `RDPSecureString` for vault-supplied transient passwords
+- reconnect API using retained connection options
+- session statistics for frames, clipboard, file transfer, and activity timestamps
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
@@ -71,7 +75,6 @@ Remaining production work:
 
 - harden RDP-to-Mac file paste with progress UI, cancellation, and Finder promised-file fallback
 - add host-app credential persistence and certificate trust UI
-- WLog level/filter control, secure password container, native reconnect, and connection statistics
 
 ## Integration API
 
@@ -104,8 +107,19 @@ Typed failures are reported as:
 
 Disconnect reasons are `.localRequest`, `.serverDisconnect(code:)`, `.timeout`, and `.error`.
 Use `RDPConnectionOptions.logFileURL` to let the package append per-session logs directly.
+Use `RDPConnectionOptions.logLevel` and `logFilters` for WLog root/category control, for example
+`["com.freerdp.channels.cliprdr": .trace]`.
 Use `RDPMacInfo.packageVersion`, `RDPMacInfo.freerdpVersion`, and
 `RDPMacInfo.buildConfiguration` in about dialogs and bug reports.
+
+For vault integration, pass `securePassword: RDPSecureString(vaultPassword)` instead of
+`password:`. The secure string provides explicit `zeroize()` and only exposes a temporary C string
+during `connect`. `password:` remains for compatibility.
+
+`RDPSession.reconnect()` and `RDPConnectionView.reconnect()` perform a clean disconnect followed by
+a connect with the retained options. `RDPSession.statistics` and `RDPConnectionView.statistics`
+expose `RDPConnectionStatistics` counters for frames, frame bytes, clipboard text events, file
+counts, file bytes, session start, and last activity.
 
 Threading contract:
 
@@ -122,12 +136,12 @@ Follow-up request status:
 | 2. Typed error callback | Implemented |
 | 3. Disconnect reason callback | Implemented |
 | 4. Per-session log file URL | Implemented |
-| 5. WLog level/filter control | Deferred |
+| 5. WLog level/filter control | Implemented |
 | 6. Package and FreeRDP version info | Implemented |
 | 7. Thread safety contract docs | Documented |
-| 8. Secure password handling | Deferred |
-| 9. Reconnect API | Deferred |
-| 10. Connection statistics | Deferred |
+| 8. Secure password handling | Implemented |
+| 9. Reconnect API | Implemented |
+| 10. Connection statistics | Implemented |
 
 ## Test Summary
 
@@ -139,6 +153,10 @@ Verified against a Windows RDP test host on 2026-05-21:
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
 - RDP-to-Mac copy-back materialized the remote file to the macOS pasteboard
 - decomposed Korean filenames are normalized to NFC before being advertised to Windows
+- WLog debug/filter options were applied during live connection testing
+- per-session log file creation was verified at `/tmp/rdp-session-followup.log`
+- live reconnect was verified against the test host with DisplayControl and dynamic resize restored
+- secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
 - `swift test` passes all package tests
 
 Manual checklist for future changes:
@@ -191,14 +209,18 @@ try rdpView.connect(
         host: host,
         port: 3389,
         username: username,
-        password: password,
+        securePassword: RDPSecureString(vaultPassword),
         domain: domain,
         redirectedFolderPath: "/Users/me/RDPShare",
         redirectedFolderName: "RemoteShare",
         audioPlaybackMode: .playLocally,
-        logFileURL: URL(fileURLWithPath: "/Users/me/Library/Logs/MyApp/rdp/session.log")
+        logFileURL: URL(fileURLWithPath: "/Users/me/Library/Logs/MyApp/rdp/session.log"),
+        logLevel: .info,
+        logFilters: ["com.freerdp.channels.cliprdr": .debug]
     )
 )
+
+let stats = rdpView.statistics
 ```
 
 `RDPConnectionView` owns the `RDPSession`, renders frames through Metal, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
@@ -221,6 +243,8 @@ RDP_MAC_REDIRECT_FOLDER_PATH=/Users/me/RDPShare \
 RDP_MAC_REDIRECT_FOLDER_NAME=RemoteShare \
 RDP_MAC_AUDIO_MODE=local \
 RDP_MAC_LOG_FILE=/tmp/rdp-session.log \
+RDP_MAC_LOG_LEVEL=debug \
+RDP_MAC_LOG_FILTERS=com.freerdp.channels.cliprdr=trace \
 RDP_MAC_AUTOCONNECT=1 \
 swift run rdp-mac
 ```
@@ -228,6 +252,8 @@ swift run rdp-mac
 `RDP_MAC_AUDIO_MODE` accepts `local`, `remote`, or `off`. `RDP_MAC_AUTOCONNECT` is optional.
 Without it, visible credential fields are only prefilled in the connection bar.
 `RDP_MAC_LOG_FILE` is optional and appends session logs to the given path.
+`RDP_MAC_LOG_LEVEL` accepts `trace`, `debug`, `info`, `warn`, `error`, `fatal`, or `off`.
+`RDP_MAC_LOG_FILTERS` accepts semicolon-separated `category=level` pairs.
 
 The sample app connection bar also exposes the audio mode and redirected folder controls for manual testing.
 

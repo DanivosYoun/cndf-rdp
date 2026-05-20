@@ -12,6 +12,8 @@ struct ExternalCredentialProvider {
         static let redirectedFolderName = "RDP_MAC_REDIRECT_FOLDER_NAME"
         static let audioPlaybackMode = "RDP_MAC_AUDIO_MODE"
         static let logFilePath = "RDP_MAC_LOG_FILE"
+        static let logLevel = "RDP_MAC_LOG_LEVEL"
+        static let logFilters = "RDP_MAC_LOG_FILTERS"
         static let autoConnect = "RDP_MAC_AUTOCONNECT"
     }
 
@@ -40,7 +42,9 @@ struct ExternalCredentialProvider {
             redirectedFolderPath: nilIfEmpty(trimmed(environment[Key.redirectedFolderPath])),
             redirectedFolderName: nilIfEmpty(trimmed(environment[Key.redirectedFolderName])),
             audioPlaybackMode: parsedAudioPlaybackMode(environment[Key.audioPlaybackMode]),
-            logFileURL: parsedLogFileURL(environment[Key.logFilePath])
+            logFileURL: parsedLogFileURL(environment[Key.logFilePath]),
+            logLevel: parsedLogLevel(environment[Key.logLevel]),
+            logFilters: parsedLogFilters(environment[Key.logFilters])
         )
     }
 
@@ -78,5 +82,29 @@ struct ExternalCredentialProvider {
             return nil
         }
         return URL(fileURLWithPath: path)
+    }
+
+    private func parsedLogLevel(_ value: String?) -> RDPLogLevel {
+        guard let value = nilIfEmpty(trimmed(value))?.lowercased(),
+              let level = RDPLogLevel(rawValue: value) else {
+            return .info
+        }
+        return level
+    }
+
+    private func parsedLogFilters(_ value: String?) -> [String: RDPLogLevel] {
+        guard let value = nilIfEmpty(trimmed(value)) else {
+            return [:]
+        }
+
+        var filters: [String: RDPLogLevel] = [:]
+        for entry in value.split(separator: ";") {
+            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let level = RDPLogLevel(rawValue: parts[1].lowercased()) else {
+                continue
+            }
+            filters[parts[0]] = level
+        }
+        return filters
     }
 }

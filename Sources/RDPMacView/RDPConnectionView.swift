@@ -58,6 +58,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         session?.isConnected ?? false
     }
 
+    public var statistics: RDPConnectionStatistics? {
+        session?.statistics
+    }
+
     public func connect(_ options: RDPConnectionOptions) throws {
         disconnect()
 
@@ -79,6 +83,11 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         session = nil
         clientView.session = nil
         delegate?.rdpConnectionView(self, didChangeConnected: false)
+    }
+
+    public func reconnect() throws {
+        try session?.reconnect()
+        clientView.sendForcedDesktopSize()
     }
 
     public func sendForcedDesktopSize() {
