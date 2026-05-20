@@ -1,6 +1,6 @@
 # RDP Mac
 
-SwiftPM-based macOS RDP client scaffold with a thin FreeRDP bridge and separate clipboard/file-transfer services.
+SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin FreeRDP bridge, dynamic resize, clipboard/file transfer, local folder redirection, and audio playback options.
 
 ## Modules
 
@@ -11,7 +11,7 @@ SwiftPM-based macOS RDP client scaffold with a thin FreeRDP bridge and separate 
 - `ClipboardBridge`: `NSPasteboard` read/write coordination and local-to-remote clipboard dispatch.
 - `FileTransferStaging`: local file staging plus encoded file-list payloads used by the bridge layer.
 
-## Current State
+## Build
 
 The project builds against a local FreeRDP checkout pinned to `3.26.0`
 (`3f6d7cb1f8973cc84c66b258a9a61c4e2b2f30a6`). Build it before running SwiftPM:
@@ -22,7 +22,11 @@ The project builds against a local FreeRDP checkout pinned to `3.26.0`
 
 `Vendor/FreeRDP/src` is a local git checkout created by the build script. `Vendor/FreeRDP/build`
 and `Vendor/FreeRDP/install` are generated and ignored. The build script reapplies the local
-FreeRDP `cliprdr` format-name patch after resetting the checkout to the pinned commit.
+FreeRDP `cliprdr` format-name patch after resetting the checkout to the pinned commit. The
+vendored build enables `cliprdr`, `drdynvc`, `disp`, `rdpgfx`, `rdpdr`, `drive`, `rdpsnd`,
+and the macOS audio backend.
+
+## Feature Status
 
 The bridge currently provides:
 
@@ -41,6 +45,8 @@ The bridge currently provides:
 - Mac-to-RDP file paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
 - RDP-to-Mac file paste materialization using remote range requests and local staged file URLs
 - Finder file drag/drop into the RDP surface with automatic remote paste trigger
+- optional mounted macOS folder visible in the remote session as an RDP redirected drive
+- optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
 
 The bridge registers FreeRDP's static addin provider directly because it creates a
@@ -60,23 +66,36 @@ Remaining production work:
 - harden RDP-to-Mac file paste with progress UI, cancellation, and Finder promised-file fallback
 - add credential persistence and certificate trust UI
 
-## Manual Test Checklist
+## Test Summary
 
-After launching a test session:
+Verified against a Windows RDP test host on 2026-05-21:
+
+- FreeRDP addins loaded and connected: `rdpdr`, `rdpsnd`, `cliprdr`, `drdynvc`, `rdpgfx`, `disp`
+- audio playback path connected through `AUDIO_PLAYBACK_DVC`
+- dynamic resize sent through DisplayControl after the remote desktop connected
+- Mac-to-RDP file paste requested descriptor, file size, and file range successfully
+- RDP-to-Mac copy-back materialized the remote file to the macOS pasteboard
+- `swift test` passes all package tests
+
+Manual checklist for future changes:
 
 1. Resize the macOS window and confirm the remote desktop fills the view without black side gaps.
 2. Copy a file in Finder, focus Explorer or Desktop in the RDP session, then paste.
 3. Drag a file from Finder into the RDP surface and confirm it appears remotely.
 4. Select a remote file in Explorer, copy it, then paste into Finder on macOS.
-
-Expected file-transfer logs include `FileGroupDescriptorW`, local file descriptor requests,
-file size requests, and file range requests.
+5. Enable a redirected folder and confirm it appears in the remote session.
+6. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
 
 ## Verify
 
 ```sh
+./Scripts/build-freerdp.sh
 swift test
 ```
+
+For live file-copy smoke testing, set `RDP_MAC_AUTOTEST_EXPLORER_FILE_PASTE=1` with
+`RDP_MAC_AUTOCONNECT=1`. The test opens the remote Desktop in Explorer, offers a small
+local file, pastes it, then copies the selected remote file back to the macOS pasteboard.
 
 ## Embed In Another App
 
@@ -141,6 +160,8 @@ swift run rdp-mac
 
 `RDP_MAC_AUDIO_MODE` accepts `local`, `remote`, or `off`. `RDP_MAC_AUTOCONNECT` is optional.
 Without it, visible credential fields are only prefilled in the connection bar.
+
+The sample app connection bar also exposes the audio mode and redirected folder controls for manual testing.
 
 ## Test Hook
 

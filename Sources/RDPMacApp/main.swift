@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -24,11 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
         let root = NSView(frame: window.contentView?.bounds ?? .zero)
         root.autoresizingMask = [.width, .height]
 
-        let connectionBar = ConnectionBarView(frame: NSRect(x: 0, y: root.bounds.height - 48, width: root.bounds.width, height: 48))
+        let connectionBarHeight: CGFloat = 86
+        let connectionBar = ConnectionBarView(frame: NSRect(x: 0, y: root.bounds.height - connectionBarHeight, width: root.bounds.width, height: connectionBarHeight))
         connectionBar.autoresizingMask = [.width, .minYMargin]
         connectionBar.delegate = self
 
-        let clientView = RDPClientView(frame: NSRect(x: 0, y: 0, width: root.bounds.width, height: root.bounds.height - 48))
+        let clientView = RDPClientView(frame: NSRect(x: 0, y: 0, width: root.bounds.width, height: root.bounds.height - connectionBarHeight))
         clientView.autoresizingMask = [.width, .height]
 
         root.addSubview(clientView)
@@ -47,28 +48,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
         }
     }
 
-    func connectionBarDidRequestConnect(
-        _ view: ConnectionBarView,
-        host: String,
-        port: UInt16,
-        username: String,
-        password: String,
-        domain: String
-    ) {
-        guard !host.isEmpty else {
+    func connectionBarDidRequestConnect(_ view: ConnectionBarView, options: RDPConnectionOptions) {
+        guard !options.host.isEmpty else {
             view.setStatus("Host required")
             return
         }
-        connect(
-            using: RDPConnectionOptions(
-                host: host,
-                port: port,
-                username: username.isEmpty ? nil : username,
-                password: password.isEmpty ? nil : password,
-                domain: domain.isEmpty ? nil : domain
-            ),
-            statusView: view
-        )
+        connect(using: options, statusView: view)
     }
 
     private func connect(using options: RDPConnectionOptions, statusView view: ConnectionBarView) {
