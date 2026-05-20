@@ -110,6 +110,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
         NSLog("[RDP] received remote text, \(text.count) chars")
     }
 
+    func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {
+        NSLog("[RDP] failed: \(String(describing: error))")
+        DispatchQueue.main.async { [weak self] in
+            self?.connectionBar?.setStatus("Failed: \(String(describing: error))")
+        }
+    }
+
+    func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {
+        NSLog("[RDP] disconnected: \(String(describing: reason))")
+    }
+
     func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
         NSLog("[RDP] received remote files, \(files.count) files")
     }

@@ -11,6 +11,7 @@ struct ExternalCredentialProvider {
         static let redirectedFolderPath = "RDP_MAC_REDIRECT_FOLDER_PATH"
         static let redirectedFolderName = "RDP_MAC_REDIRECT_FOLDER_NAME"
         static let audioPlaybackMode = "RDP_MAC_AUDIO_MODE"
+        static let logFilePath = "RDP_MAC_LOG_FILE"
         static let autoConnect = "RDP_MAC_AUTOCONNECT"
     }
 
@@ -38,7 +39,8 @@ struct ExternalCredentialProvider {
             domain: nilIfEmpty(trimmed(environment[Key.domain])),
             redirectedFolderPath: nilIfEmpty(trimmed(environment[Key.redirectedFolderPath])),
             redirectedFolderName: nilIfEmpty(trimmed(environment[Key.redirectedFolderName])),
-            audioPlaybackMode: parsedAudioPlaybackMode(environment[Key.audioPlaybackMode])
+            audioPlaybackMode: parsedAudioPlaybackMode(environment[Key.audioPlaybackMode]),
+            logFileURL: parsedLogFileURL(environment[Key.logFilePath])
         )
     }
 
@@ -69,5 +71,12 @@ struct ExternalCredentialProvider {
         default:
             return .disabled
         }
+    }
+
+    private func parsedLogFileURL(_ value: String?) -> URL? {
+        guard let path = nilIfEmpty(trimmed(value)) else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
     }
 }

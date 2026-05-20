@@ -11,6 +11,7 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let redirectedFolderPath: String?
     public let redirectedFolderName: String?
     public let audioPlaybackMode: RDPAudioPlaybackMode
+    public let logFileURL: URL?
 
     public init(
         host: String,
@@ -22,7 +23,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         enableDriveRedirection: Bool = false,
         redirectedFolderPath: String? = nil,
         redirectedFolderName: String? = nil,
-        audioPlaybackMode: RDPAudioPlaybackMode = .disabled
+        audioPlaybackMode: RDPAudioPlaybackMode = .disabled,
+        logFileURL: URL? = nil
     ) {
         self.host = host
         self.port = port
@@ -34,6 +36,7 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.redirectedFolderPath = redirectedFolderPath
         self.redirectedFolderName = redirectedFolderName
         self.audioPlaybackMode = audioPlaybackMode
+        self.logFileURL = logFileURL
     }
 }
 

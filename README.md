@@ -46,6 +46,11 @@ The bridge currently provides:
 - RDP-to-Mac file paste materialization using remote range requests and local staged file URLs
 - Finder file drag/drop into the RDP surface with automatic remote paste trigger
 - NFC filename normalization at Mac/Windows file-transfer boundaries for Korean filenames
+- certificate trust callback for TOFU/known-host policy integration
+- typed connection failure callback for user-facing diagnostics and audit codes
+- disconnect reason callback for audit/reconnect policy
+- optional per-session log file writing
+- package and FreeRDP build info through `RDPMacInfo`
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
@@ -65,7 +70,64 @@ Smooth interactive behavior depends on keeping resize, rendering, input, and cli
 Remaining production work:
 
 - harden RDP-to-Mac file paste with progress UI, cancellation, and Finder promised-file fallback
-- add credential persistence and certificate trust UI
+- add host-app credential persistence and certificate trust UI
+- WLog level/filter control, secure password container, native reconnect, and connection statistics
+
+## Integration API
+
+`RDPSessionDelegate` and `RDPConnectionViewDelegate` expose the integration hooks needed by a host app:
+
+```swift
+func rdpSession(
+    _ session: RDPSession,
+    shouldTrustCertificateFingerprint fingerprint: String,
+    hostname: String,
+    port: UInt16
+) async -> Bool
+
+func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError)
+func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason)
+```
+
+The default certificate callback returns `true` for TOFU auto-accept behavior. Host apps with a
+known-host store should compare `fingerprint`, store on first use, and return `false` for rejected
+changes. A rejected certificate is reported as `.certificateRejected`.
+
+Typed failures are reported as:
+
+- `.networkUnreachable(underlying:)`
+- `.tlsHandshakeFailed(reason:)`
+- `.authenticationFailed`
+- `.certificateRejected`
+- `.configurationInvalid(reason:)`
+- `.freerdp(code:description:)`
+
+Disconnect reasons are `.localRequest`, `.serverDisconnect(code:)`, `.timeout`, and `.error`.
+Use `RDPConnectionOptions.logFileURL` to let the package append per-session logs directly.
+Use `RDPMacInfo.packageVersion`, `RDPMacInfo.freerdpVersion`, and
+`RDPMacInfo.buildConfiguration` in about dialogs and bug reports.
+
+Threading contract:
+
+- `RDPConnectionView.connect(_:)`, `disconnect()`, and view mutation should be called from the main thread.
+- `RDPSession.connect(_:)` and `disconnect()` may be called by the owner that created the session.
+- `RDPSessionDelegate` callbacks are delivered from the FreeRDP worker thread unless explicitly noted by the view wrapper.
+- `RDPConnectionViewDelegate` frame display is marshalled to the main thread by `RDPConnectionView`; other callbacks should dispatch to the main thread before mutating UI.
+
+Follow-up request status:
+
+| Request | Status |
+|---|---|
+| 1. Certificate TOFU callback | Implemented |
+| 2. Typed error callback | Implemented |
+| 3. Disconnect reason callback | Implemented |
+| 4. Per-session log file URL | Implemented |
+| 5. WLog level/filter control | Deferred |
+| 6. Package and FreeRDP version info | Implemented |
+| 7. Thread safety contract docs | Documented |
+| 8. Secure password handling | Deferred |
+| 9. Reconnect API | Deferred |
+| 10. Connection statistics | Deferred |
 
 ## Test Summary
 
@@ -133,7 +195,8 @@ try rdpView.connect(
         domain: domain,
         redirectedFolderPath: "/Users/me/RDPShare",
         redirectedFolderName: "RemoteShare",
-        audioPlaybackMode: .playLocally
+        audioPlaybackMode: .playLocally,
+        logFileURL: URL(fileURLWithPath: "/Users/me/Library/Logs/MyApp/rdp/session.log")
     )
 )
 ```
@@ -157,12 +220,14 @@ RDP_MAC_DOMAIN=DOMAIN \
 RDP_MAC_REDIRECT_FOLDER_PATH=/Users/me/RDPShare \
 RDP_MAC_REDIRECT_FOLDER_NAME=RemoteShare \
 RDP_MAC_AUDIO_MODE=local \
+RDP_MAC_LOG_FILE=/tmp/rdp-session.log \
 RDP_MAC_AUTOCONNECT=1 \
 swift run rdp-mac
 ```
 
 `RDP_MAC_AUDIO_MODE` accepts `local`, `remote`, or `off`. `RDP_MAC_AUTOCONNECT` is optional.
 Without it, visible credential fields are only prefilled in the connection bar.
+`RDP_MAC_LOG_FILE` is optional and appends session logs to the given path.
 
 The sample app connection bar also exposes the audio mode and redirected folder controls for manual testing.
 

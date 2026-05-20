@@ -13,6 +13,7 @@
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/client/disp.h>
 #include <freerdp/channels/channels.h>
+#include <freerdp/error.h>
 #include <freerdp/event.h>
 #include <freerdp/gdi/gdi.h>
 #include <freerdp/input.h>
@@ -41,6 +42,8 @@ struct RDPBridgeSession {
     uint32_t desktop_width;
     uint32_t desktop_height;
     double desktop_scale;
+    UINT32 last_error_code;
+    BOOL certificate_rejected;
     DispClientContext *disp;
     CliprdrClientContext *cliprdr;
     char *local_text;
@@ -74,6 +77,18 @@ static void bridge_logf(RDPBridgeSession *session, const char *format, ...) {
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
     session->callbacks.log(message, session->callbacks.context);
+}
+
+static void bridge_failure(RDPBridgeSession *session, RDPBridgeFailureKind kind, UINT32 code, const char *description) {
+    if ((session != NULL) && (session->callbacks.failure != NULL)) {
+        session->callbacks.failure(kind, code, description != NULL ? description : "", session->callbacks.context);
+    }
+}
+
+static void bridge_disconnect_event(RDPBridgeSession *session, RDPBridgeDisconnectKind kind, UINT32 code) {
+    if ((session != NULL) && (session->callbacks.disconnect != NULL)) {
+        session->callbacks.disconnect(kind, code, session->callbacks.context);
+    }
 }
 
 RDPBridgeSession *rdp_bridge_session_create(const RDPBridgeCallbacks *callbacks) {
@@ -624,6 +639,37 @@ static BOOL bridge_pre_connect(freerdp *instance) {
     return TRUE;
 }
 
+static DWORD bridge_verify_certificate_ex(
+    freerdp *instance,
+    const char *host,
+    UINT16 port,
+    const char *common_name,
+    const char *subject,
+    const char *issuer,
+    const char *fingerprint,
+    DWORD flags) {
+    (void)common_name;
+    (void)subject;
+    (void)issuer;
+    (void)flags;
+
+    RDPBridgeSession *session = session_from_context(instance->context);
+    if ((session == NULL) || (session->callbacks.certificateTrust == NULL)) {
+        return 1;
+    }
+
+    const BOOL trusted = session->callbacks.certificateTrust(
+        fingerprint != NULL ? fingerprint : "",
+        host != NULL ? host : "",
+        port,
+        session->callbacks.context);
+    if (!trusted) {
+        session->certificate_rejected = TRUE;
+        return 0;
+    }
+    return 1;
+}
+
 static BOOL bridge_post_connect(freerdp *instance) {
     if ((instance == NULL) || (instance->context == NULL)) {
         return FALSE;
@@ -678,6 +724,7 @@ static BOOL bridge_add_redirected_folder(
 static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
+    instance->VerifyCertificateEx = bridge_verify_certificate_ex;
 
     if (!set_string(settings, FreeRDP_ServerHostname, options->host)) {
         return FALSE;
@@ -712,7 +759,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session->desktop_height) &&
            freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32) &&
            freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, options->enableClipboard) &&
            freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, enable_device_redirection) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectDrives, FALSE) &&
@@ -743,13 +790,73 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE);
 }
 
+static RDPBridgeFailureKind bridge_failure_kind_for_error(RDPBridgeSession *session, UINT32 code) {
+    if ((session != NULL) && session->certificate_rejected) {
+        return RDPBridgeFailureCertificate;
+    }
+    switch (code) {
+        case FREERDP_ERROR_DNS_ERROR:
+        case FREERDP_ERROR_DNS_NAME_NOT_FOUND:
+        case FREERDP_ERROR_CONNECT_FAILED:
+        case FREERDP_ERROR_CONNECT_TRANSPORT_FAILED:
+        case FREERDP_ERROR_CONNECT_KDC_UNREACHABLE:
+            return RDPBridgeFailureNetwork;
+        case FREERDP_ERROR_TLS_CONNECT_FAILED:
+        case FREERDP_ERROR_SECURITY_NEGO_CONNECT_FAILED:
+        case FREERDP_ERROR_MCS_CONNECT_INITIAL_ERROR:
+            return RDPBridgeFailureTLS;
+        case FREERDP_ERROR_AUTHENTICATION_FAILED:
+        case FREERDP_ERROR_CONNECT_LOGON_FAILURE:
+        case FREERDP_ERROR_CONNECT_WRONG_PASSWORD:
+        case FREERDP_ERROR_CONNECT_ACCESS_DENIED:
+        case FREERDP_ERROR_CONNECT_NO_OR_MISSING_CREDENTIALS:
+        case FREERDP_ERROR_CONNECT_ACCOUNT_DISABLED:
+        case FREERDP_ERROR_CONNECT_ACCOUNT_LOCKED_OUT:
+        case FREERDP_ERROR_CONNECT_ACCOUNT_EXPIRED:
+        case FREERDP_ERROR_CONNECT_ACCOUNT_RESTRICTION:
+        case FREERDP_ERROR_CONNECT_LOGON_TYPE_NOT_GRANTED:
+        case FREERDP_ERROR_CONNECT_PASSWORD_EXPIRED:
+        case FREERDP_ERROR_CONNECT_PASSWORD_MUST_CHANGE:
+        case FREERDP_ERROR_CONNECT_PASSWORD_CERTAINLY_EXPIRED:
+            return RDPBridgeFailureAuthentication;
+        case FREERDP_ERROR_PRE_CONNECT_FAILED:
+        case FREERDP_ERROR_POST_CONNECT_FAILED:
+            return RDPBridgeFailureConfiguration;
+        default:
+            return RDPBridgeFailureFreeRDP;
+    }
+}
+
+static RDPBridgeDisconnectKind bridge_disconnect_kind_for_error(RDPBridgeSession *session, UINT32 code) {
+    if ((session != NULL) && session->stop_requested) {
+        return RDPBridgeDisconnectLocalRequest;
+    }
+    if ((session != NULL) && session->certificate_rejected) {
+        return RDPBridgeDisconnectError;
+    }
+    switch (code) {
+        case FREERDP_ERROR_CONNECT_TRANSPORT_FAILED:
+        case FREERDP_ERROR_CONNECT_ACTIVATION_TIMEOUT:
+            return RDPBridgeDisconnectTimeout;
+        case FREERDP_ERROR_SUCCESS:
+            return RDPBridgeDisconnectServer;
+        default:
+            return RDPBridgeDisconnectError;
+    }
+}
+
 static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     RDPBridgeSession *session = (RDPBridgeSession *)arg;
     HANDLE events[64] = { 0 };
 
     if (!freerdp_connect(session->instance)) {
-        bridge_log(session, "FreeRDP connect failed.");
+        const UINT32 code = freerdp_get_last_error(session->instance->context);
+        const char *description = freerdp_get_last_error_string(code);
+        session->last_error_code = code;
+        bridge_logf(session, "FreeRDP connect failed: %s [0x%08x].", description, code);
+        bridge_failure(session, bridge_failure_kind_for_error(session, code), code, description);
         session->connected = false;
+        bridge_disconnect_event(session, RDPBridgeDisconnectError, code);
         return 1;
     }
 
@@ -765,17 +872,29 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
 
         DWORD status = WaitForMultipleObjects(count, events, FALSE, 50);
         if (status == WAIT_FAILED) {
+            session->last_error_code = GetLastError();
             break;
         }
 
         if (!freerdp_check_event_handles(session->instance->context)) {
+            session->last_error_code = freerdp_get_last_error(session->instance->context);
             break;
         }
     }
 
+    UINT32 code = freerdp_get_last_error(session->instance->context);
+    if (code == FREERDP_ERROR_SUCCESS) {
+        const int ultimatum = freerdp_get_disconnect_ultimatum(session->instance->context);
+        code = ultimatum > 0 ? (UINT32)ultimatum : session->last_error_code;
+    }
+    const RDPBridgeDisconnectKind disconnect_kind = bridge_disconnect_kind_for_error(session, code);
+    if ((disconnect_kind == RDPBridgeDisconnectError) && !session->stop_requested) {
+        bridge_failure(session, bridge_failure_kind_for_error(session, code), code, freerdp_get_last_error_string(code));
+    }
     freerdp_disconnect(session->instance);
     session->connected = false;
     bridge_log(session, "FreeRDP disconnected.");
+    bridge_disconnect_event(session, disconnect_kind, code);
     return 0;
 }
 #endif
@@ -799,6 +918,8 @@ RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeCon
     session->instance->PostConnect = bridge_post_connect;
     session->instance->PostDisconnect = bridge_post_disconnect;
     session->instance->LoadChannels = bridge_load_channels;
+    session->last_error_code = FREERDP_ERROR_SUCCESS;
+    session->certificate_rejected = FALSE;
     if (!freerdp_context_new(session->instance)) {
         freerdp_free(session->instance);
         session->instance = NULL;

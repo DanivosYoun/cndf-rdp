@@ -3,16 +3,49 @@ import FileTransferStaging
 import Foundation
 import FreeRDPBridge
 
-public enum RDPSessionError: Error, Equatable {
+public enum RDPSessionError: Error, Equatable, Sendable {
     case unableToCreateBridgeSession
     case bridgeRejectedOperation(Int32)
+    case networkUnreachable(underlying: String)
+    case tlsHandshakeFailed(reason: String)
+    case authenticationFailed
+    case certificateRejected
+    case freerdp(code: UInt32, description: String)
+    case configurationInvalid(reason: String)
+}
+
+public enum RDPDisconnectReason: Equatable, Sendable {
+    case localRequest
+    case serverDisconnect(code: UInt32?)
+    case timeout
+    case error
 }
 
 public protocol RDPSessionDelegate: AnyObject {
     func rdpSession(_ session: RDPSession, didLog message: String)
+    func rdpSession(
+        _ session: RDPSession,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool
+    func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError)
+    func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason)
     func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String)
     func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile])
     func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame)
+}
+
+public extension RDPSessionDelegate {
+    func rdpSession(
+        _ session: RDPSession,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool { true }
+
+    func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {}
+    func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {}
 }
 
 public final class RDPSession {
@@ -25,6 +58,8 @@ public final class RDPSession {
     private var remoteClipboardSink: RemoteClipboardSink?
     private var remoteFileDownloadManager: RDPRemoteFileDownloadManager?
     private var callbacks: RDPBridgeCallbacks
+    private var logFileURL: URL?
+    private let logLock = NSLock()
 
     public init(
         staging: FileTransferStaging = FileTransferStaging(),
@@ -39,7 +74,27 @@ public final class RDPSession {
         callbacks.log = { message, context in
             guard let message, let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
-            session.delegate?.rdpSession(session, didLog: String(cString: message))
+            session.emitLog(String(cString: message))
+        }
+        callbacks.certificateTrust = { fingerprint, hostname, port, context in
+            guard let context else { return true }
+            let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            return session.evaluateCertificateTrust(
+                fingerprint: fingerprint.map(String.init(cString:)) ?? "",
+                hostname: hostname.map(String.init(cString:)) ?? "",
+                port: port
+            )
+        }
+        callbacks.failure = { kind, code, description, context in
+            guard let context else { return }
+            let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            let text = description.map(String.init(cString:)) ?? ""
+            session.delegate?.rdpSession(session, didFailWith: RDPSessionError(kind: kind, code: code, description: text))
+        }
+        callbacks.disconnect = { kind, code, context in
+            guard let context else { return }
+            let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            session.delegate?.rdpSession(session, didDisconnectWith: RDPDisconnectReason(kind: kind, code: code))
         }
         callbacks.remoteText = { bytes, length, context in
             guard let context else { return }
@@ -121,6 +176,11 @@ public final class RDPSession {
     public func connect(_ options: RDPConnectionOptions) throws {
         guard let bridgeSession else {
             throw RDPSessionError.unableToCreateBridgeSession
+        }
+
+        logFileURL = options.logFileURL
+        if let logFileURL {
+            try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
 
         let status = options.host.withCString { hostPointer in
@@ -249,6 +309,44 @@ public final class RDPSession {
         }
     }
 
+    private func emitLog(_ message: String) {
+        if let logFileURL {
+            logLock.lock()
+            defer { logLock.unlock() }
+            let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+            if let data = line.data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: logFileURL.path),
+                   let handle = try? FileHandle(forWritingTo: logFileURL) {
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                    try? handle.close()
+                } else {
+                    try? data.write(to: logFileURL, options: .atomic)
+                }
+            }
+        }
+        delegate?.rdpSession(self, didLog: message)
+    }
+
+    private func evaluateCertificateTrust(fingerprint: String, hostname: String, port: UInt16) -> Bool {
+        guard let delegate else { return true }
+        let semaphore = DispatchSemaphore(value: 0)
+        let resultQueue = DispatchQueue(label: "rdp.cert-trust.result")
+        var trusted = true
+        Task {
+            let result = await delegate.rdpSession(
+                self,
+                shouldTrustCertificateFingerprint: fingerprint,
+                hostname: hostname,
+                port: port
+            )
+            resultQueue.sync { trusted = result }
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + 120)
+        return resultQueue.sync { trusted }
+    }
+
     private func materializeRemoteFiles(_ entries: [RDPFileListEntry]) {
         guard !entries.isEmpty, let remoteFileDownloadManager else {
             return
@@ -285,6 +383,40 @@ private extension RDPPointerButton {
             return RDPBridgePointerButtonRight
         case .middle:
             return RDPBridgePointerButtonMiddle
+        }
+    }
+}
+
+private extension RDPSessionError {
+    init(kind: RDPBridgeFailureKind, code: UInt32, description: String) {
+        switch kind {
+        case RDPBridgeFailureNetwork:
+            self = .networkUnreachable(underlying: description)
+        case RDPBridgeFailureTLS:
+            self = .tlsHandshakeFailed(reason: description)
+        case RDPBridgeFailureAuthentication:
+            self = .authenticationFailed
+        case RDPBridgeFailureCertificate:
+            self = .certificateRejected
+        case RDPBridgeFailureConfiguration:
+            self = .configurationInvalid(reason: description)
+        default:
+            self = .freerdp(code: code, description: description)
+        }
+    }
+}
+
+private extension RDPDisconnectReason {
+    init(kind: RDPBridgeDisconnectKind, code: UInt32) {
+        switch kind {
+        case RDPBridgeDisconnectLocalRequest:
+            self = .localRequest
+        case RDPBridgeDisconnectServer:
+            self = .serverDisconnect(code: code == 0 ? nil : code)
+        case RDPBridgeDisconnectTimeout:
+            self = .timeout
+        default:
+            self = .error
         }
     }
 }

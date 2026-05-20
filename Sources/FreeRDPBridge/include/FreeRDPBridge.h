@@ -36,7 +36,37 @@ typedef enum RDPBridgeAudioPlaybackMode {
     RDPBridgeAudioPlaybackRemote = 2
 } RDPBridgeAudioPlaybackMode;
 
+typedef enum RDPBridgeFailureKind {
+    RDPBridgeFailureNetwork = 0,
+    RDPBridgeFailureTLS = 1,
+    RDPBridgeFailureAuthentication = 2,
+    RDPBridgeFailureCertificate = 3,
+    RDPBridgeFailureConfiguration = 4,
+    RDPBridgeFailureFreeRDP = 5
+} RDPBridgeFailureKind;
+
+typedef enum RDPBridgeDisconnectKind {
+    RDPBridgeDisconnectLocalRequest = 0,
+    RDPBridgeDisconnectServer = 1,
+    RDPBridgeDisconnectTimeout = 2,
+    RDPBridgeDisconnectError = 3
+} RDPBridgeDisconnectKind;
+
 typedef void (*RDPBridgeLogCallback)(const char *message, void *context);
+typedef bool (*RDPBridgeCertificateTrustCallback)(
+    const char *fingerprint,
+    const char *hostname,
+    uint16_t port,
+    void *context);
+typedef void (*RDPBridgeFailureCallback)(
+    RDPBridgeFailureKind kind,
+    uint32_t code,
+    const char *description,
+    void *context);
+typedef void (*RDPBridgeDisconnectCallback)(
+    RDPBridgeDisconnectKind kind,
+    uint32_t code,
+    void *context);
 typedef void (*RDPBridgeRemoteTextCallback)(const uint8_t *utf8, size_t length, void *context);
 typedef void (*RDPBridgeRemoteFileListCallback)(const uint8_t *payload, size_t length, void *context);
 typedef void (*RDPBridgeRemoteFileContentsCallback)(
@@ -53,6 +83,9 @@ typedef void (*RDPBridgeFrameCallback)(
 
 typedef struct RDPBridgeCallbacks {
     RDPBridgeLogCallback log;
+    RDPBridgeCertificateTrustCallback certificateTrust;
+    RDPBridgeFailureCallback failure;
+    RDPBridgeDisconnectCallback disconnect;
     RDPBridgeRemoteTextCallback remoteText;
     RDPBridgeRemoteFileListCallback remoteFileList;
     RDPBridgeRemoteFileContentsCallback remoteFileContents;

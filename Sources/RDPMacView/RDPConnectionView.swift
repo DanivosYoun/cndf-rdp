@@ -4,6 +4,14 @@ import RDPClientCore
 public protocol RDPConnectionViewDelegate: AnyObject {
     func rdpConnectionView(_ view: RDPConnectionView, didLog message: String)
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool)
+    func rdpConnectionView(
+        _ view: RDPConnectionView,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool
+    func rdpConnectionView(_ view: RDPConnectionView, didFailWith error: RDPSessionError)
+    func rdpConnectionView(_ view: RDPConnectionView, didDisconnectWith reason: RDPDisconnectReason)
     func rdpConnectionView(_ view: RDPConnectionView, didReceiveRemoteText text: String)
     func rdpConnectionView(_ view: RDPConnectionView, didReceiveRemoteFiles files: [RDPRemoteFile])
 }
@@ -11,6 +19,14 @@ public protocol RDPConnectionViewDelegate: AnyObject {
 public extension RDPConnectionViewDelegate {
     func rdpConnectionView(_ view: RDPConnectionView, didLog message: String) {}
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {}
+    func rdpConnectionView(
+        _ view: RDPConnectionView,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool { true }
+    func rdpConnectionView(_ view: RDPConnectionView, didFailWith error: RDPSessionError) {}
+    func rdpConnectionView(_ view: RDPConnectionView, didDisconnectWith reason: RDPDisconnectReason) {}
     func rdpConnectionView(_ view: RDPConnectionView, didReceiveRemoteText text: String) {}
     func rdpConnectionView(_ view: RDPConnectionView, didReceiveRemoteFiles files: [RDPRemoteFile]) {}
 }
@@ -100,6 +116,28 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
             }
             self.delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
         }
+    }
+
+    public func rdpSession(
+        _ session: RDPSession,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool {
+        await delegate?.rdpConnectionView(
+            self,
+            shouldTrustCertificateFingerprint: fingerprint,
+            hostname: hostname,
+            port: port
+        ) ?? true
+    }
+
+    public func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {
+        delegate?.rdpConnectionView(self, didFailWith: error)
+    }
+
+    public func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {
+        delegate?.rdpConnectionView(self, didDisconnectWith: reason)
     }
 
     public func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String) {
