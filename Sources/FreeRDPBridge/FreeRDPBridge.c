@@ -59,6 +59,8 @@ typedef struct RDPBridgeContext {
     rdpContext _p;
     RDPBridgeSession *session;
 } RDPBridgeContext;
+
+static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_timeout);
 #endif
 
 static void bridge_log(RDPBridgeSession *session, const char *message) {
@@ -110,7 +112,11 @@ void rdp_bridge_session_destroy(RDPBridgeSession *session) {
         return;
     }
 
-    rdp_bridge_disconnect(session);
+#if defined(RDP_FREERDP_REAL)
+    (void)bridge_disconnect(session, INFINITE);
+#else
+    (void)rdp_bridge_disconnect(session);
+#endif
     free(session);
 }
 
@@ -1003,17 +1009,37 @@ RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeCon
 }
 
 RDPBridgeStatus rdp_bridge_disconnect(RDPBridgeSession *session) {
+#if defined(RDP_FREERDP_REAL)
+    return bridge_disconnect(session, 5000);
+#else
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    session->connected = false;
+    return RDPBridgeStatusOK;
+#endif
+}
+
+#if defined(RDP_FREERDP_REAL)
+static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_timeout) {
     if (session == NULL) {
         return RDPBridgeStatusInvalidArgument;
     }
 
-#if defined(RDP_FREERDP_REAL)
     session->stop_requested = true;
     if ((session->instance != NULL) && (session->instance->context != NULL)) {
         freerdp_abort_connect_context(session->instance->context);
     }
     if (session->thread != NULL) {
-        WaitForSingleObject(session->thread, 5000);
+        DWORD wait_status = WaitForSingleObject(session->thread, wait_timeout);
+        if (wait_status == WAIT_TIMEOUT) {
+            bridge_log(session, "FreeRDP disconnect timed out while waiting for the event loop thread.");
+            return RDPBridgeStatusInternalError;
+        }
+        if (wait_status != WAIT_OBJECT_0) {
+            bridge_log(session, "FreeRDP disconnect failed while waiting for the event loop thread.");
+            return RDPBridgeStatusInternalError;
+        }
         CloseHandle(session->thread);
         session->thread = NULL;
     }
@@ -1028,10 +1054,10 @@ RDPBridgeStatus rdp_bridge_disconnect(RDPBridgeSession *session) {
     bridge_clear_local_files(session);
     session->disp = NULL;
     session->cliprdr = NULL;
-#endif
     session->connected = false;
     return RDPBridgeStatusOK;
 }
+#endif
 
 bool rdp_bridge_is_connected(const RDPBridgeSession *session) {
     return (session != NULL) && session->connected;

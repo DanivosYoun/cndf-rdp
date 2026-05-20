@@ -73,6 +73,7 @@ public final class RDPSession {
     private var callbacks: RDPBridgeCallbacks
     private var logFileURL: URL?
     private let logLock = NSLock()
+    private let sessionLock = NSRecursiveLock()
     private let statisticsLock = NSLock()
     private var statisticsStorage = MutableRDPConnectionStatistics()
     private var lastConnectionOptions: RDPConnectionOptions?
@@ -193,14 +194,15 @@ public final class RDPSession {
 
     deinit {
         if let bridgeSession {
-            rdp_bridge_disconnect(bridgeSession)
             rdp_bridge_session_destroy(bridgeSession)
         }
     }
 
     public var isConnected: Bool {
-        guard let bridgeSession else { return false }
-        return rdp_bridge_is_connected(bridgeSession)
+        withSessionLock {
+            guard let bridgeSession else { return false }
+            return rdp_bridge_is_connected(bridgeSession)
+        }
     }
 
     public var statistics: RDPConnectionStatistics {
@@ -210,41 +212,42 @@ public final class RDPSession {
     }
 
     public func connect(_ options: RDPConnectionOptions) throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
-        }
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
 
-        logFileURL = options.logFileURL
-        if let logFileURL {
-            try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        }
+            logFileURL = options.logFileURL
+            if let logFileURL {
+                try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            }
 
-        resetStatistics()
-        lastConnectionOptions = options
+            resetStatistics()
 
-        let status = options.host.withCString { hostPointer in
-            withOptionalCString(options.username) { usernamePointer in
-                withPasswordCString(options) { passwordPointer in
-                    withOptionalCString(options.domain) { domainPointer in
-                        withOptionalCString(options.redirectedFolderPath) { folderPathPointer in
-                            withOptionalCString(options.redirectedFolderName) { folderNamePointer in
-                                withLogFilterCString(options.logFilters) { logFiltersPointer in
-                                    options.logLevel.rawValue.uppercased().withCString { logLevelPointer in
-                                        var bridgeOptions = RDPBridgeConnectionOptions(
-                                            host: hostPointer,
-                                            port: options.port,
-                                            username: usernamePointer,
-                                            password: passwordPointer,
-                                            domain: domainPointer,
-                                            enableClipboard: options.enableClipboard,
-                                            enableDriveRedirection: options.enableDriveRedirection || options.redirectedFolderPath != nil,
-                                            redirectedFolderPath: folderPathPointer,
-                                            redirectedFolderName: folderNamePointer,
-                                            audioPlaybackMode: RDPBridgeAudioPlaybackMode(rawValue: options.audioPlaybackMode.rawValue),
-                                            logLevel: logLevelPointer,
-                                            logFilters: logFiltersPointer
-                                        )
-                                        return rdp_bridge_connect(bridgeSession, &bridgeOptions)
+            let status = options.host.withCString { hostPointer in
+                withOptionalCString(options.username) { usernamePointer in
+                    withPasswordCString(options) { passwordPointer in
+                        withOptionalCString(options.domain) { domainPointer in
+                            withOptionalCString(options.redirectedFolderPath) { folderPathPointer in
+                                withOptionalCString(options.redirectedFolderName) { folderNamePointer in
+                                    withLogFilterCString(options.logFilters) { logFiltersPointer in
+                                        options.logLevel.rawValue.uppercased().withCString { logLevelPointer in
+                                            var bridgeOptions = RDPBridgeConnectionOptions(
+                                                host: hostPointer,
+                                                port: options.port,
+                                                username: usernamePointer,
+                                                password: passwordPointer,
+                                                domain: domainPointer,
+                                                enableClipboard: options.enableClipboard,
+                                                enableDriveRedirection: options.enableDriveRedirection || options.redirectedFolderPath != nil,
+                                                redirectedFolderPath: folderPathPointer,
+                                                redirectedFolderName: folderNamePointer,
+                                                audioPlaybackMode: RDPBridgeAudioPlaybackMode(rawValue: options.audioPlaybackMode.rawValue),
+                                                logLevel: logLevelPointer,
+                                                logFilters: logFiltersPointer
+                                            )
+                                            return rdp_bridge_connect(bridgeSession, &bridgeOptions)
+                                        }
                                     }
                                 }
                             }
@@ -252,34 +255,41 @@ public final class RDPSession {
                     }
                 }
             }
-        }
 
-        try throwIfNeeded(status)
+            try throwIfNeeded(status)
+            lastConnectionOptions = options
+        }
     }
 
     public func reconnect() throws {
-        guard let lastConnectionOptions else {
-            throw RDPSessionError.configurationInvalid(reason: "No previous RDP connection options are available.")
+        try withSessionLock {
+            guard let lastConnectionOptions else {
+                throw RDPSessionError.configurationInvalid(reason: "No previous RDP connection options are available.")
+            }
+            try disconnect()
+            try connect(lastConnectionOptions)
         }
-        try disconnect()
-        try connect(lastConnectionOptions)
     }
 
     public func disconnect() throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(rdp_bridge_disconnect(bridgeSession))
         }
-        try throwIfNeeded(rdp_bridge_disconnect(bridgeSession))
     }
 
     public func pollLocalClipboard() throws {
-        do {
-            try clipboardCoordinator?.pollLocalPasteboard()
-        } catch ClipboardBridgeError.noSupportedPasteboardContent {
-            return
-        } catch {
-            delegate?.rdpSession(self, didLog: "Local clipboard sync failed: \(error)")
-            throw error
+        try withSessionLock {
+            do {
+                try clipboardCoordinator?.pollLocalPasteboard()
+            } catch ClipboardBridgeError.noSupportedPasteboardContent {
+                return
+            } catch {
+                delegate?.rdpSession(self, didLog: "Local clipboard sync failed: \(error)")
+                throw error
+            }
         }
     }
 
@@ -290,7 +300,9 @@ public final class RDPSession {
                 let values = try url.resourceValues(forKeys: [.fileSizeKey])
                 return total + UInt64(values.fileSize ?? 0)
             }
-            try remoteClipboardSink?.sendLocalFiles(urls)
+            try withSessionLock {
+                try remoteClipboardSink?.sendLocalFiles(urls)
+            }
             updateStatistics { stats in
                 stats.localFilesOffered += UInt64(urls.count)
                 stats.localFileBytesOffered += offeredBytes
@@ -303,7 +315,9 @@ public final class RDPSession {
     }
 
     public func sendLocalText(_ text: String) throws {
-        try remoteClipboardSink?.sendLocalText(text)
+        try withSessionLock {
+            try remoteClipboardSink?.sendLocalText(text)
+        }
         updateStatistics { stats in
             stats.localClipboardTextsSent += 1
             stats.lastActivityAt = Date()
@@ -311,9 +325,6 @@ public final class RDPSession {
     }
 
     public func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool = false) throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
-        }
         guard let size = resizeCoordinator.sizeToSend(
             pointWidth: pointWidth,
             pointHeight: pointHeight,
@@ -323,50 +334,63 @@ public final class RDPSession {
             return
         }
 
-        try throwIfNeeded(
-            rdp_bridge_update_desktop_size(
-                bridgeSession,
-                size.pixelWidth,
-                size.pixelHeight,
-                size.scale
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(
+                rdp_bridge_update_desktop_size(
+                    bridgeSession,
+                    size.pixelWidth,
+                    size.pixelHeight,
+                    size.scale
+                )
             )
-        )
+        }
     }
 
     public func sendPointerMove(_ location: RDPPointerLocation) throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(rdp_bridge_send_pointer_move(bridgeSession, location.pixelX, location.pixelY))
         }
-        try throwIfNeeded(rdp_bridge_send_pointer_move(bridgeSession, location.pixelX, location.pixelY))
     }
 
     public func sendPointerButton(_ button: RDPPointerButton, at location: RDPPointerLocation, pressed: Bool) throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
-        }
-        try throwIfNeeded(
-            rdp_bridge_send_pointer_button(
-                bridgeSession,
-                location.pixelX,
-                location.pixelY,
-                button.bridgeValue,
-                pressed
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(
+                rdp_bridge_send_pointer_button(
+                    bridgeSession,
+                    location.pixelX,
+                    location.pixelY,
+                    button.bridgeValue,
+                    pressed
+                )
             )
-        )
+        }
     }
 
     public func sendScroll(deltaX: Int32, deltaY: Int32) throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(rdp_bridge_send_scroll(bridgeSession, deltaX, deltaY))
         }
-        try throwIfNeeded(rdp_bridge_send_scroll(bridgeSession, deltaX, deltaY))
     }
 
     public func sendKey(keyCode: UInt16, pressed: Bool) throws {
-        guard let bridgeSession else {
-            throw RDPSessionError.unableToCreateBridgeSession
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(rdp_bridge_send_key(bridgeSession, keyCode, pressed))
         }
-        try throwIfNeeded(rdp_bridge_send_key(bridgeSession, keyCode, pressed))
     }
 
     private func throwIfNeeded(_ status: RDPBridgeStatus) throws {
@@ -423,6 +447,12 @@ public final class RDPSession {
         statisticsLock.lock()
         update(&statisticsStorage)
         statisticsLock.unlock()
+    }
+
+    private func withSessionLock<T>(_ body: () throws -> T) rethrows -> T {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return try body()
     }
 
     private func materializeRemoteFiles(_ entries: [RDPFileListEntry]) {

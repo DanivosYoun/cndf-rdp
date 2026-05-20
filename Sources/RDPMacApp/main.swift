@@ -11,7 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
     private var receivedFrameCount = 0
     private var lastFrameSize: CGSize = .zero
     private var didRunExplorerFilePasteAutotest = false
-    private var didRunReconnectAutotest = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
@@ -103,7 +102,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
             }
             if message == "Display control channel connected." {
                 self?.runExplorerFilePasteAutotestIfNeeded()
-                self?.runReconnectAutotestIfNeeded()
             }
         }
     }
@@ -169,26 +167,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
                 session.delegate?.rdpSession(session, didLog: "Explorer file copyback autotest sent Ctrl+C.")
             } catch {
                 session.delegate?.rdpSession(session, didLog: "Explorer file paste autotest failed: \(error)")
-            }
-        }
-    }
-
-    private func runReconnectAutotestIfNeeded() {
-        guard !didRunReconnectAutotest,
-              ProcessInfo.processInfo.environment["RDP_MAC_AUTOTEST_RECONNECT"] == "1",
-              let session else {
-            return
-        }
-        didRunReconnectAutotest = true
-
-        DispatchQueue.global(qos: .utility).async { [weak session] in
-            Thread.sleep(forTimeInterval: 2.0)
-            guard let session else { return }
-            do {
-                try session.reconnect()
-                session.delegate?.rdpSession(session, didLog: "Reconnect autotest completed.")
-            } catch {
-                session.delegate?.rdpSession(session, didLog: "Reconnect autotest failed: \(error)")
             }
         }
     }
