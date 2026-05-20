@@ -14,6 +14,7 @@ let package = Package(
     products: [
         .executable(name: "rdp-mac", targets: ["RDPMacApp"]),
         .library(name: "RDPClientCore", targets: ["RDPClientCore"]),
+        .library(name: "RDPMacView", targets: ["RDPMacView"]),
         .library(name: "ClipboardBridge", targets: ["ClipboardBridge"]),
         .library(name: "FileTransferStaging", targets: ["FileTransferStaging"]),
         .library(name: "FreeRDPBridge", targets: ["FreeRDPBridge"])
@@ -21,6 +22,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "RDPMacApp",
+            dependencies: ["RDPClientCore", "RDPMacView"]
+        ),
+        .target(
+            name: "RDPMacView",
             dependencies: ["RDPClientCore"]
         ),
         .target(

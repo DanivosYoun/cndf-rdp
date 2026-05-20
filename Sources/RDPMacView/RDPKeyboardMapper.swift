@@ -1,12 +1,12 @@
 import AppKit
 
-enum RDPKeyboardMapper {
-    static let extended: UInt16 = 0x0100
+public enum RDPKeyboardMapper {
+    public static let extended: UInt16 = 0x0100
 
-    static let leftShift: UInt16 = 0x2A
-    static let leftControl: UInt16 = 0x1D
-    static let leftAlt: UInt16 = 0x38
-    static let leftWindows: UInt16 = extended | 0x5B
+    public static let leftShift: UInt16 = 0x2A
+    public static let leftControl: UInt16 = 0x1D
+    public static let leftAlt: UInt16 = 0x38
+    public static let leftWindows: UInt16 = extended | 0x5B
 
     private static let keyMap: [UInt16: UInt16] = [
         0: 0x1E, 1: 0x1F, 2: 0x20, 3: 0x21, 4: 0x23, 5: 0x22, 6: 0x2C, 7: 0x2D,
@@ -30,11 +30,11 @@ enum RDPKeyboardMapper {
         0: 0x1E, 6: 0x2C, 7: 0x2D, 8: 0x2E, 9: 0x2F
     ]
 
-    static func scancode(for macKeyCode: UInt16) -> UInt16? {
+    public static func scancode(for macKeyCode: UInt16) -> UInt16? {
         keyMap[macKeyCode]
     }
 
-    static func commandShortcutScancode(for macKeyCode: UInt16) -> UInt16? {
+    public static func commandShortcutScancode(for macKeyCode: UInt16) -> UInt16? {
         commandShortcutMap[macKeyCode]
     }
 }

@@ -5,6 +5,7 @@ SwiftPM-based macOS RDP client scaffold with a thin FreeRDP bridge and separate 
 ## Modules
 
 - `RDPMacApp`: AppKit executable with a connection bar and RDP surface.
+- `RDPMacView`: embeddable AppKit view package for host macOS apps.
 - `RDPClientCore`: Swift session lifecycle wrapper and delegate API.
 - `FreeRDPBridge`: narrow C ABI for FreeRDP integration, linked against the vendored FreeRDP 3.26 build.
 - `ClipboardBridge`: `NSPasteboard` read/write coordination and local-to-remote clipboard dispatch.
@@ -38,6 +39,7 @@ The bridge currently provides:
 - Mac-to-RDP file paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
 - RDP-to-Mac file paste materialization using remote range requests and local staged file URLs
 - Finder file drag/drop into the RDP surface with automatic remote paste trigger
+- embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
 
 The bridge registers FreeRDP's static addin provider directly because it creates a
 minimal `freerdp_new()` session instead of using the full FreeRDP client wrapper.
@@ -73,6 +75,43 @@ file size requests, and file range requests.
 ```sh
 swift test
 ```
+
+## Embed In Another App
+
+Add this repository as a SwiftPM dependency:
+
+```swift
+.package(url: "https://github.com/CNDF-WORK/terminal-rdp.git", branch: "main")
+```
+
+Then depend on `RDPMacView` from the app target:
+
+```swift
+.product(name: "RDPMacView", package: "terminal-rdp")
+```
+
+Use `RDPConnectionView` as a normal `NSView`:
+
+```swift
+import RDPMacView
+import RDPClientCore
+
+let rdpView = RDPConnectionView(frame: container.bounds)
+rdpView.autoresizingMask = [.width, .height]
+container.addSubview(rdpView)
+
+try rdpView.connect(
+    RDPConnectionOptions(
+        host: host,
+        port: 3389,
+        username: username,
+        password: password,
+        domain: domain
+    )
+)
+```
+
+`RDPConnectionView` owns the `RDPSession`, renders frames through Metal, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
 
 ## External Credentials
 

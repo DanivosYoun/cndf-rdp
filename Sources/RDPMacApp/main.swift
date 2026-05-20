@@ -1,5 +1,6 @@
 import AppKit
 import RDPClientCore
+import RDPMacView
 
 final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, ConnectionBarViewDelegate {
     private var session: RDPSession?
