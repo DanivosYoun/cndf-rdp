@@ -69,10 +69,40 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
             drainRunLoop()
         }
     }
+
+    func testShutdownRetainGraveyardSurvivesDelayedMainQueueDrain() {
+        autoreleasepool {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+                styleMask: [.titled, .closable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            let view = RDPConnectionView(frame: window.contentView?.bounds ?? .zero)
+            window.contentView = view
+            window.makeKeyAndOrderFront(nil)
+
+            let diagnostics = view.shutdown()
+            window.close()
+            drainRunLoop(duration: 2.5)
+
+            XCTAssertFalse(view.isConnected)
+            XCTAssertEqual(diagnostics.pendingMainQueueTasks, 0)
+            XCTAssertEqual(diagnostics.inFlightCommandBuffers, 0)
+        }
+        drainRunLoop()
+    }
 }
 
 private func drainRunLoop(cycles: Int = 5) {
     for _ in 0..<cycles {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+    }
+}
+
+private func drainRunLoop(duration: TimeInterval) {
+    let deadline = Date().addingTimeInterval(duration)
+    while Date() < deadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
     }
 }

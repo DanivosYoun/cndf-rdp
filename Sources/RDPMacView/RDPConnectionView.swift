@@ -57,7 +57,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     private let mainCallbackLock = NSLock()
     private var pendingMainCallbacks = 0
     private static let shutdownRetainLock = NSLock()
-    private static var shutdownRetainContexts: [UUID: ShutdownRetainContext] = [:]
+    private static var shutdownRetainContexts: [Unmanaged<ShutdownRetainContext>] = []
 
     public override init(frame frameRect: NSRect) {
         self.clientView = RDPClientView(frame: frameRect)
@@ -187,17 +187,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     private func retainThroughCloseDrain(window: NSWindow) {
-        let id = UUID()
         let context = ShutdownRetainContext(view: self, window: window)
         Self.shutdownRetainLock.lock()
-        Self.shutdownRetainContexts[id] = context
+        Self.shutdownRetainContexts.append(Unmanaged.passRetained(context))
         Self.shutdownRetainLock.unlock()
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            Self.shutdownRetainLock.lock()
-            Self.shutdownRetainContexts[id] = nil
-            Self.shutdownRetainLock.unlock()
-        }
     }
 
     private func detachSessionForAsyncDisconnect() {

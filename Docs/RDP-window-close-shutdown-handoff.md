@@ -42,8 +42,8 @@ in-flight.
 - Calls `releaseDrawables()`.
 - Removes the Metal subview from its superview.
 - Disables the current window close animation and orders the window out.
-- Retains the view/window for a short post-shutdown grace period to let AppKit and Core Animation
-  drain close and autorelease work safely.
+- Retains the already-shut-down view/window in a process-lifetime unmanaged graveyard so AppKit and
+  Core Animation never release the close path objects after `window.close()`.
 - Detaches the RDP session delegate and suppresses late callbacks.
 - Synchronously disconnects the RDP session so FreeRDP worker teardown is complete when shutdown
   returns.
@@ -58,7 +58,8 @@ in-flight.
   - Added shutdown guards for reconnect, polling, frame display, and delegate callbacks.
   - Replaced async shutdown disconnect with synchronous session detach/disconnect.
   - Added queued main-callback accounting/drain.
-  - Added a short retained close context for the view/window.
+  - Added a process-lifetime unmanaged close-context graveyard for the already-shut-down
+    view/window shell.
 - `Sources/RDPMacView/RDPClientView.swift`
   - Added `shutdownRendering()`.
   - Added `window == nil` guard in `viewDidMoveToWindow()`.
@@ -74,6 +75,7 @@ in-flight.
   - Covers shutdown diagnostics.
   - Covers repeated `RDPConnectionView` hosting in `NSWindow`, `shutdown()`, `window.close()`, and
     autorelease-drain survival.
+  - Covers delayed main-queue drain past the previous 2-second release point.
 
 ## Verification
 
@@ -83,10 +85,11 @@ Automated:
 swift test
 ```
 
-Expected result: all 22 package tests pass.
+Expected result: all 23 package tests pass.
 
 Automated window-close coverage now includes 10 repeated `NSWindow` host + `shutdown()` +
-`window.close()` cycles with run-loop/autorelease draining.
+`window.close()` cycles with run-loop/autorelease draining, plus a delayed drain that runs past the
+previous 2-second retain-release crash point.
 
 Manual window-close verification for terminal integration:
 
@@ -104,3 +107,7 @@ Manual window-close verification for terminal integration:
 - Use `shutdown()` for window/view lifetime teardown. It may block briefly while FreeRDP exits.
 - The host app should not touch `rdpView.clientView.isPaused`, `delegate`, or `releaseDrawables()`
   directly after adopting this API.
+- `shutdown()` intentionally retains the closed `NSWindow` plus `RDPConnectionView` shell for the
+  rest of the process. The RDP session, Metal renderer, drawables, delegates, and clipboard timer
+  are already detached, so this trades a small bounded-per-window shell leak for crash-free close
+  behavior on macOS 26.4.1.
