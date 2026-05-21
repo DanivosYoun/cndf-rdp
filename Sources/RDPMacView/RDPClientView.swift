@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import RDPClientCore
 
 public final class RDPClientView: NSView {
@@ -10,6 +11,17 @@ public final class RDPClientView: NSView {
     private var pendingResizeWorkItem: DispatchWorkItem?
     private var isRenderPipelineShutdown = false
     private let frameColorSpace = CGColorSpaceCreateDeviceRGB()
+    private static let disabledLayerActions: [String: CAAction] = [
+        "backgroundColor": NSNull(),
+        "bounds": NSNull(),
+        "contents": NSNull(),
+        "contentsGravity": NSNull(),
+        "contentsScale": NSNull(),
+        "onOrderIn": NSNull(),
+        "onOrderOut": NSNull(),
+        "position": NSNull(),
+        "sublayers": NSNull()
+    ]
 
     public override var acceptsFirstResponder: Bool {
         true
@@ -35,6 +47,7 @@ public final class RDPClientView: NSView {
         backingLayer.backgroundColor = NSColor.black.cgColor
         backingLayer.contentsGravity = .resizeAspect
         backingLayer.masksToBounds = true
+        backingLayer.actions = Self.disabledLayerActions
         layer = backingLayer
         registerForDraggedTypes([.fileURL])
     }
@@ -176,8 +189,11 @@ public final class RDPClientView: NSView {
         guard !isRenderPipelineShutdown else { return }
         guard let image = makeImage(from: frame) else { return }
         remoteFrameSize = CGSize(width: frame.width, height: frame.height)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer?.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
         layer?.contents = image
+        CATransaction.commit()
     }
 
     @discardableResult
@@ -197,8 +213,11 @@ public final class RDPClientView: NSView {
         remoteFrameSize = .zero
         isHidden = true
         session = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer?.removeAllAnimations()
         layer?.contents = nil
+        CATransaction.commit()
         removeFromSuperview()
         return 0
     }

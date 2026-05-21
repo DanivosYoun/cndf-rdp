@@ -61,6 +61,7 @@ The bridge currently provides:
 - optional 1x resize mode for low-bandwidth sessions
 - optional fixed remote desktop size for force-display-mode style workflows
 - configurable FreeRDP color depth: 16, 24, or 32 bpp
+- frame presentation disables `CALayer` implicit animations so RDP frames swap immediately without fade/transition effects
 - serialized `RDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
 - hardened FreeRDP teardown that waits for the event-loop thread before freeing native session state
 - explicit `RDPConnectionView.shutdown()` for safe `NSWindow` close and render-surface teardown
@@ -79,6 +80,7 @@ Smooth interactive behavior depends on keeping resize, rendering, input, and cli
 - desktop resize updates are coalesced by `DisplayResizeCoordinator`
 - Retina displays send point size multiplied by `NSWindow.backingScaleFactor` unless `preferDeviceNativeResolution` is disabled
 - `forcedDesktopSize` locks the remote framebuffer size and scales it proportionally inside the local view
+- the frame layer disables implicit `contents`, `contentsScale`, bounds, and position animations to avoid fade-like frame transitions
 - clipboard/file transfers are staged outside the UI path
 - the bridge API has an explicit `rdp_bridge_update_desktop_size` hook for FreeRDP display control integration
 
@@ -181,6 +183,7 @@ Verified against a Windows RDP test host on 2026-05-21:
 - live resize smoke tests verified Retina/native scale (`1920x1280 scale=2.00`), 1x opt-out
   (`960x640 scale=1.00`), forced desktop size (`1920x1080 scale=1.00`), and 16/24 bpp
   connection negotiation without new crash reports
+- frame-layer implicit animation suppression is covered by unit tests and live smoke-tested with RDP connect/shutdown
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
 - Mac-to-RDP folder paste was live-tested through Explorer; Windows requested descriptors plus file size/range reads for both root and nested files
 - folder paste is staged recursively as relative file paths such as `Folder\Sub\file.txt`
@@ -196,7 +199,7 @@ Verified against a Windows RDP test host on 2026-05-21:
   `didWait=true`, `pendingMain=0`, and `inFlight=0`, and no new macOS crash report was created
 - folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all 26 package tests, with the live RDP close test skipped unless
+- `swift test` passes all 27 package tests, with the live RDP close test skipped unless
   `RDP_WINDOW_CLOSE_INTEGRATION=1` is set
 
 Manual checklist for future changes:
