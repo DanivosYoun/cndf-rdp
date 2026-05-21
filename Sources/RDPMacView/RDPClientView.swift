@@ -167,17 +167,19 @@ public final class RDPClientView: MTKView {
         renderer?.update(frame: frame)
     }
 
-    public func shutdownRendering() {
+    @discardableResult
+    public func shutdownRendering(waitTimeout: TimeInterval = 1.0) -> Int {
         isRenderPipelineShutdown = true
         pendingResizeWorkItem?.cancel()
         pendingResizeWorkItem = nil
         isPaused = true
         delegate = nil
-        renderer?.shutdown()
+        let remainingCommandBuffers = renderer?.shutdown(waitTimeout: waitTimeout) ?? 0
         renderer = nil
         session = nil
         releaseDrawables()
         removeFromSuperview()
+        return remainingCommandBuffers
     }
 
     private func sendPointerMove(_ event: NSEvent) {

@@ -4,9 +4,9 @@ Target repository: `DanivosYoun/cndf-rdp`
 
 ## Summary
 
-`RDPConnectionView` now has an explicit `shutdown()` API for host apps that present RDP in a
-separate `NSWindow`. Call `shutdown()` before `window.close()` or before removing the view from the
-window hierarchy.
+`RDPConnectionView` now has an explicit synchronous `shutdown()` API for host apps that present RDP
+in a separate `NSWindow`. Call `shutdown()` before `window.close()` or before removing the view from
+the window hierarchy.
 
 The fix addresses a close-time SIGSEGV caused by AppKit/Core Animation releasing a window transform
 animation while Metal drawables and the `MTKView` display link were still tied to the closing window.
@@ -29,38 +29,51 @@ window.close()
 `shutdown()` is one-way. Do not call `connect(_:)` again on the same `RDPConnectionView`; create a
 new view for the next RDP window.
 
+`shutdown()` returns `RDPShutdownDiagnostics` so the host app can log whether FreeRDP worker teardown
+was waited, how many queued main callbacks remain, and how many Metal command buffers are still
+in-flight.
+
 ## What `shutdown()` Does
 
 - Stops the `MTKView` display link with `isPaused = true`.
 - Clears the Metal delegate.
 - Clears renderer texture state.
+- Waits for in-flight Metal command buffers to complete.
 - Calls `releaseDrawables()`.
 - Removes the Metal subview from its superview.
 - Disables the current window close animation and orders the window out.
-- Retains the view/window for two main-runloop turns to let AppKit and Core Animation drain close
-  and autorelease work safely.
+- Retains the view/window for a short post-shutdown grace period to let AppKit and Core Animation
+  drain close and autorelease work safely.
 - Detaches the RDP session delegate and suppresses late callbacks.
-- Disconnects the RDP session on a utility queue so the window close path does not block on FreeRDP
-  teardown.
+- Synchronously disconnects the RDP session so FreeRDP worker teardown is complete when shutdown
+  returns.
+- Drains queued main-thread RDP view callbacks before returning when possible.
 
 ## Package Changes
 
 - `Sources/RDPMacView/RDPConnectionView.swift`
-  - Added `public func shutdown()`.
+  - Added `public func shutdown() -> RDPShutdownDiagnostics`.
+  - Added `RDPShutdownDiagnostics`.
   - Removed blocking session disconnect from `deinit`.
   - Added shutdown guards for reconnect, polling, frame display, and delegate callbacks.
-  - Added async session detach/disconnect for shutdown.
+  - Replaced async shutdown disconnect with synchronous session detach/disconnect.
+  - Added queued main-callback accounting/drain.
+  - Added a short retained close context for the view/window.
 - `Sources/RDPMacView/RDPClientView.swift`
   - Added `shutdownRendering()`.
   - Added `window == nil` guard in `viewDidMoveToWindow()`.
   - Cancels pending resize work and blocks resize/frame updates after renderer shutdown.
 - `Sources/RDPMacView/RDPMetalRenderer.swift`
   - Added renderer shutdown state.
+  - Tracks in-flight command buffers and waits during shutdown.
   - Clears texture/frame state and blocks further draw/update calls after shutdown.
 - `Tests/RDPMacViewTests/RDPConnectionViewLifecycleTests.swift`
   - Covers shutdown idempotence.
   - Covers connect-after-shutdown rejection.
   - Covers delegate detachment and late-callback suppression.
+  - Covers shutdown diagnostics.
+  - Covers repeated `RDPConnectionView` hosting in `NSWindow`, `shutdown()`, `window.close()`, and
+    autorelease-drain survival.
 
 ## Verification
 
@@ -70,10 +83,12 @@ Automated:
 swift test
 ```
 
-Expected result: all 21 package tests pass.
+Expected result: all 22 package tests pass.
 
-Manual window-close verification, because `NSWindow.close()` inside XCTest can crash XCTest's own
-invalid-object checker on macOS 26.4.1:
+Automated window-close coverage now includes 10 repeated `NSWindow` host + `shutdown()` +
+`window.close()` cycles with run-loop/autorelease draining.
+
+Manual window-close verification for terminal integration:
 
 1. Open an RDP window that hosts `RDPConnectionView`.
 2. Connect to a real RDP host and wait for at least one frame.
@@ -86,6 +101,6 @@ invalid-object checker on macOS 26.4.1:
 ## Notes
 
 - `RDPConnectionView.disconnect()` is still available for normal in-view disconnect behavior.
-- Use `shutdown()` for window/view lifetime teardown.
+- Use `shutdown()` for window/view lifetime teardown. It may block briefly while FreeRDP exits.
 - The host app should not touch `rdpView.clientView.isPaused`, `delegate`, or `releaseDrawables()`
   directly after adopting this API.

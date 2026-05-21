@@ -7,11 +7,15 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
     func testShutdownIsIdempotent() {
         let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
 
-        view.shutdown()
-        view.shutdown()
+        let firstDiagnostics = view.shutdown()
+        let secondDiagnostics = view.shutdown()
 
         XCTAssertFalse(view.isConnected)
         XCTAssertNil(view.statistics)
+        XCTAssertFalse(firstDiagnostics.didWaitForFreeRDPWorker)
+        XCTAssertEqual(firstDiagnostics.pendingMainQueueTasks, 0)
+        XCTAssertEqual(firstDiagnostics.inFlightCommandBuffers, 0)
+        XCTAssertFalse(secondDiagnostics.didWaitForFreeRDPWorker)
     }
 
     func testShutdownDetachesDelegateAfterSingleStateCallback() throws {
@@ -39,6 +43,37 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
                 .configurationInvalid(reason: "RDPConnectionView has been shut down.")
             )
         }
+    }
+
+    func testShutdownThenWindowCloseSurvivesAutoreleaseDrain() {
+        for _ in 0..<10 {
+            autoreleasepool {
+                let window = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+                    styleMask: [.titled, .closable, .resizable],
+                    backing: .buffered,
+                    defer: false
+                )
+                let view = RDPConnectionView(frame: window.contentView?.bounds ?? .zero)
+                window.contentView = view
+                window.makeKeyAndOrderFront(nil)
+
+                let diagnostics = view.shutdown()
+                window.close()
+                drainRunLoop()
+
+                XCTAssertFalse(view.isConnected)
+                XCTAssertEqual(diagnostics.pendingMainQueueTasks, 0)
+                XCTAssertEqual(diagnostics.inFlightCommandBuffers, 0)
+            }
+            drainRunLoop()
+        }
+    }
+}
+
+private func drainRunLoop(cycles: Int = 5) {
+    for _ in 0..<cycles {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
     }
 }
 

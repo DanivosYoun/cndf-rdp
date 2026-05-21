@@ -8,9 +8,11 @@ final class RDPMetalRenderer: NSObject, MTKViewDelegate {
     private let pipelineState: MTLRenderPipelineState
     private let samplerState: MTLSamplerState
     private let lock = NSLock()
+    private let inFlightCondition = NSCondition()
     private var texture: MTLTexture?
     private var frameSize: CGSize = .zero
     private var isShutdown = false
+    private var inFlightCommandBuffers = 0
 
     init?(view: MTKView) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice(),
@@ -165,15 +167,42 @@ final class RDPMetalRenderer: NSObject, MTKViewDelegate {
         }
 
         encoder.endEncoding()
+
+        inFlightCondition.lock()
+        inFlightCommandBuffers += 1
+        inFlightCondition.unlock()
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            guard let self else { return }
+            self.inFlightCondition.lock()
+            self.inFlightCommandBuffers = max(0, self.inFlightCommandBuffers - 1)
+            self.inFlightCondition.broadcast()
+            self.inFlightCondition.unlock()
+        }
+
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
 
-    func shutdown() {
+    func shutdown(waitTimeout: TimeInterval = 1.0) -> Int {
         lock.lock()
         isShutdown = true
         texture = nil
         frameSize = .zero
         lock.unlock()
+
+        return waitForInFlightCommandBuffers(timeout: waitTimeout)
+    }
+
+    private func waitForInFlightCommandBuffers(timeout: TimeInterval) -> Int {
+        let deadline = Date().addingTimeInterval(timeout)
+        inFlightCondition.lock()
+        defer { inFlightCondition.unlock() }
+
+        while inFlightCommandBuffers > 0 {
+            if !inFlightCondition.wait(until: deadline) {
+                break
+            }
+        }
+        return inFlightCommandBuffers
     }
 }

@@ -127,16 +127,18 @@ counts, file bytes, session start, and last activity.
 Call `RDPConnectionView.shutdown()` before closing a host `NSWindow` or removing the view from the
 window hierarchy. `shutdown()` is idempotent, stops the `MTKView` display link, clears the Metal
 delegate, releases drawables, disables the current window close animation, orders the window out,
-removes the Metal subview, detaches delegates, suppresses late callbacks, and disconnects the RDP
-session off the main thread. It also keeps the view/window alive for two main-runloop turns so
-AppKit and Core Animation can drain close/autorelease work after the host calls `window.close()`.
+waits for in-flight Metal command buffers, removes the Metal subview, detaches delegates,
+suppresses late callbacks, synchronously disconnects the RDP session, drains queued main-thread view
+callbacks, and returns `RDPShutdownDiagnostics`. It also keeps the view/window alive briefly after
+shutdown so AppKit and Core Animation can drain close/autorelease work after the host calls
+`window.close()`.
 After `shutdown()`, the view instance cannot be reconnected; create a new `RDPConnectionView` for a
 new session.
 
 Threading contract:
 
 - `RDPConnectionView.connect(_:)`, `disconnect()`, and view mutation should be called from the main thread.
-- `RDPConnectionView.shutdown()` should be called on the main thread before host window close; it avoids blocking the close path on FreeRDP teardown.
+- `RDPConnectionView.shutdown()` should be called before host window close. It marshals to the main thread if needed, and can block while FreeRDP worker teardown completes.
 - `RDPSession.connect(_:)`, `disconnect()`, `reconnect()`, input dispatch, resize, clipboard polling, and file offering are internally serialized around the FreeRDP bridge.
 - `RDPSession.disconnect()` waits up to five seconds for the FreeRDP event-loop thread to exit before returning an error; `RDPSession` destruction waits until native teardown is complete before freeing bridge state.
 - `RDPSessionDelegate` callbacks are delivered from the FreeRDP worker thread unless explicitly noted by the view wrapper.
@@ -173,10 +175,10 @@ Verified against a Windows RDP test host on 2026-05-21:
 - per-session log file creation was verified at `/tmp/rdp-session-followup.log`
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
 - session teardown hardening was verified with live connect/disconnect and no new macOS crash report
-- `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, and late-callback suppression are covered by AppKit unit tests
+- `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, late-callback suppression, diagnostics, and repeated `NSWindow.close()` autorelease-drain survival are covered by AppKit unit tests
 - folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all 21 package tests
+- `swift test` passes all 22 package tests
 
 Manual checklist for future changes:
 
@@ -251,7 +253,7 @@ try rdpView.connect(
 let stats = rdpView.statistics
 
 // Before closing the host NSWindow or removing rdpView:
-rdpView.shutdown()
+let diagnostics = rdpView.shutdown()
 ```
 
 `RDPConnectionView` owns the `RDPSession`, renders frames through Metal, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.

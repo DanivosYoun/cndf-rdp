@@ -31,6 +31,22 @@ public extension RDPConnectionViewDelegate {
     func rdpConnectionView(_ view: RDPConnectionView, didReceiveRemoteFiles files: [RDPRemoteFile]) {}
 }
 
+public struct RDPShutdownDiagnostics: Equatable {
+    public var didWaitForFreeRDPWorker: Bool
+    public var pendingMainQueueTasks: Int
+    public var inFlightCommandBuffers: Int
+
+    public init(
+        didWaitForFreeRDPWorker: Bool,
+        pendingMainQueueTasks: Int,
+        inFlightCommandBuffers: Int
+    ) {
+        self.didWaitForFreeRDPWorker = didWaitForFreeRDPWorker
+        self.pendingMainQueueTasks = pendingMainQueueTasks
+        self.inFlightCommandBuffers = inFlightCommandBuffers
+    }
+}
+
 public final class RDPConnectionView: NSView, RDPSessionDelegate {
     public weak var delegate: RDPConnectionViewDelegate?
 
@@ -38,6 +54,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     private var session: RDPSession?
     private var clipboardTimer: Timer?
     private var isShutdown = false
+    private let mainCallbackLock = NSLock()
+    private var pendingMainCallbacks = 0
+    private static let shutdownRetainLock = NSLock()
+    private static var shutdownRetainContexts: [UUID: ShutdownRetainContext] = [:]
 
     public override init(frame frameRect: NSRect) {
         self.clientView = RDPClientView(frame: frameRect)
@@ -100,17 +120,34 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         clientView.sendForcedDesktopSize()
     }
 
-    public func shutdown() {
+    @discardableResult
+    public func shutdown() -> RDPShutdownDiagnostics {
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync {
+                shutdown()
+            }
+        }
+
         guard !isShutdown else {
-            return
+            return RDPShutdownDiagnostics(
+                didWaitForFreeRDPWorker: false,
+                pendingMainQueueTasks: pendingMainCallbackCount(),
+                inFlightCommandBuffers: 0
+            )
         }
         isShutdown = true
         prepareWindowForClose()
         let callbackDelegate = delegate
         delegate = nil
-        clientView.shutdownRendering()
-        detachSessionForAsyncDisconnect()
+        let inFlightCommandBuffers = clientView.shutdownRendering(waitTimeout: 1.0)
+        let didWaitForFreeRDPWorker = detachSessionForSynchronousDisconnect()
+        drainPendingMainCallbacks(timeout: 0.25)
         callbackDelegate?.rdpConnectionView(self, didChangeConnected: false)
+        return RDPShutdownDiagnostics(
+            didWaitForFreeRDPWorker: didWaitForFreeRDPWorker,
+            pendingMainQueueTasks: pendingMainCallbackCount(),
+            inFlightCommandBuffers: inFlightCommandBuffers
+        )
     }
 
     public func sendForcedDesktopSize() {
@@ -150,13 +187,16 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     private func retainThroughCloseDrain(window: NSWindow) {
-        let retainedView = self
-        let retainedWindow = window
-        DispatchQueue.main.async {
-            DispatchQueue.main.async {
-                _ = retainedView
-                _ = retainedWindow
-            }
+        let id = UUID()
+        let context = ShutdownRetainContext(view: self, window: window)
+        Self.shutdownRetainLock.lock()
+        Self.shutdownRetainContexts[id] = context
+        Self.shutdownRetainLock.unlock()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            Self.shutdownRetainLock.lock()
+            Self.shutdownRetainContexts[id] = nil
+            Self.shutdownRetainLock.unlock()
         }
     }
 
@@ -175,10 +215,57 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
     }
 
+    private func detachSessionForSynchronousDisconnect() -> Bool {
+        clipboardTimer?.invalidate()
+        clipboardTimer = nil
+        let session = session
+        session?.delegate = nil
+        self.session = nil
+        clientView.session = nil
+        guard let session else {
+            return false
+        }
+        try? session.disconnect()
+        return true
+    }
+
+    private func enqueueMainCallback(_ callback: @escaping () -> Void) {
+        incrementPendingMainCallback()
+        DispatchQueue.main.async { [weak self] in
+            defer { self?.decrementPendingMainCallback() }
+            callback()
+        }
+    }
+
+    private func incrementPendingMainCallback() {
+        mainCallbackLock.lock()
+        pendingMainCallbacks += 1
+        mainCallbackLock.unlock()
+    }
+
+    private func decrementPendingMainCallback() {
+        mainCallbackLock.lock()
+        pendingMainCallbacks = max(0, pendingMainCallbacks - 1)
+        mainCallbackLock.unlock()
+    }
+
+    private func pendingMainCallbackCount() -> Int {
+        mainCallbackLock.lock()
+        defer { mainCallbackLock.unlock() }
+        return pendingMainCallbacks
+    }
+
+    private func drainPendingMainCallbacks(timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while pendingMainCallbackCount() > 0 && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+    }
+
     public func rdpSession(_ session: RDPSession, didLog message: String) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didLog: message)
-        DispatchQueue.main.async { [weak self] in
+        enqueueMainCallback { [weak self] in
             guard let self, !self.isShutdown else { return }
             if message == "FreeRDP connected." || message == "Display control channel connected." {
                 self.clientView.sendForcedDesktopSize()
@@ -224,9 +311,19 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     public func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
         guard !isShutdown else { return }
-        DispatchQueue.main.async { [weak self] in
+        enqueueMainCallback { [weak self] in
             guard let self, !self.isShutdown else { return }
             self.clientView.display(frame)
         }
+    }
+}
+
+private final class ShutdownRetainContext {
+    let view: RDPConnectionView
+    let window: NSWindow
+
+    init(view: RDPConnectionView, window: NSWindow) {
+        self.view = view
+        self.window = window
     }
 }
