@@ -42,7 +42,7 @@ The bridge currently provides:
 - GDI framebuffer delivery to Swift as BGRA frames
 - Metal-backed frame presentation through `MTKView`
 - `cliprdr` text clipboard format negotiation
-- Mac-to-RDP file paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
+- Mac-to-RDP file and folder paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
 - RDP-to-Mac file paste materialization using remote range requests and local staged file URLs
 - Finder file drag/drop into the RDP surface with automatic remote paste trigger
 - NFC filename normalization at Mac/Windows file-transfer boundaries for Korean filenames
@@ -165,6 +165,7 @@ Verified against a Windows RDP test host on 2026-05-21:
 - audio playback path connected through `AUDIO_PLAYBACK_DVC`
 - dynamic resize sent through DisplayControl after the remote desktop connected
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
+- Mac-to-RDP folder paste is staged recursively as relative file paths such as `Folder\Sub\file.txt`
 - RDP-to-Mac copy-back materialized the remote file to the macOS pasteboard
 - decomposed Korean filenames are normalized to NFC before being advertised to Windows
 - WLog debug/filter options were applied during live connection testing
@@ -172,21 +173,23 @@ Verified against a Windows RDP test host on 2026-05-21:
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
 - session teardown hardening was verified with live connect/disconnect and no new macOS crash report
 - `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, and late-callback suppression are covered by AppKit unit tests
+- folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all 19 package tests
+- `swift test` passes all 21 package tests
 
 Manual checklist for future changes:
 
 1. Resize the macOS window and confirm the remote desktop fills the view without black side gaps.
 2. Copy a file in Finder, focus Explorer or Desktop in the RDP session, then paste.
 3. Drag a file from Finder into the RDP surface and confirm it appears remotely.
-4. Select a remote file in Explorer, copy it, then paste into Finder on macOS.
-5. Enable a redirected folder and confirm it appears in the remote session.
-6. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
-7. Copy or drag a Korean-named file and confirm the name stays composed on Windows.
-8. Host `RDPConnectionView` in a separate `NSWindow`, connect, call `shutdown()`, then close the window and confirm the host app stays alive.
-9. Repeat the `shutdown()` plus window close flow 10 times and confirm there is no crash or delayed macOS crash report.
-10. Connect and immediately call `shutdown()` before the first frame arrives, then close the window.
+4. Copy or drag a folder that contains nested files and confirm the folder structure appears remotely.
+5. Select a remote file in Explorer, copy it, then paste into Finder on macOS.
+6. Enable a redirected folder and confirm it appears in the remote session.
+7. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
+8. Copy or drag a Korean-named file or folder and confirm the name stays composed on Windows.
+9. Host `RDPConnectionView` in a separate `NSWindow`, connect, call `shutdown()`, then close the window and confirm the host app stays alive.
+10. Repeat the `shutdown()` plus window close flow 10 times and confirm there is no crash or delayed macOS crash report.
+11. Connect and immediately call `shutdown()` before the first frame arrives, then close the window.
 
 ## Verify
 

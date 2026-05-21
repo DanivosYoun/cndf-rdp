@@ -2,7 +2,6 @@ import Foundation
 
 public enum FileTransferStagingError: Error, Equatable {
     case sourceDoesNotExist(URL)
-    case sourceIsDirectory(URL)
     case unableToCreateStagingDirectory(URL)
     case unableToReadFileSize(URL)
 }
@@ -39,26 +38,16 @@ public final class FileTransferStaging {
     public func stageLocalFilesForRemotePaste(_ urls: [URL]) throws -> [StagedFile] {
         try prepare()
 
-        return try urls.map { sourceURL in
+        return try urls.flatMap { sourceURL in
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory) else {
                 throw FileTransferStagingError.sourceDoesNotExist(sourceURL)
             }
-            guard !isDirectory.boolValue else {
-                throw FileTransferStagingError.sourceIsDirectory(sourceURL)
+            if isDirectory.boolValue {
+                return try stageLocalDirectoryForRemotePaste(sourceURL)
             }
 
-            let values = try sourceURL.resourceValues(forKeys: [.fileSizeKey])
-            guard let size = values.fileSize else {
-                throw FileTransferStagingError.unableToReadFileSize(sourceURL)
-            }
-
-            return StagedFile(
-                sourceURL: sourceURL,
-                stagedURL: sourceURL,
-                fileName: FileNameNormalization.normalizeForTransfer(sourceURL.lastPathComponent),
-                byteCount: UInt64(size)
-            )
+            return [try stageLocalFileForRemotePaste(sourceURL, fileName: sourceURL.lastPathComponent)]
         }
     }
 
@@ -87,5 +76,56 @@ public final class FileTransferStaging {
         }
 
         return rootURL.appendingPathComponent(UUID().uuidString, isDirectory: false)
+    }
+
+    private func stageLocalDirectoryForRemotePaste(_ directoryURL: URL) throws -> [StagedFile] {
+        guard let enumerator = fileManager.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            options: [.skipsPackageDescendants]
+        ) else {
+            return []
+        }
+
+        var files: [StagedFile] = []
+        let rootName = FileNameNormalization.normalizeForTransfer(directoryURL.lastPathComponent)
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            if values.isDirectory == true {
+                continue
+            }
+            let relativePath = relativeTransferPath(fileURL: fileURL, rootURL: directoryURL, rootName: rootName)
+            files.append(try stageLocalFileForRemotePaste(fileURL, fileName: relativePath))
+        }
+        return files.sorted { $0.fileName < $1.fileName }
+    }
+
+    private func stageLocalFileForRemotePaste(_ sourceURL: URL, fileName: String) throws -> StagedFile {
+        let values = try sourceURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values.fileSize else {
+            throw FileTransferStagingError.unableToReadFileSize(sourceURL)
+        }
+
+        return StagedFile(
+            sourceURL: sourceURL,
+            stagedURL: sourceURL,
+            fileName: normalizedTransferPath(fileName),
+            byteCount: UInt64(size)
+        )
+    }
+
+    private func relativeTransferPath(fileURL: URL, rootURL: URL, rootName: String) -> String {
+        let rootPath = rootURL.standardizedFileURL.path
+        let filePath = fileURL.standardizedFileURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        let relative = filePath.hasPrefix(prefix) ? String(filePath.dropFirst(prefix.count)) : fileURL.lastPathComponent
+        return ([rootName] + relative.split(separator: "/").map(String.init)).joined(separator: "\\")
+    }
+
+    private func normalizedTransferPath(_ path: String) -> String {
+        path
+            .split(separator: "\\", omittingEmptySubsequences: false)
+            .map { FileNameNormalization.normalizeForTransfer(String($0)) }
+            .joined(separator: "\\")
     }
 }

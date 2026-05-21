@@ -70,7 +70,7 @@ Automated:
 swift test
 ```
 
-Expected result: all 19 package tests pass.
+Expected result: all 21 package tests pass.
 
 Manual window-close verification, because `NSWindow.close()` inside XCTest can crash XCTest's own
 invalid-object checker on macOS 26.4.1:
