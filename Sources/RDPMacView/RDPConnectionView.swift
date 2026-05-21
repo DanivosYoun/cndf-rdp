@@ -37,6 +37,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     public let clientView: RDPClientView
     private var session: RDPSession?
     private var clipboardTimer: Timer?
+    private var isShutdown = false
 
     public override init(frame frameRect: NSRect) {
         self.clientView = RDPClientView(frame: frameRect)
@@ -51,7 +52,8 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     deinit {
-        disconnect()
+        detachSessionForAsyncDisconnect()
+        clientView.shutdownRendering()
     }
 
     public var isConnected: Bool {
@@ -63,6 +65,9 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     public func connect(_ options: RDPConnectionOptions) throws {
+        guard !isShutdown else {
+            throw RDPSessionError.configurationInvalid(reason: "RDPConnectionView has been shut down.")
+        }
         disconnect()
 
         let session = try RDPSession()
@@ -86,8 +91,22 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     public func reconnect() throws {
+        guard !isShutdown else {
+            throw RDPSessionError.configurationInvalid(reason: "RDPConnectionView has been shut down.")
+        }
         try session?.reconnect()
         clientView.sendForcedDesktopSize()
+    }
+
+    public func shutdown() {
+        guard !isShutdown else {
+            return
+        }
+        isShutdown = true
+        prepareWindowForClose()
+        clientView.shutdownRendering()
+        detachSessionForAsyncDisconnect()
+        delegate?.rdpConnectionView(self, didChangeConnected: false)
     }
 
     public func sendForcedDesktopSize() {
@@ -107,7 +126,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     private func startClipboardPolling() {
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self else { return }
+            guard let self, !self.isShutdown else { return }
             do {
                 try self.session?.pollLocalClipboard()
             } catch {
@@ -116,10 +135,45 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
     }
 
+    private func prepareWindowForClose() {
+        guard let window else {
+            return
+        }
+        window.animationBehavior = .none
+        window.orderOut(nil)
+        retainThroughCloseDrain(window: window)
+    }
+
+    private func retainThroughCloseDrain(window: NSWindow) {
+        let retainedView = self
+        let retainedWindow = window
+        DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                _ = retainedView
+                _ = retainedWindow
+            }
+        }
+    }
+
+    private func detachSessionForAsyncDisconnect() {
+        clipboardTimer?.invalidate()
+        clipboardTimer = nil
+        let session = session
+        session?.delegate = nil
+        self.session = nil
+        clientView.session = nil
+        guard let session else {
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            try? session.disconnect()
+        }
+    }
+
     public func rdpSession(_ session: RDPSession, didLog message: String) {
         delegate?.rdpConnectionView(self, didLog: message)
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isShutdown else { return }
             if message == "FreeRDP connected." || message == "Display control channel connected." {
                 self.clientView.sendForcedDesktopSize()
             }
@@ -159,7 +213,8 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     public func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
         DispatchQueue.main.async { [weak self] in
-            self?.clientView.display(frame)
+            guard let self, !self.isShutdown else { return }
+            self.clientView.display(frame)
         }
     }
 }

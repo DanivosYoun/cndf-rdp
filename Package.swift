@@ -71,6 +71,10 @@ let package = Package(
         .testTarget(
             name: "RDPClientCoreTests",
             dependencies: ["RDPClientCore"]
+        ),
+        .testTarget(
+            name: "RDPMacViewTests",
+            dependencies: ["RDPMacView"]
         )
     ]
 )

@@ -57,6 +57,7 @@ The bridge currently provides:
 - session statistics for frames, clipboard, file transfer, and activity timestamps
 - serialized `RDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
 - hardened FreeRDP teardown that waits for the event-loop thread before freeing native session state
+- explicit `RDPConnectionView.shutdown()` for safe `NSWindow` close and Metal drawable teardown
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
@@ -123,9 +124,16 @@ a connect with the retained options. `RDPSession.statistics` and `RDPConnectionV
 expose `RDPConnectionStatistics` counters for frames, frame bytes, clipboard text events, file
 counts, file bytes, session start, and last activity.
 
+Call `RDPConnectionView.shutdown()` before closing a host `NSWindow` or removing the view from the
+window hierarchy. `shutdown()` is idempotent, stops the `MTKView` display link, clears the Metal
+delegate, releases drawables, disables the current window close animation, orders the window out,
+detaches delegates, and disconnects the RDP session off the main thread. After `shutdown()`, the
+view instance cannot be reconnected; create a new `RDPConnectionView` for a new session.
+
 Threading contract:
 
 - `RDPConnectionView.connect(_:)`, `disconnect()`, and view mutation should be called from the main thread.
+- `RDPConnectionView.shutdown()` should be called on the main thread before host window close; it avoids blocking the close path on FreeRDP teardown.
 - `RDPSession.connect(_:)`, `disconnect()`, `reconnect()`, input dispatch, resize, clipboard polling, and file offering are internally serialized around the FreeRDP bridge.
 - `RDPSession.disconnect()` waits up to five seconds for the FreeRDP event-loop thread to exit before returning an error; `RDPSession` destruction waits until native teardown is complete before freeing bridge state.
 - `RDPSessionDelegate` callbacks are delivered from the FreeRDP worker thread unless explicitly noted by the view wrapper.
@@ -160,6 +168,7 @@ Verified against a Windows RDP test host on 2026-05-21:
 - per-session log file creation was verified at `/tmp/rdp-session-followup.log`
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
 - session teardown hardening was verified with live connect/disconnect and no new macOS crash report
+- `RDPConnectionView.shutdown()` lifecycle behavior is covered by AppKit unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
 - `swift test` passes all package tests
 
@@ -172,6 +181,9 @@ Manual checklist for future changes:
 5. Enable a redirected folder and confirm it appears in the remote session.
 6. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
 7. Copy or drag a Korean-named file and confirm the name stays composed on Windows.
+8. Host `RDPConnectionView` in a separate `NSWindow`, connect, call `shutdown()`, then close the window and confirm the host app stays alive.
+9. Repeat the `shutdown()` plus window close flow 10 times and confirm there is no crash or delayed macOS crash report.
+10. Connect and immediately call `shutdown()` before the first frame arrives, then close the window.
 
 ## Verify
 
@@ -225,6 +237,9 @@ try rdpView.connect(
 )
 
 let stats = rdpView.statistics
+
+// Before closing the host NSWindow or removing rdpView:
+rdpView.shutdown()
 ```
 
 `RDPConnectionView` owns the `RDPSession`, renders frames through Metal, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.

@@ -10,6 +10,7 @@ public final class RDPClientView: MTKView {
     private var modifierState: Set<UInt16> = []
     private var remoteFrameSize: CGSize = .zero
     private var pendingResizeWorkItem: DispatchWorkItem?
+    private var isRenderPipelineShutdown = false
 
     public override var acceptsFirstResponder: Bool {
         true
@@ -38,7 +39,10 @@ public final class RDPClientView: MTKView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.makeFirstResponder(self)
+        guard let window else {
+            return
+        }
+        window.makeFirstResponder(self)
         sendForcedDesktopSize()
     }
 
@@ -151,14 +155,29 @@ public final class RDPClientView: MTKView {
     }
 
     public func sendForcedDesktopSize() {
+        guard !isRenderPipelineShutdown else { return }
         pendingResizeWorkItem?.cancel()
         pendingResizeWorkItem = nil
         sendDesktopSize(force: true)
     }
 
     public func display(_ frame: RDPFrame) {
+        guard !isRenderPipelineShutdown else { return }
         remoteFrameSize = CGSize(width: frame.width, height: frame.height)
         renderer?.update(frame: frame)
+    }
+
+    public func shutdownRendering() {
+        isRenderPipelineShutdown = true
+        pendingResizeWorkItem?.cancel()
+        pendingResizeWorkItem = nil
+        isPaused = true
+        delegate = nil
+        renderer?.shutdown()
+        renderer = nil
+        session = nil
+        releaseDrawables()
+        removeFromSuperview()
     }
 
     private func sendPointerMove(_ event: NSEvent) {
@@ -226,6 +245,7 @@ public final class RDPClientView: MTKView {
     }
 
     private func sendDesktopSize(force: Bool) {
+        guard !isRenderPipelineShutdown else { return }
         try? session?.updateDesktopSize(
             pointWidth: Double(bounds.width),
             pointHeight: Double(bounds.height),
@@ -235,6 +255,7 @@ public final class RDPClientView: MTKView {
     }
 
     private func scheduleDesktopSize() {
+        guard !isRenderPipelineShutdown else { return }
         pendingResizeWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             self?.sendDesktopSize(force: false)

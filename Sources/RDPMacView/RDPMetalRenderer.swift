@@ -10,6 +10,7 @@ final class RDPMetalRenderer: NSObject, MTKViewDelegate {
     private let lock = NSLock()
     private var texture: MTLTexture?
     private var frameSize: CGSize = .zero
+    private var isShutdown = false
 
     init?(view: MTKView) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice(),
@@ -90,6 +91,12 @@ final class RDPMetalRenderer: NSObject, MTKViewDelegate {
         guard frame.width > 0, frame.height > 0, frame.stride >= frame.width * 4 else {
             return
         }
+        lock.lock()
+        let canUpdate = !isShutdown
+        lock.unlock()
+        guard canUpdate else {
+            return
+        }
 
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
@@ -123,9 +130,14 @@ final class RDPMetalRenderer: NSObject, MTKViewDelegate {
 
     func draw(in view: MTKView) {
         lock.lock()
+        let canDraw = !isShutdown
         let currentTexture = texture
         let currentFrameSize = frameSize
         lock.unlock()
+
+        guard canDraw else {
+            return
+        }
 
         guard let drawable = view.currentDrawable,
               let descriptor = view.currentRenderPassDescriptor,
@@ -155,5 +167,13 @@ final class RDPMetalRenderer: NSObject, MTKViewDelegate {
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    func shutdown() {
+        lock.lock()
+        isShutdown = true
+        texture = nil
+        frameSize = .zero
+        lock.unlock()
     }
 }
