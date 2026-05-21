@@ -127,8 +127,11 @@ counts, file bytes, session start, and last activity.
 Call `RDPConnectionView.shutdown()` before closing a host `NSWindow` or removing the view from the
 window hierarchy. `shutdown()` is idempotent, stops the `MTKView` display link, clears the Metal
 delegate, releases drawables, disables the current window close animation, orders the window out,
-detaches delegates, and disconnects the RDP session off the main thread. After `shutdown()`, the
-view instance cannot be reconnected; create a new `RDPConnectionView` for a new session.
+removes the Metal subview, detaches delegates, suppresses late callbacks, and disconnects the RDP
+session off the main thread. It also keeps the view/window alive for two main-runloop turns so
+AppKit and Core Animation can drain close/autorelease work after the host calls `window.close()`.
+After `shutdown()`, the view instance cannot be reconnected; create a new `RDPConnectionView` for a
+new session.
 
 Threading contract:
 
@@ -168,9 +171,9 @@ Verified against a Windows RDP test host on 2026-05-21:
 - per-session log file creation was verified at `/tmp/rdp-session-followup.log`
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
 - session teardown hardening was verified with live connect/disconnect and no new macOS crash report
-- `RDPConnectionView.shutdown()` lifecycle behavior is covered by AppKit unit tests
+- `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, and late-callback suppression are covered by AppKit unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all package tests
+- `swift test` passes all 19 package tests
 
 Manual checklist for future changes:
 

@@ -87,7 +87,9 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         try? session?.disconnect()
         session = nil
         clientView.session = nil
-        delegate?.rdpConnectionView(self, didChangeConnected: false)
+        if !isShutdown {
+            delegate?.rdpConnectionView(self, didChangeConnected: false)
+        }
     }
 
     public func reconnect() throws {
@@ -104,9 +106,11 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
         isShutdown = true
         prepareWindowForClose()
+        let callbackDelegate = delegate
+        delegate = nil
         clientView.shutdownRendering()
         detachSessionForAsyncDisconnect()
-        delegate?.rdpConnectionView(self, didChangeConnected: false)
+        callbackDelegate?.rdpConnectionView(self, didChangeConnected: false)
     }
 
     public func sendForcedDesktopSize() {
@@ -114,6 +118,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     public func pollLocalClipboard() throws {
+        guard !isShutdown else { return }
         try session?.pollLocalClipboard()
     }
 
@@ -171,6 +176,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     public func rdpSession(_ session: RDPSession, didLog message: String) {
+        guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didLog: message)
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isShutdown else { return }
@@ -187,7 +193,8 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         hostname: String,
         port: UInt16
     ) async -> Bool {
-        await delegate?.rdpConnectionView(
+        guard !isShutdown else { return false }
+        return await delegate?.rdpConnectionView(
             self,
             shouldTrustCertificateFingerprint: fingerprint,
             hostname: hostname,
@@ -196,22 +203,27 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     public func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {
+        guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didFailWith: error)
     }
 
     public func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {
+        guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didDisconnectWith: reason)
     }
 
     public func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String) {
+        guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didReceiveRemoteText: text)
     }
 
     public func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
+        guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didReceiveRemoteFiles: files)
     }
 
     public func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
+        guard !isShutdown else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isShutdown else { return }
             self.clientView.display(frame)
