@@ -13,6 +13,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "rdp-mac", targets: ["RDPMacApp"]),
+        .executable(name: "window-close-stress-test", targets: ["WindowCloseStressTest"]),
         .library(name: "RDPClientCore", targets: ["RDPClientCore"]),
         .library(name: "RDPMacView", targets: ["RDPMacView"]),
         .library(name: "ClipboardBridge", targets: ["ClipboardBridge"]),
@@ -22,6 +23,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "RDPMacApp",
+            dependencies: ["RDPClientCore", "RDPMacView"]
+        ),
+        .executableTarget(
+            name: "WindowCloseStressTest",
             dependencies: ["RDPClientCore", "RDPMacView"]
         ),
         .target(

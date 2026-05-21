@@ -35,15 +35,21 @@ public struct RDPShutdownDiagnostics: Equatable {
     public var didWaitForFreeRDPWorker: Bool
     public var pendingMainQueueTasks: Int
     public var inFlightCommandBuffers: Int
+    public var freeRDPWorkerWaitDurationMs: Int
+    public var metalDrainDurationMs: Int
 
     public init(
         didWaitForFreeRDPWorker: Bool,
         pendingMainQueueTasks: Int,
-        inFlightCommandBuffers: Int
+        inFlightCommandBuffers: Int,
+        freeRDPWorkerWaitDurationMs: Int = 0,
+        metalDrainDurationMs: Int = 0
     ) {
         self.didWaitForFreeRDPWorker = didWaitForFreeRDPWorker
         self.pendingMainQueueTasks = pendingMainQueueTasks
         self.inFlightCommandBuffers = inFlightCommandBuffers
+        self.freeRDPWorkerWaitDurationMs = freeRDPWorkerWaitDurationMs
+        self.metalDrainDurationMs = metalDrainDurationMs
     }
 }
 
@@ -137,15 +143,19 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         let closeWindow = prepareWindowForClose()
         let callbackDelegate = delegate
         delegate = nil
+        let renderDrainStartedAt = Date()
         let inFlightCommandBuffers = clientView.shutdownRendering(waitTimeout: 1.0)
-        let didWaitForFreeRDPWorker = detachSessionForSynchronousDisconnect()
+        let renderDrainDurationMs = elapsedMilliseconds(since: renderDrainStartedAt)
+        let freeRDPWorkerWait = detachSessionForSynchronousDisconnect()
         drainPendingMainCallbacks(timeout: 0.25)
         detachFromWindowContent(closeWindow)
         callbackDelegate?.rdpConnectionView(self, didChangeConnected: false)
         return RDPShutdownDiagnostics(
-            didWaitForFreeRDPWorker: didWaitForFreeRDPWorker,
+            didWaitForFreeRDPWorker: freeRDPWorkerWait.didWait,
             pendingMainQueueTasks: pendingMainCallbackCount(),
-            inFlightCommandBuffers: inFlightCommandBuffers
+            inFlightCommandBuffers: inFlightCommandBuffers,
+            freeRDPWorkerWaitDurationMs: freeRDPWorkerWait.durationMs,
+            metalDrainDurationMs: renderDrainDurationMs
         )
     }
 
@@ -213,7 +223,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
     }
 
-    private func detachSessionForSynchronousDisconnect() -> Bool {
+    private func detachSessionForSynchronousDisconnect() -> (didWait: Bool, durationMs: Int) {
         clipboardTimer?.invalidate()
         clipboardTimer = nil
         let session = session
@@ -221,10 +231,11 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         self.session = nil
         clientView.session = nil
         guard let session else {
-            return false
+            return (false, 0)
         }
+        let startedAt = Date()
         try? session.disconnect()
-        return true
+        return (true, elapsedMilliseconds(since: startedAt))
     }
 
     private func enqueueMainCallback(_ callback: @escaping () -> Void) {
@@ -258,6 +269,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         while pendingMainCallbackCount() > 0 && Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
         }
+    }
+
+    private func elapsedMilliseconds(since startDate: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(startDate) * 1000))
     }
 
     public func rdpSession(_ session: RDPSession, didLog message: String) {

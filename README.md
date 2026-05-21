@@ -5,6 +5,8 @@ SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin FreeRDP br
 ## Modules
 
 - `RDPMacApp`: AppKit executable with a connection bar and RDP surface.
+- `WindowCloseStressTest`: standalone executable that repeatedly connects, shuts down, closes an
+  RDP window, and drains autorelease pools outside XCTest.
 - `RDPMacView`: embeddable AppKit view package for host macOS apps.
 - `RDPClientCore`: Swift session lifecycle wrapper and delegate API.
 - `FreeRDPBridge`: narrow C ABI for FreeRDP integration, linked against the vendored FreeRDP 3.26 build.
@@ -132,6 +134,9 @@ drains queued main-thread view callbacks, replaces the host window's content vie
 placeholder, and returns `RDPShutdownDiagnostics`. This removes the RDP content tree from AppKit's
 later `window.close()` release path and lets the host's ARC/window-controller ownership release the
 window normally after close.
+Diagnostics include whether a FreeRDP worker was waited, pending main callback count,
+in-flight command buffer count kept for API compatibility, FreeRDP wait duration, and render drain
+duration.
 After `shutdown()`, the view instance cannot be reconnected; create a new `RDPConnectionView` for a
 new session.
 
@@ -176,9 +181,13 @@ Verified against a Windows RDP test host on 2026-05-21:
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
 - session teardown hardening was verified with live connect/disconnect and no new macOS crash report
 - `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, late-callback suppression, diagnostics, repeated `NSWindow.close()` autorelease-drain survival, delayed main-queue drain survival, and post-close deallocation are covered by AppKit unit tests
+- live connect + shutdown + window close regression was verified with the standalone
+  `window-close-stress-test` for 100 consecutive cycles; every cycle reported
+  `didWait=true`, `pendingMain=0`, and `inFlight=0`, and no new macOS crash report was created
 - folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all 23 package tests
+- `swift test` passes all 24 package tests, with the live RDP close test skipped unless
+  `RDP_WINDOW_CLOSE_INTEGRATION=1` is set
 
 Manual checklist for future changes:
 
@@ -302,3 +311,22 @@ pasteboard.
 `RDP_MAC_AUTOTEST_EXPLORER_FOLDER_PASTE=1` opens the remote Desktop in Explorer, offers
 a temporary folder with a nested Korean-named file, and sends Ctrl+V so the remote side
 requests the staged relative file paths.
+
+## Window Close Stress
+
+The `window-close-stress-test` executable is a non-XCTest close-path regression harness.
+It requires live RDP credentials through the same `RDP_MAC_*` environment variables as the sample app.
+
+```sh
+RDP_MAC_HOST=192.168.1.10 \
+RDP_MAC_PORT=3389 \
+RDP_MAC_USERNAME=user \
+RDP_MAC_PASSWORD=secret \
+RDP_WINDOW_CLOSE_STRESS_CYCLES=10 \
+swift run window-close-stress-test
+```
+
+Each cycle creates an `NSWindow`, connects `RDPConnectionView`, waits briefly after connection,
+calls `shutdown()`, closes the window, drains the run loop, and prints `RDPShutdownDiagnostics`.
+For XCTest-based live coverage, set `RDP_WINDOW_CLOSE_INTEGRATION=1` with the same `RDP_MAC_*`
+variables before running `swift test`.
