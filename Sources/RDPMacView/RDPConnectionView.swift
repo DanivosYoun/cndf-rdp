@@ -56,8 +56,6 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     private var isShutdown = false
     private let mainCallbackLock = NSLock()
     private var pendingMainCallbacks = 0
-    private static let shutdownRetainLock = NSLock()
-    private static var shutdownRetainContexts: [Unmanaged<ShutdownRetainContext>] = []
 
     public override init(frame frameRect: NSRect) {
         self.clientView = RDPClientView(frame: frameRect)
@@ -136,12 +134,13 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
             )
         }
         isShutdown = true
-        prepareWindowForClose()
+        let closeWindow = prepareWindowForClose()
         let callbackDelegate = delegate
         delegate = nil
         let inFlightCommandBuffers = clientView.shutdownRendering(waitTimeout: 1.0)
         let didWaitForFreeRDPWorker = detachSessionForSynchronousDisconnect()
         drainPendingMainCallbacks(timeout: 0.25)
+        detachFromWindowContent(closeWindow)
         callbackDelegate?.rdpConnectionView(self, didChangeConnected: false)
         return RDPShutdownDiagnostics(
             didWaitForFreeRDPWorker: didWaitForFreeRDPWorker,
@@ -177,20 +176,26 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
     }
 
-    private func prepareWindowForClose() {
+    private func prepareWindowForClose() -> NSWindow? {
         guard let window else {
-            return
+            return nil
         }
         window.animationBehavior = .none
+        window.isReleasedWhenClosed = false
+        window.initialFirstResponder = nil
+        window.makeFirstResponder(nil)
         window.orderOut(nil)
-        retainThroughCloseDrain(window: window)
+        return window
     }
 
-    private func retainThroughCloseDrain(window: NSWindow) {
-        let context = ShutdownRetainContext(view: self, window: window)
-        Self.shutdownRetainLock.lock()
-        Self.shutdownRetainContexts.append(Unmanaged.passRetained(context))
-        Self.shutdownRetainLock.unlock()
+    private func detachFromWindowContent(_ window: NSWindow?) {
+        guard let window, window.contentView === self else {
+            removeFromSuperview()
+            return
+        }
+        let placeholder = NSView(frame: frame)
+        placeholder.autoresizingMask = [.width, .height]
+        window.contentView = placeholder
     }
 
     private func detachSessionForAsyncDisconnect() {
@@ -308,15 +313,5 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
             guard let self, !self.isShutdown else { return }
             self.clientView.display(frame)
         }
-    }
-}
-
-private final class ShutdownRetainContext {
-    let view: RDPConnectionView
-    let window: NSWindow
-
-    init(view: RDPConnectionView, window: NSWindow) {
-        self.view = view
-        self.window = window
     }
 }

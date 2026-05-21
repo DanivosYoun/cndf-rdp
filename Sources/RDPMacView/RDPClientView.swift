@@ -1,16 +1,15 @@
 import AppKit
-import MetalKit
 import RDPClientCore
 
-public final class RDPClientView: MTKView {
+public final class RDPClientView: NSView {
     public weak var session: RDPSession?
 
     private var trackingArea: NSTrackingArea?
-    private var renderer: RDPMetalRenderer?
     private var modifierState: Set<UInt16> = []
     private var remoteFrameSize: CGSize = .zero
     private var pendingResizeWorkItem: DispatchWorkItem?
     private var isRenderPipelineShutdown = false
+    private let frameColorSpace = CGColorSpaceCreateDeviceRGB()
 
     public override var acceptsFirstResponder: Bool {
         true
@@ -20,20 +19,23 @@ public final class RDPClientView: MTKView {
         true
     }
 
-    public init(frame frameRect: NSRect) {
-        super.init(frame: frameRect, device: MTLCreateSystemDefaultDevice())
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
         configure()
     }
 
-    public required init(coder: NSCoder) {
+    public required init?(coder: NSCoder) {
         super.init(coder: coder)
         configure()
     }
 
     private func configure() {
-        clearColor = MTLClearColorMake(0, 0, 0, 1)
-        colorPixelFormat = .bgra8Unorm
-        renderer = RDPMetalRenderer(view: self)
+        wantsLayer = true
+        let backingLayer = CALayer()
+        backingLayer.backgroundColor = NSColor.black.cgColor
+        backingLayer.contentsGravity = .resize
+        backingLayer.masksToBounds = true
+        layer = backingLayer
         registerForDraggedTypes([.fileURL])
     }
 
@@ -55,6 +57,10 @@ public final class RDPClientView: MTKView {
         super.updateTrackingAreas()
         if let trackingArea {
             removeTrackingArea(trackingArea)
+        }
+        guard !isRenderPipelineShutdown else {
+            trackingArea = nil
+            return
         }
         let area = NSTrackingArea(
             rect: bounds,
@@ -163,23 +169,58 @@ public final class RDPClientView: MTKView {
 
     public func display(_ frame: RDPFrame) {
         guard !isRenderPipelineShutdown else { return }
+        guard let image = makeImage(from: frame) else { return }
         remoteFrameSize = CGSize(width: frame.width, height: frame.height)
-        renderer?.update(frame: frame)
+        layer?.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        layer?.contents = image
     }
 
     @discardableResult
     public func shutdownRendering(waitTimeout: TimeInterval = 1.0) -> Int {
+        guard !isRenderPipelineShutdown else {
+            return 0
+        }
         isRenderPipelineShutdown = true
         pendingResizeWorkItem?.cancel()
         pendingResizeWorkItem = nil
-        isPaused = true
-        delegate = nil
-        let remainingCommandBuffers = renderer?.shutdown(waitTimeout: waitTimeout) ?? 0
-        renderer = nil
+        unregisterDraggedTypes()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+            self.trackingArea = nil
+        }
+        modifierState.removeAll()
+        remoteFrameSize = .zero
+        isHidden = true
         session = nil
-        releaseDrawables()
+        layer?.removeAllAnimations()
+        layer?.contents = nil
         removeFromSuperview()
-        return remainingCommandBuffers
+        return 0
+    }
+
+    private func makeImage(from frame: RDPFrame) -> CGImage? {
+        guard frame.width > 0, frame.height > 0, frame.stride >= frame.width * 4 else {
+            return nil
+        }
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+        )
+        guard let provider = CGDataProvider(data: frame.bgra as CFData) else {
+            return nil
+        }
+        return CGImage(
+            width: frame.width,
+            height: frame.height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: frame.stride,
+            space: frameColorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
     }
 
     private func sendPointerMove(_ event: NSEvent) {

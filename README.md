@@ -40,7 +40,7 @@ The bridge currently provides:
 - optional audio playback through FreeRDP `rdpsnd`
 - pointer, scroll, and keyboard input dispatch
 - GDI framebuffer delivery to Swift as BGRA frames
-- Metal-backed frame presentation through `MTKView`
+- AppKit layer-backed frame presentation without `MTKView`/`CAMetalLayer` close-time release hazards
 - `cliprdr` text clipboard format negotiation
 - Mac-to-RDP file and folder paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
 - RDP-to-Mac file paste materialization using remote range requests and local staged file URLs
@@ -57,7 +57,7 @@ The bridge currently provides:
 - session statistics for frames, clipboard, file transfer, and activity timestamps
 - serialized `RDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
 - hardened FreeRDP teardown that waits for the event-loop thread before freeing native session state
-- explicit `RDPConnectionView.shutdown()` for safe `NSWindow` close and Metal drawable teardown
+- explicit `RDPConnectionView.shutdown()` for safe `NSWindow` close and render-surface teardown
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
@@ -125,14 +125,13 @@ expose `RDPConnectionStatistics` counters for frames, frame bytes, clipboard tex
 counts, file bytes, session start, and last activity.
 
 Call `RDPConnectionView.shutdown()` before closing a host `NSWindow` or removing the view from the
-window hierarchy. `shutdown()` is idempotent, stops the `MTKView` display link, clears the Metal
-delegate, releases drawables, disables the current window close animation, orders the window out,
-waits for in-flight Metal command buffers, removes the Metal subview, detaches delegates,
-suppresses late callbacks, synchronously disconnects the RDP session, drains queued main-thread view
-callbacks, and returns `RDPShutdownDiagnostics`. It also keeps the already-shut-down view/window in
-a process-lifetime unmanaged graveyard after shutdown so AppKit and Core Animation never deallocate
-the close path objects after the host calls `window.close()`. The session, renderer, drawables, and
-delegates are detached before that retain, so the retained shell is intentionally small.
+window hierarchy. `shutdown()` is idempotent, stops frame presentation, clears layer contents,
+disables the current window close animation, sets `isReleasedWhenClosed = false`, orders the window
+out, detaches delegates, suppresses late callbacks, synchronously disconnects the RDP session,
+drains queued main-thread view callbacks, replaces the host window's content view with an inert
+placeholder, and returns `RDPShutdownDiagnostics`. This removes the RDP content tree from AppKit's
+later `window.close()` release path and lets the host's ARC/window-controller ownership release the
+window normally after close.
 After `shutdown()`, the view instance cannot be reconnected; create a new `RDPConnectionView` for a
 new session.
 
@@ -176,7 +175,7 @@ Verified against a Windows RDP test host on 2026-05-21:
 - per-session log file creation was verified at `/tmp/rdp-session-followup.log`
 - live reconnect was verified against the test host with DisplayControl and dynamic resize restored
 - session teardown hardening was verified with live connect/disconnect and no new macOS crash report
-- `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, late-callback suppression, diagnostics, repeated `NSWindow.close()` autorelease-drain survival, and delayed main-queue drain survival are covered by AppKit unit tests
+- `RDPConnectionView.shutdown()` lifecycle behavior, idempotence, connect-after-shutdown rejection, late-callback suppression, diagnostics, repeated `NSWindow.close()` autorelease-drain survival, delayed main-queue drain survival, and post-close deallocation are covered by AppKit unit tests
 - folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
 - `swift test` passes all 23 package tests
@@ -257,7 +256,7 @@ let stats = rdpView.statistics
 let diagnostics = rdpView.shutdown()
 ```
 
-`RDPConnectionView` owns the `RDPSession`, renders frames through Metal, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
+`RDPConnectionView` owns the `RDPSession`, renders frames through an AppKit layer-backed view, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
 
 `redirectedFolderPath` mounts one macOS folder into the remote session using the provided
 `redirectedFolderName` share name. Leave it `nil` to disable local folder mounting.

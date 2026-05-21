@@ -70,7 +70,10 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
         }
     }
 
-    func testShutdownRetainGraveyardSurvivesDelayedMainQueueDrain() {
+    func testShutdownDetachesFromWindowContentBeforeDelayedMainQueueDrain() {
+        weak var releasedView: RDPConnectionView?
+        weak var releasedWindow: NSWindow?
+
         autoreleasepool {
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
@@ -79,10 +82,14 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
                 defer: false
             )
             let view = RDPConnectionView(frame: window.contentView?.bounds ?? .zero)
+            releasedView = view
+            releasedWindow = window
             window.contentView = view
             window.makeKeyAndOrderFront(nil)
 
             let diagnostics = view.shutdown()
+            XCTAssertFalse(window.contentView === view)
+            XCTAssertFalse(window.isReleasedWhenClosed)
             window.close()
             drainRunLoop(duration: 2.5)
 
@@ -91,6 +98,8 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
             XCTAssertEqual(diagnostics.inFlightCommandBuffers, 0)
         }
         drainRunLoop()
+        XCTAssertNil(releasedView)
+        XCTAssertNil(releasedWindow)
     }
 }
 
