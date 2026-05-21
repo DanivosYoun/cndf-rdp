@@ -1,3 +1,4 @@
+import CoreGraphics
 import RDPClientCore
 import XCTest
 
@@ -15,9 +16,12 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertNil(options.logFileURL)
         XCTAssertEqual(options.logLevel, .info)
         XCTAssertTrue(options.logFilters.isEmpty)
+        XCTAssertTrue(options.preferDeviceNativeResolution)
+        XCTAssertEqual(options.colorDepth, .depth32)
+        XCTAssertNil(options.forcedDesktopSize)
     }
 
-    func testStoresRedirectedFolderAndAudioOptions() {
+    func testStoresConnectionOptions() {
         let logURL = URL(fileURLWithPath: "/tmp/rdp.log")
         let securePassword = RDPSecureString("secret")
         let options = RDPConnectionOptions(
@@ -28,7 +32,10 @@ final class RDPConnectionOptionsTests: XCTestCase {
             audioPlaybackMode: .playLocally,
             logFileURL: logURL,
             logLevel: .debug,
-            logFilters: ["com.freerdp.channels.cliprdr": .trace]
+            logFilters: ["com.freerdp.channels.cliprdr": .trace],
+            preferDeviceNativeResolution: false,
+            colorDepth: .depth24,
+            forcedDesktopSize: CGSize(width: 1920, height: 1080)
         )
 
         XCTAssertEqual(options.securePassword, securePassword)
@@ -38,6 +45,9 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertEqual(options.logFileURL, logURL)
         XCTAssertEqual(options.logLevel, .debug)
         XCTAssertEqual(options.logFilters["com.freerdp.channels.cliprdr"], .trace)
+        XCTAssertFalse(options.preferDeviceNativeResolution)
+        XCTAssertEqual(options.colorDepth, .depth24)
+        XCTAssertEqual(options.forcedDesktopSize, CGSize(width: 1920, height: 1080))
     }
 
     func testSecureStringCanBeZeroized() {

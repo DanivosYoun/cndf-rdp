@@ -799,8 +799,19 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
         return FALSE;
     }
 
+    session->desktop_width = options->desktopWidth > 0 ? options->desktopWidth : session->desktop_width;
+    session->desktop_height = options->desktopHeight > 0 ? options->desktopHeight : session->desktop_height;
     session->desktop_width = session->desktop_width == 0 ? 1440 : session->desktop_width;
     session->desktop_height = session->desktop_height == 0 ? 900 : session->desktop_height;
+    session->desktop_scale = options->desktopScale >= 1.0 ? options->desktopScale : 1.0;
+    UINT32 color_depth = options->colorDepth;
+    if ((color_depth != 16) && (color_depth != 24) && (color_depth != 32)) {
+        color_depth = 32;
+    }
+    UINT32 desktop_scale_factor = (UINT32)(session->desktop_scale * 100.0);
+    if (desktop_scale_factor < 100) {
+        desktop_scale_factor = 100;
+    }
     const BOOL has_redirected_folder =
         (options->redirectedFolderPath != NULL) && (strlen(options->redirectedFolderPath) > 0);
     const BOOL enable_device_redirection = options->enableDriveRedirection || has_redirected_folder ||
@@ -814,7 +825,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
 
     return freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, session->desktop_width) &&
            freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, session->desktop_height) &&
-           freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, color_depth) &&
            freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, options->enableClipboard) &&
@@ -833,7 +844,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_DesktopResize, TRUE) &&
-           freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor, 100) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_DesktopScaleFactor, desktop_scale_factor) &&
            freerdp_settings_set_uint32(settings, FreeRDP_DeviceScaleFactor, 100) &&
            freerdp_settings_set_bool(settings, FreeRDP_AsyncChannels, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_AsyncUpdate, TRUE) &&

@@ -106,6 +106,10 @@ typedef struct RDPBridgeConnectionOptions {
     RDPBridgeAudioPlaybackMode audioPlaybackMode;
     const char *logLevel;
     const char *logFilters;
+    uint32_t colorDepth;
+    uint32_t desktopWidth;
+    uint32_t desktopHeight;
+    double desktopScale;
 } RDPBridgeConnectionOptions;
 
 typedef struct RDPBridgeLocalFile {

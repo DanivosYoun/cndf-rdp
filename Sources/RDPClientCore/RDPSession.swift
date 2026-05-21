@@ -1,4 +1,5 @@
 import ClipboardBridge
+import CoreGraphics
 import FileTransferStaging
 import Foundation
 import FreeRDPBridge
@@ -212,6 +213,21 @@ public final class RDPSession {
     }
 
     public func connect(_ options: RDPConnectionOptions) throws {
+        try connect(options, initialDesktopSize: nil)
+    }
+
+    public func connect(_ options: RDPConnectionOptions, initialPointSize: CGSize, scale: Double) throws {
+        let initialDesktopSize = resizeCoordinator.candidateSize(
+            pointWidth: Double(initialPointSize.width),
+            pointHeight: Double(initialPointSize.height),
+            scale: scale,
+            preferDeviceNativeResolution: options.preferDeviceNativeResolution,
+            forcedDesktopSize: options.forcedDesktopSize
+        )
+        try connect(options, initialDesktopSize: initialDesktopSize)
+    }
+
+    private func connect(_ options: RDPConnectionOptions, initialDesktopSize: RDPDesktopSize?) throws {
         try withSessionLock {
             guard let bridgeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
@@ -223,6 +239,7 @@ public final class RDPSession {
             }
 
             resetStatistics()
+            let bridgeDesktopSize = initialDesktopSize ?? fixedDesktopSize(from: options.forcedDesktopSize)
 
             let status = options.host.withCString { hostPointer in
                 withOptionalCString(options.username) { usernamePointer in
@@ -244,7 +261,11 @@ public final class RDPSession {
                                                 redirectedFolderName: folderNamePointer,
                                                 audioPlaybackMode: RDPBridgeAudioPlaybackMode(rawValue: options.audioPlaybackMode.rawValue),
                                                 logLevel: logLevelPointer,
-                                                logFilters: logFiltersPointer
+                                                logFilters: logFiltersPointer,
+                                                colorDepth: options.colorDepth.rawValue,
+                                                desktopWidth: bridgeDesktopSize?.pixelWidth ?? 0,
+                                                desktopHeight: bridgeDesktopSize?.pixelHeight ?? 0,
+                                                desktopScale: bridgeDesktopSize?.scale ?? 1.0
                                             )
                                             return rdp_bridge_connect(bridgeSession, &bridgeOptions)
                                         }
@@ -329,7 +350,9 @@ public final class RDPSession {
             pointWidth: pointWidth,
             pointHeight: pointHeight,
             scale: scale,
-            force: force
+            force: force,
+            preferDeviceNativeResolution: lastConnectionOptions?.preferDeviceNativeResolution ?? true,
+            forcedDesktopSize: lastConnectionOptions?.forcedDesktopSize
         ) else {
             return
         }
@@ -569,6 +592,21 @@ private func withPasswordCString<T>(_ options: RDPConnectionOptions, _ body: (Un
         return securePassword.withCString(body)
     }
     return withOptionalCString(options.password, body)
+}
+
+private func fixedDesktopSize(from size: CGSize?) -> RDPDesktopSize? {
+    guard let size else {
+        return nil
+    }
+    return RDPDesktopSize(
+        pixelWidth: bridgeDesktopDimension(size.width),
+        pixelHeight: bridgeDesktopDimension(size.height),
+        scale: 1.0
+    )
+}
+
+private func bridgeDesktopDimension(_ value: CGFloat) -> UInt32 {
+    UInt32(max(1, min(CGFloat(UInt32.max), value.rounded(.toNearestOrAwayFromZero))))
 }
 
 private func withLogFilterCString<T>(

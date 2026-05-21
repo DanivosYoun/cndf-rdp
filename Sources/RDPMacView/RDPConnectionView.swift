@@ -99,7 +99,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         self.session = session
         clientView.session = session
 
-        try session.connect(options)
+        try session.connect(options, initialPointSize: clientView.bounds.size, scale: desktopScale)
         clientView.sendForcedDesktopSize()
         startClipboardPolling()
         delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
@@ -173,6 +173,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         clientView.frame = bounds
         clientView.autoresizingMask = [.width, .height]
         addSubview(clientView)
+    }
+
+    private var desktopScale: Double {
+        Double(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0)
     }
 
     private func startClipboardPolling() {

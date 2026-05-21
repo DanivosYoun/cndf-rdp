@@ -33,7 +33,7 @@ public final class RDPClientView: NSView {
         wantsLayer = true
         let backingLayer = CALayer()
         backingLayer.backgroundColor = NSColor.black.cgColor
-        backingLayer.contentsGravity = .resize
+        backingLayer.contentsGravity = .resizeAspect
         backingLayer.masksToBounds = true
         layer = backingLayer
         registerForDraggedTypes([.fileURL])
@@ -51,6 +51,11 @@ public final class RDPClientView: NSView {
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         scheduleDesktopSize()
+    }
+
+    public override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        sendForcedDesktopSize()
     }
 
     public override func updateTrackingAreas() {
@@ -280,8 +285,11 @@ public final class RDPClientView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         let targetWidth = remoteFrameSize.width > 0 ? remoteFrameSize.width : bounds.width
         let targetHeight = remoteFrameSize.height > 0 ? remoteFrameSize.height : bounds.height
-        let xRatio = bounds.width > 0 ? point.x / bounds.width : 0
-        let yRatio = bounds.height > 0 ? point.y / bounds.height : 0
+        let displayRect = remoteDisplayRect(targetWidth: targetWidth, targetHeight: targetHeight)
+        let clampedX = max(displayRect.minX, min(displayRect.maxX, point.x))
+        let clampedY = max(displayRect.minY, min(displayRect.maxY, point.y))
+        let xRatio = displayRect.width > 0 ? (clampedX - displayRect.minX) / displayRect.width : 0
+        let yRatio = displayRect.height > 0 ? (clampedY - displayRect.minY) / displayRect.height : 0
         let x = UInt32(max(0, min(targetWidth - 1, xRatio * targetWidth)).rounded(.toNearestOrAwayFromZero))
         let y = UInt32(max(0, min(targetHeight - 1, yRatio * targetHeight)).rounded(.toNearestOrAwayFromZero))
         return RDPPointerLocation(pixelX: x, pixelY: y)
@@ -289,11 +297,30 @@ public final class RDPClientView: NSView {
 
     private func sendDesktopSize(force: Bool) {
         guard !isRenderPipelineShutdown else { return }
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
         try? session?.updateDesktopSize(
             pointWidth: Double(bounds.width),
             pointHeight: Double(bounds.height),
-            scale: 1.0,
+            scale: scale,
             force: force
+        )
+    }
+
+    private func remoteDisplayRect(targetWidth: CGFloat, targetHeight: CGFloat) -> CGRect {
+        guard bounds.width > 0, bounds.height > 0, targetWidth > 0, targetHeight > 0 else {
+            return bounds
+        }
+
+        let xScale = bounds.width / targetWidth
+        let yScale = bounds.height / targetHeight
+        let scale = min(xScale, yScale)
+        let width = targetWidth * scale
+        let height = targetHeight * scale
+        return CGRect(
+            x: bounds.minX + (bounds.width - width) / 2,
+            y: bounds.minY + (bounds.height - height) / 2,
+            width: width,
+            height: height
         )
     }
 

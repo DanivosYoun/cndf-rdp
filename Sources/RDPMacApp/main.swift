@@ -63,7 +63,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
             session.delegate = self
             self.session = session
             clientView?.session = session
-            try session.connect(options)
+            if let clientView {
+                try session.connect(
+                    options,
+                    initialPointSize: clientView.bounds.size,
+                    scale: Double(clientView.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0)
+                )
+            } else {
+                try session.connect(options)
+            }
             clientView?.sendForcedDesktopSize()
             view.setConnected(true)
             view.setStatus("Connecting")

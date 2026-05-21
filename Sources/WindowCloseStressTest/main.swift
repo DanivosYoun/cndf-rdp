@@ -52,8 +52,48 @@ private func makeConnectionOptions(environment: [String: String]) throws -> RDPC
         redirectedFolderName: environment["RDP_MAC_REDIRECT_FOLDER_NAME"],
         audioPlaybackMode: audioMode,
         logFileURL: environment["RDP_MAC_LOG_FILE"].map { URL(fileURLWithPath: $0) },
-        logLevel: .info
+        logLevel: .info,
+        preferDeviceNativeResolution: parsedBool(environment["RDP_MAC_PREFER_NATIVE_RESOLUTION"], defaultValue: true),
+        colorDepth: parsedColorDepth(environment["RDP_MAC_COLOR_DEPTH"]),
+        forcedDesktopSize: parsedDesktopSize(environment["RDP_MAC_FORCED_DESKTOP_SIZE"])
     )
+}
+
+private func parsedBool(_ value: String?, defaultValue: Bool) -> Bool {
+    switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "1", "true", "yes", "on":
+        return true
+    case "0", "false", "no", "off":
+        return false
+    default:
+        return defaultValue
+    }
+}
+
+private func parsedColorDepth(_ value: String?) -> RDPColorDepth {
+    switch value?.trimmingCharacters(in: .whitespacesAndNewlines) {
+    case "16":
+        return .depth16
+    case "24":
+        return .depth24
+    default:
+        return .depth32
+    }
+}
+
+private func parsedDesktopSize(_ value: String?) -> CGSize? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+          !value.isEmpty else {
+        return nil
+    }
+    let parts = value
+        .replacingOccurrences(of: "×", with: "x")
+        .split(separator: "x", maxSplits: 1)
+        .compactMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
+        return nil
+    }
+    return CGSize(width: parts[0], height: parts[1])
 }
 
 private func drainRunLoop(duration: TimeInterval) {

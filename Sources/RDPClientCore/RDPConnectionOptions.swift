@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 public struct RDPConnectionOptions: Equatable, Sendable {
@@ -15,6 +16,9 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let logFileURL: URL?
     public let logLevel: RDPLogLevel
     public let logFilters: [String: RDPLogLevel]
+    public let preferDeviceNativeResolution: Bool
+    public let colorDepth: RDPColorDepth
+    public let forcedDesktopSize: CGSize?
 
     public init(
         host: String,
@@ -30,7 +34,10 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         audioPlaybackMode: RDPAudioPlaybackMode = .disabled,
         logFileURL: URL? = nil,
         logLevel: RDPLogLevel = .info,
-        logFilters: [String: RDPLogLevel] = [:]
+        logFilters: [String: RDPLogLevel] = [:],
+        preferDeviceNativeResolution: Bool = true,
+        colorDepth: RDPColorDepth = .depth32,
+        forcedDesktopSize: CGSize? = nil
     ) {
         self.host = host
         self.port = port
@@ -46,6 +53,9 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.logFileURL = logFileURL
         self.logLevel = logLevel
         self.logFilters = logFilters
+        self.preferDeviceNativeResolution = preferDeviceNativeResolution
+        self.colorDepth = colorDepth
+        self.forcedDesktopSize = forcedDesktopSize
     }
 }
 
@@ -53,6 +63,12 @@ public enum RDPAudioPlaybackMode: UInt32, Equatable, Sendable {
     case disabled = 0
     case playLocally = 1
     case playOnRemote = 2
+}
+
+public enum RDPColorDepth: UInt32, Equatable, Sendable {
+    case depth16 = 16
+    case depth24 = 24
+    case depth32 = 32
 }
 
 public enum RDPLogLevel: String, Equatable, Sendable {

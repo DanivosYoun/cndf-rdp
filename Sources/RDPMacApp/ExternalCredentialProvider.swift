@@ -14,6 +14,9 @@ struct ExternalCredentialProvider {
         static let logFilePath = "RDP_MAC_LOG_FILE"
         static let logLevel = "RDP_MAC_LOG_LEVEL"
         static let logFilters = "RDP_MAC_LOG_FILTERS"
+        static let preferDeviceNativeResolution = "RDP_MAC_PREFER_NATIVE_RESOLUTION"
+        static let colorDepth = "RDP_MAC_COLOR_DEPTH"
+        static let forcedDesktopSize = "RDP_MAC_FORCED_DESKTOP_SIZE"
         static let autoConnect = "RDP_MAC_AUTOCONNECT"
     }
 
@@ -44,7 +47,10 @@ struct ExternalCredentialProvider {
             audioPlaybackMode: parsedAudioPlaybackMode(environment[Key.audioPlaybackMode]),
             logFileURL: parsedLogFileURL(environment[Key.logFilePath]),
             logLevel: parsedLogLevel(environment[Key.logLevel]),
-            logFilters: parsedLogFilters(environment[Key.logFilters])
+            logFilters: parsedLogFilters(environment[Key.logFilters]),
+            preferDeviceNativeResolution: parsedBool(environment[Key.preferDeviceNativeResolution], defaultValue: true),
+            colorDepth: parsedColorDepth(environment[Key.colorDepth]),
+            forcedDesktopSize: parsedDesktopSize(environment[Key.forcedDesktopSize])
         )
     }
 
@@ -106,5 +112,41 @@ struct ExternalCredentialProvider {
             filters[parts[0]] = level
         }
         return filters
+    }
+
+    private func parsedBool(_ value: String?, defaultValue: Bool) -> Bool {
+        switch trimmed(value)?.lowercased() {
+        case "1", "true", "yes", "on":
+            return true
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return defaultValue
+        }
+    }
+
+    private func parsedColorDepth(_ value: String?) -> RDPColorDepth {
+        switch trimmed(value) {
+        case "16":
+            return .depth16
+        case "24":
+            return .depth24
+        default:
+            return .depth32
+        }
+    }
+
+    private func parsedDesktopSize(_ value: String?) -> CGSize? {
+        guard let value = nilIfEmpty(trimmed(value))?.lowercased() else {
+            return nil
+        }
+        let parts = value
+            .replacingOccurrences(of: "×", with: "x")
+            .split(separator: "x", maxSplits: 1)
+            .compactMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
+            return nil
+        }
+        return CGSize(width: parts[0], height: parts[1])
     }
 }

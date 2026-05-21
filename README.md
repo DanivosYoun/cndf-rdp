@@ -1,6 +1,6 @@
 # RDP Mac
 
-SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin FreeRDP bridge, dynamic resize, clipboard/file transfer, local folder redirection, and audio playback options.
+SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin FreeRDP bridge, Retina-aware dynamic resize, clipboard/file transfer, local folder redirection, and audio playback options.
 
 ## Modules
 
@@ -57,6 +57,10 @@ The bridge currently provides:
 - `RDPSecureString` for vault-supplied transient passwords
 - reconnect API using retained connection options
 - session statistics for frames, clipboard, file transfer, and activity timestamps
+- Retina-aware desktop resize using the host window backing scale factor by default
+- optional 1x resize mode for low-bandwidth sessions
+- optional fixed remote desktop size for force-display-mode style workflows
+- configurable FreeRDP color depth: 16, 24, or 32 bpp
 - serialized `RDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
 - hardened FreeRDP teardown that waits for the event-loop thread before freeing native session state
 - explicit `RDPConnectionView.shutdown()` for safe `NSWindow` close and render-surface teardown
@@ -73,6 +77,8 @@ The app uses FreeRDP's event loop on a background WinPR thread and displays rece
 Smooth interactive behavior depends on keeping resize, rendering, input, and clipboard work on separate paths:
 
 - desktop resize updates are coalesced by `DisplayResizeCoordinator`
+- Retina displays send point size multiplied by `NSWindow.backingScaleFactor` unless `preferDeviceNativeResolution` is disabled
+- `forcedDesktopSize` locks the remote framebuffer size and scales it proportionally inside the local view
 - clipboard/file transfers are staged outside the UI path
 - the bridge API has an explicit `rdp_bridge_update_desktop_size` hook for FreeRDP display control integration
 
@@ -171,6 +177,10 @@ Verified against a Windows RDP test host on 2026-05-21:
 - FreeRDP addins loaded and connected: `rdpdr`, `rdpsnd`, `cliprdr`, `drdynvc`, `rdpgfx`, `disp`
 - audio playback path connected through `AUDIO_PLAYBACK_DVC`
 - dynamic resize sent through DisplayControl after the remote desktop connected
+- Retina/native-resolution resize, 1x opt-out resize, forced desktop size, and color depth options are covered by unit tests
+- live resize smoke tests verified Retina/native scale (`1920x1280 scale=2.00`), 1x opt-out
+  (`960x640 scale=1.00`), forced desktop size (`1920x1080 scale=1.00`), and 16/24 bpp
+  connection negotiation without new crash reports
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
 - Mac-to-RDP folder paste was live-tested through Explorer; Windows requested descriptors plus file size/range reads for both root and nested files
 - folder paste is staged recursively as relative file paths such as `Folder\Sub\file.txt`
@@ -186,22 +196,26 @@ Verified against a Windows RDP test host on 2026-05-21:
   `didWait=true`, `pendingMain=0`, and `inFlight=0`, and no new macOS crash report was created
 - folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all 24 package tests, with the live RDP close test skipped unless
+- `swift test` passes all 26 package tests, with the live RDP close test skipped unless
   `RDP_WINDOW_CLOSE_INTEGRATION=1` is set
 
 Manual checklist for future changes:
 
 1. Resize the macOS window and confirm the remote desktop fills the view without black side gaps.
-2. Copy a file in Finder, focus Explorer or Desktop in the RDP session, then paste.
-3. Drag a file from Finder into the RDP surface and confirm it appears remotely.
-4. Copy or drag a folder that contains nested files and confirm the folder structure appears remotely.
-5. Select a remote file in Explorer, copy it, then paste into Finder on macOS.
-6. Enable a redirected folder and confirm it appears in the remote session.
-7. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
-8. Copy or drag a Korean-named file or folder and confirm the name stays composed on Windows.
-9. Host `RDPConnectionView` in a separate `NSWindow`, connect, call `shutdown()`, then close the window and confirm the host app stays alive.
-10. Repeat the `shutdown()` plus window close flow 10 times and confirm there is no crash or delayed macOS crash report.
-11. Connect and immediately call `shutdown()` before the first frame arrives, then close the window.
+2. On a Retina display, confirm the DisplayControl log uses the backing-scale pixel size and text is sharp.
+3. Set `preferDeviceNativeResolution` to `false` and confirm resize updates use 1x point dimensions.
+4. Set `forcedDesktopSize` such as `1920x1080` and confirm the remote framebuffer stays fixed while the local view scales proportionally.
+5. Switch `colorDepth` between 32, 24, and 16 bpp and confirm connection negotiation succeeds.
+6. Copy a file in Finder, focus Explorer or Desktop in the RDP session, then paste.
+7. Drag a file from Finder into the RDP surface and confirm it appears remotely.
+8. Copy or drag a folder that contains nested files and confirm the folder structure appears remotely.
+9. Select a remote file in Explorer, copy it, then paste into Finder on macOS.
+10. Enable a redirected folder and confirm it appears in the remote session.
+11. Enable local audio playback and confirm the `rdpsnd` and `AUDIO_PLAYBACK_DVC` channels connect.
+12. Copy or drag a Korean-named file or folder and confirm the name stays composed on Windows.
+13. Host `RDPConnectionView` in a separate `NSWindow`, connect, call `shutdown()`, then close the window and confirm the host app stays alive.
+14. Repeat the `shutdown()` plus window close flow 10 times and confirm there is no crash or delayed macOS crash report.
+15. Connect and immediately call `shutdown()` before the first frame arrives, then close the window.
 
 ## Verify
 
@@ -255,7 +269,10 @@ try rdpView.connect(
         audioPlaybackMode: .playLocally,
         logFileURL: URL(fileURLWithPath: "/Users/me/Library/Logs/MyApp/rdp/session.log"),
         logLevel: .info,
-        logFilters: ["com.freerdp.channels.cliprdr": .debug]
+        logFilters: ["com.freerdp.channels.cliprdr": .debug],
+        preferDeviceNativeResolution: true,
+        colorDepth: .depth32,
+        forcedDesktopSize: nil
     )
 )
 
@@ -270,6 +287,11 @@ let diagnostics = rdpView.shutdown()
 `redirectedFolderPath` mounts one macOS folder into the remote session using the provided
 `redirectedFolderName` share name. Leave it `nil` to disable local folder mounting.
 `audioPlaybackMode` supports `.playLocally`, `.playOnRemote`, and `.disabled`.
+`preferDeviceNativeResolution` defaults to `true` and sends Retina/5K backing pixels to the
+remote side for sharper text. Set it to `false` to force 1x resize updates.
+`forcedDesktopSize` locks the remote desktop to a fixed pixel size such as `1920x1080`; the
+local view scales that framebuffer proportionally. `colorDepth` requests 16, 24, or 32 bpp from
+FreeRDP while the Swift display path continues to receive BGRA frames.
 
 ## External Credentials
 
@@ -287,6 +309,9 @@ RDP_MAC_AUDIO_MODE=local \
 RDP_MAC_LOG_FILE=/tmp/rdp-session.log \
 RDP_MAC_LOG_LEVEL=debug \
 RDP_MAC_LOG_FILTERS=com.freerdp.channels.cliprdr=trace \
+RDP_MAC_PREFER_NATIVE_RESOLUTION=1 \
+RDP_MAC_COLOR_DEPTH=32 \
+RDP_MAC_FORCED_DESKTOP_SIZE=1920x1080 \
 RDP_MAC_AUTOCONNECT=1 \
 swift run rdp-mac
 ```
@@ -296,8 +321,12 @@ Without it, visible credential fields are only prefilled in the connection bar.
 `RDP_MAC_LOG_FILE` is optional and appends session logs to the given path.
 `RDP_MAC_LOG_LEVEL` accepts `trace`, `debug`, `info`, `warn`, `error`, `fatal`, or `off`.
 `RDP_MAC_LOG_FILTERS` accepts semicolon-separated `category=level` pairs.
+`RDP_MAC_PREFER_NATIVE_RESOLUTION` accepts `1`/`true` or `0`/`false` and defaults to enabled.
+`RDP_MAC_COLOR_DEPTH` accepts `16`, `24`, or `32`.
+`RDP_MAC_FORCED_DESKTOP_SIZE` accepts `WIDTHxHEIGHT`; omit it to keep dynamic resize enabled.
 
-The sample app connection bar also exposes the audio mode and redirected folder controls for manual testing.
+The sample app connection bar also exposes Retina, color depth, forced size, audio mode, and
+redirected folder controls for manual testing.
 
 ## Test Hook
 
@@ -322,11 +351,16 @@ RDP_MAC_HOST=192.168.1.10 \
 RDP_MAC_PORT=3389 \
 RDP_MAC_USERNAME=user \
 RDP_MAC_PASSWORD=secret \
+RDP_MAC_PREFER_NATIVE_RESOLUTION=1 \
+RDP_MAC_COLOR_DEPTH=32 \
+RDP_MAC_FORCED_DESKTOP_SIZE=1920x1080 \
 RDP_WINDOW_CLOSE_STRESS_CYCLES=10 \
 swift run window-close-stress-test
 ```
 
 Each cycle creates an `NSWindow`, connects `RDPConnectionView`, waits briefly after connection,
 calls `shutdown()`, closes the window, drains the run loop, and prints `RDPShutdownDiagnostics`.
+The harness accepts the same Retina, color depth, forced size, audio, logging, and folder redirection
+environment variables as the sample app.
 For XCTest-based live coverage, set `RDP_WINDOW_CLOSE_INTEGRATION=1` with the same `RDP_MAC_*`
 variables before running `swift test`.

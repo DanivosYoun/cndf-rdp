@@ -18,6 +18,9 @@ final class ConnectionBarView: NSView {
     private let folderPathField = NSTextField(string: "")
     private let folderNameField = NSTextField(string: "RemoteShare")
     private let audioPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let nativeResolutionButton = NSButton(checkboxWithTitle: "Retina", target: nil, action: nil)
+    private let colorDepthPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let forcedSizeField = NSTextField(string: "")
     private let connectButton = NSButton(title: "Connect", target: nil, action: nil)
     private let disconnectButton = NSButton(title: "Disconnect", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Disconnected")
@@ -52,6 +55,13 @@ final class ConnectionBarView: NSView {
         folderPathField.stringValue = options.redirectedFolderPath ?? ""
         folderNameField.stringValue = options.redirectedFolderName ?? "RemoteShare"
         audioPopup.selectItem(at: Int(options.audioPlaybackMode.rawValue))
+        nativeResolutionButton.state = options.preferDeviceNativeResolution ? .on : .off
+        colorDepthPopup.selectItem(withTitle: "\(options.colorDepth.rawValue)-bit")
+        if let forcedDesktopSize = options.forcedDesktopSize {
+            forcedSizeField.stringValue = "\(Int(forcedDesktopSize.width))x\(Int(forcedDesktopSize.height))"
+        } else {
+            forcedSizeField.stringValue = ""
+        }
         updateFolderFields()
     }
 
@@ -73,6 +83,11 @@ final class ConnectionBarView: NSView {
         folderMountButton.setButtonType(.switch)
         audioPopup.addItems(withTitles: ["Audio off", "Play local", "Play remote"])
         audioPopup.selectItem(at: 0)
+        nativeResolutionButton.state = .on
+        nativeResolutionButton.setButtonType(.switch)
+        colorDepthPopup.addItems(withTitles: ["32-bit", "24-bit", "16-bit"])
+        colorDepthPopup.selectItem(at: 0)
+        forcedSizeField.placeholderString = "WxH"
 
         connectButton.target = self
         connectButton.action = #selector(connect)
@@ -96,6 +111,9 @@ final class ConnectionBarView: NSView {
 
         let optionsStack = NSStackView(views: [
             audioPopup,
+            nativeResolutionButton,
+            colorDepthPopup,
+            forcedSizeField,
             folderMountButton,
             folderNameField,
             folderPathField
@@ -119,8 +137,11 @@ final class ConnectionBarView: NSView {
         domainField.widthAnchor.constraint(equalToConstant: 110).isActive = true
         statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
         audioPopup.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        nativeResolutionButton.widthAnchor.constraint(equalToConstant: 76).isActive = true
+        colorDepthPopup.widthAnchor.constraint(equalToConstant: 86).isActive = true
+        forcedSizeField.widthAnchor.constraint(equalToConstant: 94).isActive = true
         folderNameField.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        folderPathField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        folderPathField.widthAnchor.constraint(equalToConstant: 280).isActive = true
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
@@ -147,7 +168,10 @@ final class ConnectionBarView: NSView {
                 domain: nilIfEmpty(domainField.stringValue),
                 redirectedFolderPath: shouldMountFolder ? folderPath : nil,
                 redirectedFolderName: nilIfEmpty(folderName),
-                audioPlaybackMode: selectedAudioPlaybackMode()
+                audioPlaybackMode: selectedAudioPlaybackMode(),
+                preferDeviceNativeResolution: nativeResolutionButton.state == .on,
+                colorDepth: selectedColorDepth(),
+                forcedDesktopSize: parsedForcedDesktopSize()
             )
         )
     }
@@ -171,6 +195,34 @@ final class ConnectionBarView: NSView {
         default:
             return .disabled
         }
+    }
+
+    private func selectedColorDepth() -> RDPColorDepth {
+        switch colorDepthPopup.indexOfSelectedItem {
+        case 1:
+            return .depth24
+        case 2:
+            return .depth16
+        default:
+            return .depth32
+        }
+    }
+
+    private func parsedForcedDesktopSize() -> CGSize? {
+        let value = forcedSizeField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "×", with: "x")
+        guard !value.isEmpty else {
+            return nil
+        }
+        let parts = value
+            .split(separator: "x", maxSplits: 1)
+            .compactMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
+            return nil
+        }
+        return CGSize(width: parts[0], height: parts[1])
     }
 
     private func nilIfEmpty(_ value: String) -> String? {

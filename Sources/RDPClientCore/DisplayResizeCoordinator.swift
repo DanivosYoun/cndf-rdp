@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 public struct RDPDesktopSize: Equatable, Sendable {
@@ -29,8 +30,20 @@ public final class DisplayResizeCoordinator {
         self.minimumInterval = minimumInterval
     }
 
-    public func candidateSize(pointWidth: Double, pointHeight: Double, scale: Double) -> RDPDesktopSize {
-        let normalizedScale = max(scale, 1.0)
+    public func candidateSize(
+        pointWidth: Double,
+        pointHeight: Double,
+        scale: Double,
+        preferDeviceNativeResolution: Bool = true,
+        forcedDesktopSize: CGSize? = nil
+    ) -> RDPDesktopSize {
+        if let forcedDesktopSize {
+            let width = clampedPixelDimension(forcedDesktopSize.width)
+            let height = clampedPixelDimension(forcedDesktopSize.height)
+            return RDPDesktopSize(pixelWidth: width, pixelHeight: height, scale: 1.0)
+        }
+
+        let normalizedScale = preferDeviceNativeResolution ? max(scale, 1.0) : 1.0
         let width = max(minimumPixelWidth, UInt32((pointWidth * normalizedScale).rounded(.toNearestOrAwayFromZero)))
         let height = max(minimumPixelHeight, UInt32((pointHeight * normalizedScale).rounded(.toNearestOrAwayFromZero)))
         return RDPDesktopSize(pixelWidth: width, pixelHeight: height, scale: normalizedScale)
@@ -41,9 +54,17 @@ public final class DisplayResizeCoordinator {
         pointHeight: Double,
         scale: Double,
         now: TimeInterval = ProcessInfo.processInfo.systemUptime,
-        force: Bool = false
+        force: Bool = false,
+        preferDeviceNativeResolution: Bool = true,
+        forcedDesktopSize: CGSize? = nil
     ) -> RDPDesktopSize? {
-        let candidate = candidateSize(pointWidth: pointWidth, pointHeight: pointHeight, scale: scale)
+        let candidate = candidateSize(
+            pointWidth: pointWidth,
+            pointHeight: pointHeight,
+            scale: scale,
+            preferDeviceNativeResolution: preferDeviceNativeResolution,
+            forcedDesktopSize: forcedDesktopSize
+        )
         guard force || candidate != lastSentSize else {
             return nil
         }
@@ -55,5 +76,9 @@ public final class DisplayResizeCoordinator {
         lastSentSize = candidate
         lastSentTime = now
         return candidate
+    }
+
+    private func clampedPixelDimension(_ value: CGFloat) -> UInt32 {
+        UInt32(max(1, min(CGFloat(UInt32.max), value.rounded(.toNearestOrAwayFromZero))))
     }
 }
