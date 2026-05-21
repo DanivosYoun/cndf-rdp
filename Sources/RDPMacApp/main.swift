@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
     private var receivedFrameCount = 0
     private var lastFrameSize: CGSize = .zero
     private var didRunExplorerFilePasteAutotest = false
+    private var didRunExplorerFolderPasteAutotest = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let window = NSWindow(
@@ -102,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
             }
             if message == "Display control channel connected." {
                 self?.runExplorerFilePasteAutotestIfNeeded()
+                self?.runExplorerFolderPasteAutotestIfNeeded()
             }
         }
     }
@@ -167,6 +169,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
                 session.delegate?.rdpSession(session, didLog: "Explorer file copyback autotest sent Ctrl+C.")
             } catch {
                 session.delegate?.rdpSession(session, didLog: "Explorer file paste autotest failed: \(error)")
+            }
+        }
+    }
+
+    private func runExplorerFolderPasteAutotestIfNeeded() {
+        guard !didRunExplorerFolderPasteAutotest,
+              ProcessInfo.processInfo.environment["RDP_MAC_AUTOTEST_EXPLORER_FOLDER_PASTE"] == "1",
+              let session else {
+            return
+        }
+        didRunExplorerFolderPasteAutotest = true
+
+        DispatchQueue.global(qos: .utility).async { [weak self, weak session] in
+            guard let self, let session else { return }
+            let rootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("RDPFolderPasteAutotest", isDirectory: true)
+            let nestedURL = rootURL.appendingPathComponent("하위폴더".decomposedStringWithCanonicalMapping, isDirectory: true)
+            let topFileURL = rootURL.appendingPathComponent("root.txt")
+            let nestedFileURL = nestedURL.appendingPathComponent("한글파일.txt".decomposedStringWithCanonicalMapping)
+            do {
+                try? FileManager.default.removeItem(at: rootURL)
+                try FileManager.default.createDirectory(at: nestedURL, withIntermediateDirectories: true)
+                try "root folder paste test\n".write(to: topFileURL, atomically: true, encoding: .utf8)
+                try "nested korean folder paste test\n".write(to: nestedFileURL, atomically: true, encoding: .utf8)
+                Thread.sleep(forTimeInterval: 1.0)
+                try session.sendLocalText("explorer.exe %USERPROFILE%\\Desktop")
+                try self.sendShortcut(session: session, modifiers: [RDPKeyboardMapper.leftWindows], key: 0x13)
+                Thread.sleep(forTimeInterval: 1.0)
+                try self.sendShortcut(session: session, modifiers: [RDPKeyboardMapper.leftControl], key: 0x2F)
+                try self.sendShortcut(session: session, modifiers: [], key: 0x1C)
+                Thread.sleep(forTimeInterval: 2.0)
+                try session.sendLocalFiles([rootURL])
+                Thread.sleep(forTimeInterval: 1.0)
+                try self.sendShortcut(session: session, modifiers: [RDPKeyboardMapper.leftControl], key: 0x2F)
+                session.delegate?.rdpSession(session, didLog: "Explorer folder paste autotest opened Desktop and sent Ctrl+V.")
+            } catch {
+                session.delegate?.rdpSession(session, didLog: "Explorer folder paste autotest failed: \(error)")
             }
         }
     }

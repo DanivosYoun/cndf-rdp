@@ -165,7 +165,8 @@ Verified against a Windows RDP test host on 2026-05-21:
 - audio playback path connected through `AUDIO_PLAYBACK_DVC`
 - dynamic resize sent through DisplayControl after the remote desktop connected
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
-- Mac-to-RDP folder paste is staged recursively as relative file paths such as `Folder\Sub\file.txt`
+- Mac-to-RDP folder paste was live-tested through Explorer; Windows requested descriptors plus file size/range reads for both root and nested files
+- folder paste is staged recursively as relative file paths such as `Folder\Sub\file.txt`
 - RDP-to-Mac copy-back materialized the remote file to the macOS pasteboard
 - decomposed Korean filenames are normalized to NFC before being advertised to Windows
 - WLog debug/filter options were applied during live connection testing
@@ -202,18 +203,23 @@ For live file-copy smoke testing, set `RDP_MAC_AUTOTEST_EXPLORER_FILE_PASTE=1` w
 `RDP_MAC_AUTOCONNECT=1`. The test opens the remote Desktop in Explorer, offers a small
 local file, pastes it, then copies the selected remote file back to the macOS pasteboard.
 
+For live folder-copy smoke testing, set `RDP_MAC_AUTOTEST_EXPLORER_FOLDER_PASTE=1` with
+`RDP_MAC_AUTOCONNECT=1`. The test opens the remote Desktop in Explorer, offers a temporary
+folder containing a root file plus a nested Korean-named file, and pastes it through the
+same clipboard file-transfer path used by Finder folder copy/drag.
+
 ## Embed In Another App
 
 Add this repository as a SwiftPM dependency:
 
 ```swift
-.package(url: "https://github.com/CNDF-WORK/terminal-rdp.git", branch: "main")
+.package(url: "https://github.com/DanivosYoun/cndf-rdp.git", branch: "main")
 ```
 
 Then depend on `RDPMacView` from the app target:
 
 ```swift
-.product(name: "RDPMacView", package: "terminal-rdp")
+.product(name: "RDPMacView", package: "cndf-rdp")
 ```
 
 Use `RDPConnectionView` as a normal `NSView`:
@@ -284,6 +290,13 @@ The sample app connection bar also exposes the audio mode and redirected folder 
 
 ## Test Hook
 
-For ad hoc integration testing only, set `RDP_MAC_AUTOTEST_EXPLORER_FILE_PASTE=1`.
-The app opens the remote Desktop in Explorer, offers a small local file, pastes it,
-then copies the selected remote file back to the macOS pasteboard.
+For ad hoc integration testing only, set `RDP_MAC_AUTOTEST_EXPLORER_FILE_PASTE=1`
+or `RDP_MAC_AUTOTEST_EXPLORER_FOLDER_PASTE=1`.
+
+`RDP_MAC_AUTOTEST_EXPLORER_FILE_PASTE=1` opens the remote Desktop in Explorer, offers
+a small local file, pastes it, then copies the selected remote file back to the macOS
+pasteboard.
+
+`RDP_MAC_AUTOTEST_EXPLORER_FOLDER_PASTE=1` opens the remote Desktop in Explorer, offers
+a temporary folder with a nested Korean-named file, and sends Ctrl+V so the remote side
+requests the staged relative file paths.
