@@ -2,7 +2,8 @@ import AppKit
 import RDPClientCore
 import RDPMacView
 
-final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, ConnectionBarViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPSessionDelegate, ConnectionBarViewDelegate {
+    private var window: NSWindow?
     private var session: RDPSession?
     private var timer: Timer?
     private var clientView: RDPClientView?
@@ -21,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
             defer: false
         )
         window.title = "RDP Mac"
+        window.animationBehavior = .none
+        window.isReleasedWhenClosed = false
+        window.delegate = self
         window.center()
         let root = NSView(frame: window.contentView?.bounds ?? .zero)
         root.autoresizingMask = [.width, .height]
@@ -38,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
         window.contentView = root
         self.clientView = clientView
         self.connectionBar = connectionBar
+        self.window = window
         window.makeKeyAndOrderFront(nil)
 
         if let externalOptions = externalCredentialProvider.connectionOptions() {
@@ -99,6 +104,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, RDPSessionDelegate, Co
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
         try? session?.disconnect()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        timer?.invalidate()
+        timer = nil
+        try? session?.disconnect()
+        session = nil
+        clientView?.shutdownRendering()
+        clientView = nil
+        connectionBar = nil
+        window = nil
     }
 
     func rdpSession(_ session: RDPSession, didLog message: String) {

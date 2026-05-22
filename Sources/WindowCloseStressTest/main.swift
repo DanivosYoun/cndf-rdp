@@ -31,32 +31,43 @@ private enum StressError: Error, CustomStringConvertible {
 }
 
 private func makeConnectionOptions(environment: [String: String]) throws -> RDPConnectionOptions {
-    guard let host = environment["RDP_MAC_HOST"], !host.isEmpty else {
+    guard let host = nilIfEmpty(trimmed(environment["RDP_MAC_HOST"])) else {
         throw StressError.missingHost
     }
-    let port = UInt16(environment["RDP_MAC_PORT"] ?? "") ?? 3389
-    let password = environment["RDP_MAC_PASSWORD"].map(RDPSecureString.init)
-    let audioMode: RDPAudioPlaybackMode = switch environment["RDP_MAC_AUDIO_MODE"] {
-    case "local": .playLocally
-    case "remote": .playOnRemote
+    let port = UInt16(trimmed(environment["RDP_MAC_PORT"]) ?? "") ?? 3389
+    let password = nilIfEmpty(environment["RDP_MAC_PASSWORD"]).map(RDPSecureString.init)
+    let audioMode: RDPAudioPlaybackMode = switch trimmed(environment["RDP_MAC_AUDIO_MODE"])?.lowercased() {
+    case "local", "play-locally", "playlocally", "mac", "1": .playLocally
+    case "remote", "play-on-remote", "playonremote", "server", "2": .playOnRemote
     default: .disabled
     }
 
     return RDPConnectionOptions(
         host: host,
         port: port,
-        username: environment["RDP_MAC_USERNAME"],
+        username: nilIfEmpty(trimmed(environment["RDP_MAC_USERNAME"])),
         securePassword: password,
-        domain: environment["RDP_MAC_DOMAIN"],
-        redirectedFolderPath: environment["RDP_MAC_REDIRECT_FOLDER_PATH"],
-        redirectedFolderName: environment["RDP_MAC_REDIRECT_FOLDER_NAME"],
+        domain: nilIfEmpty(trimmed(environment["RDP_MAC_DOMAIN"])),
+        redirectedFolderPath: nilIfEmpty(trimmed(environment["RDP_MAC_REDIRECT_FOLDER_PATH"])),
+        redirectedFolderName: nilIfEmpty(trimmed(environment["RDP_MAC_REDIRECT_FOLDER_NAME"])),
         audioPlaybackMode: audioMode,
-        logFileURL: environment["RDP_MAC_LOG_FILE"].map { URL(fileURLWithPath: $0) },
+        logFileURL: nilIfEmpty(trimmed(environment["RDP_MAC_LOG_FILE"])).map { URL(fileURLWithPath: $0) },
         logLevel: .info,
         preferDeviceNativeResolution: parsedBool(environment["RDP_MAC_PREFER_NATIVE_RESOLUTION"], defaultValue: true),
         colorDepth: parsedColorDepth(environment["RDP_MAC_COLOR_DEPTH"]),
         forcedDesktopSize: parsedDesktopSize(environment["RDP_MAC_FORCED_DESKTOP_SIZE"])
     )
+}
+
+private func trimmed(_ value: String?) -> String? {
+    value?.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func nilIfEmpty(_ value: String?) -> String? {
+    guard let value, !value.isEmpty else {
+        return nil
+    }
+    return value
 }
 
 private func parsedBool(_ value: String?, defaultValue: Bool) -> Bool {
@@ -149,6 +160,7 @@ private func runCycle(index: Int, options: RDPConnectionOptions, waitAfterConnec
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
+app.activate(ignoringOtherApps: true)
 
 let environment = ProcessInfo.processInfo.environment
 do {
