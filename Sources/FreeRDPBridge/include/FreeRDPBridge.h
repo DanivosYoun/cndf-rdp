@@ -151,7 +151,18 @@ RDPBridgeStatus rdp_bridge_send_pointer_button(
     RDPBridgePointerButton button,
     bool pressed);
 RDPBridgeStatus rdp_bridge_send_scroll(RDPBridgeSession *session, int32_t delta_x, int32_t delta_y);
+RDPBridgeStatus rdp_bridge_send_scroll_at(
+    RDPBridgeSession *session,
+    uint32_t x,
+    uint32_t y,
+    int32_t delta_x,
+    int32_t delta_y);
 RDPBridgeStatus rdp_bridge_send_key(RDPBridgeSession *session, uint16_t key_code, bool pressed);
+RDPBridgeStatus rdp_bridge_send_key_ex(
+    RDPBridgeSession *session,
+    uint16_t key_code,
+    bool pressed,
+    bool extended);
 
 #ifdef __cplusplus
 }

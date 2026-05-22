@@ -38,10 +38,14 @@ The bridge currently provides:
 - `rdp_bridge_send_local_file_list`
 - `rdp_bridge_request_remote_file_contents`
 - `rdp_bridge_update_desktop_size`
+- `rdp_bridge_send_scroll_at`
+- `rdp_bridge_send_key_ex`
 - optional local folder redirection through FreeRDP `rdpdr`
 - optional audio playback through FreeRDP `rdpsnd`
 - pointer, scroll, and keyboard input dispatch
 - GDI framebuffer delivery to Swift as BGRA frames
+- rendered-frame tap callback as BGRA `CVPixelBuffer` for host-side session sharing/encoding
+- public input injection methods for shared-session mouse, keyboard, and scroll forwarding
 - AppKit layer-backed frame presentation without `MTKView`/`CAMetalLayer` close-time release hazards
 - `cliprdr` text clipboard format negotiation
 - Mac-to-RDP file and folder paste using `FileGroupDescriptorW` plus `FileContentsRequest` range reads
@@ -81,6 +85,7 @@ Smooth interactive behavior depends on keeping resize, rendering, input, and cli
 - Retina displays send point size multiplied by `NSWindow.backingScaleFactor` unless `preferDeviceNativeResolution` is disabled
 - `forcedDesktopSize` locks the remote framebuffer size and scales it proportionally inside the local view
 - the frame layer disables implicit `contents`, `contentsScale`, bounds, and position animations to avoid fade-like frame transitions
+- `onRenderedFrame` is a nil-by-default tap; when attached, each displayed frame is copied into a BGRA `CVPixelBuffer` after the layer update
 - clipboard/file transfers are staged outside the UI path
 - the bridge API has an explicit `rdp_bridge_update_desktop_size` hook for FreeRDP display control integration
 
@@ -134,6 +139,34 @@ a connect with the retained options. `RDPSession.statistics` and `RDPConnectionV
 expose `RDPConnectionStatistics` counters for frames, frame bytes, clipboard text events, file
 counts, file bytes, session start, and last activity.
 
+For RDP session sharing, `RDPClientView` and `RDPConnectionView` expose a rendered-frame tap:
+
+```swift
+rdpView.onRenderedFrame = { pixelBuffer, hostTime in
+    encoderQueue.async {
+        encode(pixelBuffer, presentationTime: hostTime)
+    }
+}
+```
+
+The tap fires on the main thread after the backing layer has been updated. The pixel buffer is
+BGRA (`kCVPixelFormatType_32BGRA`) and created only when the tap is non-`nil`; hosts may retain the
+buffer. Keep the closure cheap and dispatch encoding work off-main. Set `onRenderedFrame = nil`
+before disconnect/shutdown; `RDPClientView.shutdownRendering()` also clears it defensively.
+
+Shared-session viewers can inject input through the same FreeRDP path used by local AppKit events:
+
+```swift
+rdpView.injectMouse(x: 960, y: 540, button: .left, flags: [.move, .down])
+rdpView.injectMouse(x: 960, y: 540, button: .left, flags: [.up])
+rdpView.injectKey(virtualKeyCode: 0x41, scanCode: 0x1E, flags: [.down, .up])
+rdpView.injectScroll(x: 960, y: 540, deltaY: 120, deltaX: 0)
+```
+
+Injected coordinates are remote framebuffer coordinates, not local view coordinates. The caller is
+responsible for viewer-to-host scaling and permission checks. Injection methods are fire-and-forget,
+safe to call from any queue, and no-op when the view is shut down or the RDP session is disconnected.
+
 Call `RDPConnectionView.shutdown()` before closing a host `NSWindow` or removing the view from the
 window hierarchy. `shutdown()` is idempotent, stops frame presentation, clears layer contents,
 disables the current window close animation, sets `isReleasedWhenClosed = false`, orders the window
@@ -153,6 +186,7 @@ Threading contract:
 - `RDPConnectionView.connect(_:)`, `disconnect()`, and view mutation should be called from the main thread.
 - `RDPConnectionView.shutdown()` should be called before host window close. It marshals to the main thread if needed, and can block while FreeRDP worker teardown completes.
 - `RDPSession.connect(_:)`, `disconnect()`, `reconnect()`, input dispatch, resize, clipboard polling, and file offering are internally serialized around the FreeRDP bridge.
+- `RDPConnectionView.injectMouse`, `injectKey`, and `injectScroll` may be called from any queue; they enqueue work on a serial input queue and return immediately.
 - `RDPSession.disconnect()` waits up to five seconds for the FreeRDP event-loop thread to exit before returning an error; `RDPSession` destruction waits until native teardown is complete before freeing bridge state.
 - `RDPSessionDelegate` callbacks are delivered from the FreeRDP worker thread unless explicitly noted by the view wrapper.
 - `RDPConnectionViewDelegate` frame display is marshalled to the main thread by `RDPConnectionView`; other callbacks should dispatch to the main thread before mutating UI.
@@ -174,7 +208,8 @@ Follow-up request status:
 
 ## Test Summary
 
-Verified against a Windows RDP test host on 2026-05-21:
+Live behavior was verified against a Windows RDP test host on 2026-05-21. Package tests were
+rerun on 2026-05-22:
 
 - FreeRDP addins loaded and connected: `rdpdr`, `rdpsnd`, `cliprdr`, `drdynvc`, `rdpgfx`, `disp`
 - audio playback path connected through `AUDIO_PLAYBACK_DVC`
@@ -184,6 +219,8 @@ Verified against a Windows RDP test host on 2026-05-21:
   (`960x640 scale=1.00`), forced desktop size (`1920x1080 scale=1.00`), and 16/24 bpp
   connection negotiation without new crash reports
 - frame-layer implicit animation suppression is covered by unit tests and live smoke-tested with RDP connect/shutdown
+- frame tap delivery is covered by unit tests for BGRA `CVPixelBuffer` format, dimensions, host timestamp, main-thread delivery, shutdown cleanup, and `RDPConnectionView` forwarding
+- input injection no-op behavior without a connected session is covered by unit tests
 - Mac-to-RDP file paste requested descriptor, file size, and file range successfully
 - Mac-to-RDP folder paste was live-tested through Explorer; Windows requested descriptors plus file size/range reads for both root and nested files
 - folder paste is staged recursively as relative file paths such as `Folder\Sub\file.txt`
@@ -199,7 +236,7 @@ Verified against a Windows RDP test host on 2026-05-21:
   `didWait=true`, `pendingMain=0`, and `inFlight=0`, and no new macOS crash report was created
 - folder staging, mixed file/folder paste lists, and Korean filename NFC normalization are covered by unit tests
 - secure password, reconnect guard, runtime info, and statistics APIs are covered by tests
-- `swift test` passes all 27 package tests, with the live RDP close test skipped unless
+- `swift test` passes all 31 package tests, with the live RDP close test skipped unless
   `RDP_WINDOW_CLOSE_INTEGRATION=1` is set
 
 Manual checklist for future changes:

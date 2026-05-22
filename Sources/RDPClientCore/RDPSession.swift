@@ -399,20 +399,36 @@ public final class RDPSession {
     }
 
     public func sendScroll(deltaX: Int32, deltaY: Int32) throws {
+        try sendScroll(at: RDPPointerLocation(pixelX: 0, pixelY: 0), deltaX: deltaX, deltaY: deltaY)
+    }
+
+    public func sendScroll(at location: RDPPointerLocation, deltaX: Int32, deltaY: Int32) throws {
         try withSessionLock {
             guard let bridgeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
             }
-            try throwIfNeeded(rdp_bridge_send_scroll(bridgeSession, deltaX, deltaY))
+            try throwIfNeeded(
+                rdp_bridge_send_scroll_at(
+                    bridgeSession,
+                    location.pixelX,
+                    location.pixelY,
+                    deltaX,
+                    deltaY
+                )
+            )
         }
     }
 
     public func sendKey(keyCode: UInt16, pressed: Bool) throws {
+        try sendKey(keyCode: keyCode, pressed: pressed, extended: false)
+    }
+
+    public func sendKey(keyCode: UInt16, pressed: Bool, extended: Bool) throws {
         try withSessionLock {
             guard let bridgeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
             }
-            try throwIfNeeded(rdp_bridge_send_key(bridgeSession, keyCode, pressed))
+            try throwIfNeeded(rdp_bridge_send_key_ex(bridgeSession, keyCode, pressed, extended))
         }
     }
 

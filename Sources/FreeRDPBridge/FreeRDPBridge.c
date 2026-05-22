@@ -1347,7 +1347,12 @@ RDPBridgeStatus rdp_bridge_send_pointer_button(
     return RDPBridgeStatusOK;
 }
 
-RDPBridgeStatus rdp_bridge_send_scroll(RDPBridgeSession *session, int32_t delta_x, int32_t delta_y) {
+RDPBridgeStatus rdp_bridge_send_scroll_at(
+    RDPBridgeSession *session,
+    uint32_t x,
+    uint32_t y,
+    int32_t delta_x,
+    int32_t delta_y) {
     if (session == NULL) {
         return RDPBridgeStatusInvalidArgument;
     }
@@ -1363,23 +1368,33 @@ RDPBridgeStatus rdp_bridge_send_scroll(RDPBridgeSession *session, int32_t delta_
         if (delta_y < 0) {
             flags |= PTR_FLAGS_WHEEL_NEGATIVE;
         }
-        freerdp_input_send_mouse_event(session->instance->context->input, flags, 0, 0);
+        freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y);
     }
     if (delta_x != 0) {
         UINT16 flags = PTR_FLAGS_HWHEEL | (abs(delta_x) & WheelRotationMask);
         if (delta_x < 0) {
             flags |= PTR_FLAGS_WHEEL_NEGATIVE;
         }
-        freerdp_input_send_mouse_event(session->instance->context->input, flags, 0, 0);
+        freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y);
     }
 #else
+    (void)x;
+    (void)y;
     (void)delta_x;
     (void)delta_y;
 #endif
     return RDPBridgeStatusOK;
 }
 
-RDPBridgeStatus rdp_bridge_send_key(RDPBridgeSession *session, uint16_t key_code, bool pressed) {
+RDPBridgeStatus rdp_bridge_send_scroll(RDPBridgeSession *session, int32_t delta_x, int32_t delta_y) {
+    return rdp_bridge_send_scroll_at(session, 0, 0, delta_x, delta_y);
+}
+
+RDPBridgeStatus rdp_bridge_send_key_ex(
+    RDPBridgeSession *session,
+    uint16_t key_code,
+    bool pressed,
+    bool extended) {
     if (session == NULL) {
         return RDPBridgeStatusInvalidArgument;
     }
@@ -1390,12 +1405,21 @@ RDPBridgeStatus rdp_bridge_send_key(RDPBridgeSession *session, uint16_t key_code
     if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
         return RDPBridgeStatusNotConnected;
     }
-    if (!freerdp_input_send_keyboard_event_ex(session->instance->context->input, pressed ? TRUE : FALSE, FALSE, key_code)) {
+    if (!freerdp_input_send_keyboard_event_ex(
+            session->instance->context->input,
+            pressed ? TRUE : FALSE,
+            extended ? TRUE : FALSE,
+            key_code)) {
         return RDPBridgeStatusInternalError;
     }
 #else
     (void)key_code;
     (void)pressed;
+    (void)extended;
 #endif
     return RDPBridgeStatusOK;
+}
+
+RDPBridgeStatus rdp_bridge_send_key(RDPBridgeSession *session, uint16_t key_code, bool pressed) {
+    return rdp_bridge_send_key_ex(session, key_code, pressed, false);
 }

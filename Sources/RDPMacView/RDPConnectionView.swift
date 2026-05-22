@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 import RDPClientCore
 
 public protocol RDPConnectionViewDelegate: AnyObject {
@@ -88,6 +89,15 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         session?.statistics
     }
 
+    public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)? {
+        get {
+            clientView.onRenderedFrame
+        }
+        set {
+            clientView.onRenderedFrame = newValue
+        }
+    }
+
     public func connect(_ options: RDPConnectionOptions) throws {
         guard !isShutdown else {
             throw RDPSessionError.configurationInvalid(reason: "RDPConnectionView has been shut down.")
@@ -166,6 +176,21 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     public func pollLocalClipboard() throws {
         guard !isShutdown else { return }
         try session?.pollLocalClipboard()
+    }
+
+    public func injectMouse(x: Int32, y: Int32, button: RDPMouseButton?, flags: RDPMouseFlags) {
+        guard !isShutdown else { return }
+        clientView.injectMouse(x: x, y: y, button: button, flags: flags)
+    }
+
+    public func injectKey(virtualKeyCode: UInt16, scanCode: UInt16, flags: RDPKeyFlags) {
+        guard !isShutdown else { return }
+        clientView.injectKey(virtualKeyCode: virtualKeyCode, scanCode: scanCode, flags: flags)
+    }
+
+    public func injectScroll(x: Int32, y: Int32, deltaY: Int32, deltaX: Int32) {
+        guard !isShutdown else { return }
+        clientView.injectScroll(x: x, y: y, deltaY: deltaY, deltaX: deltaX)
     }
 
     private func configure() {

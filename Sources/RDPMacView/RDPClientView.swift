@@ -1,9 +1,11 @@
 import AppKit
+import CoreVideo
 import QuartzCore
 import RDPClientCore
 
 public final class RDPClientView: NSView {
     public weak var session: RDPSession?
+    public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)?
 
     private var trackingArea: NSTrackingArea?
     private var modifierState: Set<UInt16> = []
@@ -11,6 +13,7 @@ public final class RDPClientView: NSView {
     private var pendingResizeWorkItem: DispatchWorkItem?
     private var isRenderPipelineShutdown = false
     private let frameColorSpace = CGColorSpaceCreateDeviceRGB()
+    private let injectedInputQueue = DispatchQueue(label: "rdp.client-view.injected-input", qos: .userInteractive)
     private static let disabledLayerActions: [String: CAAction] = [
         "backgroundColor": NSNull(),
         "bounds": NSNull(),
@@ -39,6 +42,10 @@ public final class RDPClientView: NSView {
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
         configure()
+    }
+
+    deinit {
+        onRenderedFrame = nil
     }
 
     private func configure() {
@@ -194,6 +201,58 @@ public final class RDPClientView: NSView {
         layer?.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
         layer?.contents = image
         CATransaction.commit()
+        if let onRenderedFrame, let pixelBuffer = makePixelBuffer(from: frame) {
+            onRenderedFrame(pixelBuffer, CACurrentMediaTime())
+        }
+    }
+
+    public func injectMouse(x: Int32, y: Int32, button: RDPMouseButton?, flags: RDPMouseFlags) {
+        guard !isRenderPipelineShutdown, let session else {
+            return
+        }
+        let location = RDPPointerLocation(pixelX: clampedPixelCoordinate(x), pixelY: clampedPixelCoordinate(y))
+        injectedInputQueue.async {
+            guard session.isConnected else { return }
+            if flags.contains(.move) {
+                try? session.sendPointerMove(location)
+            }
+            guard let pointerButton = button?.pointerButton else {
+                return
+            }
+            if flags.contains(.down) {
+                try? session.sendPointerButton(pointerButton, at: location, pressed: true)
+            }
+            if flags.contains(.up) {
+                try? session.sendPointerButton(pointerButton, at: location, pressed: false)
+            }
+        }
+    }
+
+    public func injectKey(virtualKeyCode: UInt16, scanCode: UInt16, flags: RDPKeyFlags) {
+        guard !isRenderPipelineShutdown, let session else {
+            return
+        }
+        injectedInputQueue.async {
+            guard session.isConnected else { return }
+            let extended = flags.contains(.extended)
+            if flags.contains(.down) {
+                try? session.sendKey(keyCode: scanCode, pressed: true, extended: extended)
+            }
+            if flags.contains(.up) {
+                try? session.sendKey(keyCode: scanCode, pressed: false, extended: extended)
+            }
+        }
+    }
+
+    public func injectScroll(x: Int32, y: Int32, deltaY: Int32, deltaX: Int32) {
+        guard !isRenderPipelineShutdown, let session else {
+            return
+        }
+        let location = RDPPointerLocation(pixelX: clampedPixelCoordinate(x), pixelY: clampedPixelCoordinate(y))
+        injectedInputQueue.async {
+            guard session.isConnected else { return }
+            try? session.sendScroll(at: location, deltaX: deltaX, deltaY: deltaY)
+        }
     }
 
     @discardableResult
@@ -213,6 +272,7 @@ public final class RDPClientView: NSView {
         remoteFrameSize = .zero
         isHidden = true
         session = nil
+        onRenderedFrame = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer?.removeAllAnimations()
@@ -245,6 +305,53 @@ public final class RDPClientView: NSView {
             shouldInterpolate: false,
             intent: .defaultIntent
         )
+    }
+
+    private func makePixelBuffer(from frame: RDPFrame) -> CVPixelBuffer? {
+        guard frame.width > 0, frame.height > 0, frame.stride >= frame.width * 4 else {
+            return nil
+        }
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+        ]
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            frame.width,
+            frame.height,
+            kCVPixelFormatType_32BGRA,
+            attributes as CFDictionary,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        }
+        guard let destinationBaseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return nil
+        }
+
+        let destinationStride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bytesPerRowToCopy = min(frame.width * 4, frame.stride, destinationStride)
+        frame.bgra.withUnsafeBytes { sourceBuffer in
+            guard let sourceBaseAddress = sourceBuffer.baseAddress else {
+                return
+            }
+            for row in 0..<frame.height {
+                memcpy(
+                    destinationBaseAddress.advanced(by: row * destinationStride),
+                    sourceBaseAddress.advanced(by: row * frame.stride),
+                    bytesPerRowToCopy
+                )
+            }
+        }
+        return pixelBuffer
     }
 
     private func sendPointerMove(_ event: NSEvent) {
@@ -356,4 +463,21 @@ public final class RDPClientView: NSView {
     private func fileURLs(from sender: NSDraggingInfo) -> [URL] {
         sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
     }
+}
+
+private extension RDPMouseButton {
+    var pointerButton: RDPPointerButton {
+        switch self {
+        case .left:
+            return .left
+        case .right:
+            return .right
+        case .middle:
+            return .middle
+        }
+    }
+}
+
+private func clampedPixelCoordinate(_ value: Int32) -> UInt32 {
+    UInt32(max(0, value))
 }
