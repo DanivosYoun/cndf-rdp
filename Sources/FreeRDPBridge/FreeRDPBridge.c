@@ -51,6 +51,17 @@ struct RDPBridgeSession {
     size_t local_text_length;
     RDPBridgeLocalFile *local_files;
     size_t local_file_count;
+    // TLS 1.2 자동 폴백 재시도: 첫 연결이 TLS connect 단계에서 실패하면(예: Entra
+    // 하드닝 Azure VM의 TLS 1.3/SCHANNEL 비호환) 보관해 둔 옵션으로 인스턴스를 다시
+    // 만들어 TLS 1.2를 강제한 뒤 한 번만 재시도한다. retry_options의 문자열은 소유
+    // 복사본이라 호출자의 옵션이 사라진 뒤에도 안전하게 재구성할 수 있다.
+    RDPBridgeConnectionOptions retry_options;
+    bool retry_options_valid;
+    bool tls12_retry_done;
+    // Serializes session->instance free/rebuild in the retry path (worker thread)
+    // against freerdp_abort_connect_context in bridge_disconnect (caller thread).
+    CRITICAL_SECTION instance_lock;
+    bool instance_lock_initialized;
 #endif
 };
 
@@ -61,6 +72,9 @@ typedef struct RDPBridgeContext {
 } RDPBridgeContext;
 
 static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_timeout);
+static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
+                                             const RDPBridgeConnectionOptions *options,
+                                             BOOL force_tls12);
 #endif
 
 static void bridge_log(RDPBridgeSession *session, const char *message) {
@@ -104,6 +118,11 @@ RDPBridgeSession *rdp_bridge_session_create(const RDPBridgeCallbacks *callbacks)
         session->callbacks = *callbacks;
     }
 
+#if defined(RDP_FREERDP_REAL)
+    InitializeCriticalSection(&session->instance_lock);
+    session->instance_lock_initialized = true;
+#endif
+
     return session;
 }
 
@@ -114,6 +133,10 @@ void rdp_bridge_session_destroy(RDPBridgeSession *session) {
 
 #if defined(RDP_FREERDP_REAL)
     (void)bridge_disconnect(session, INFINITE);
+    if (session->instance_lock_initialized) {
+        DeleteCriticalSection(&session->instance_lock);
+        session->instance_lock_initialized = false;
+    }
 #else
     (void)rdp_bridge_disconnect(session);
 #endif
@@ -635,6 +658,14 @@ static BOOL bridge_pre_connect(freerdp *instance) {
     if ((instance == NULL) || (instance->context == NULL) || (instance->context->settings == NULL)) {
         return FALSE;
     }
+    // If a disconnect was requested before this connect actually started its
+    // transport (e.g. a cancel that raced the TLS-1.2 retry, after FreeRDP reset
+    // the abort event at connect-begin), bail here so the connect doesn't ignore
+    // the lost abort and make bridge_disconnect wait out its timeout.
+    RDPBridgeSession *pre_session = session_from_context(instance->context);
+    if ((pre_session != NULL) && pre_session->stop_requested) {
+        return FALSE;
+    }
     if (!freerdp_settings_set_bool(instance->context->settings, FreeRDP_CertificateCallbackPreferPEM, TRUE)) {
         return FALSE;
     }
@@ -918,9 +949,43 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     HANDLE events[64] = { 0 };
 
     if (!freerdp_connect(session->instance)) {
-        const UINT32 code = freerdp_get_last_error(session->instance->context);
+        UINT32 code = freerdp_get_last_error(session->instance->context);
+        // TLS connect 단계 실패(인증서 거부/사용자 중단 아님)면 TLS 1.2를 강제한
+        // 새 인스턴스로 딱 한 번 재시도한다. Entra 하드닝 Azure VM이 기본 협상
+        // (TLS 1.3/SCHANNEL)으로는 거부하지만 TLS 1.2로는 받는 경우를 흡수.
+        if ((code == FREERDP_ERROR_TLS_CONNECT_FAILED) &&
+            !session->certificate_rejected && !session->stop_requested &&
+            !session->tls12_retry_done && session->retry_options_valid) {
+            session->tls12_retry_done = true;
+            bridge_logf(session, "FreeRDP TLS connect failed [0x%08x]; rebuilding with TLS 1.2 and retrying.", code);
+            // Serialize the instance free/rebuild against a concurrent
+            // bridge_disconnect abort (both touch session->instance).
+            EnterCriticalSection(&session->instance_lock);
+            freerdp_context_free(session->instance);
+            freerdp_free(session->instance);
+            session->instance = NULL;
+            RDPBridgeStatus rebuild = bridge_build_instance(session, &session->retry_options, TRUE);
+            LeaveCriticalSection(&session->instance_lock);
+            // If a disconnect raced in during the rebuild, don't start a new
+            // connect — let the failure path run and the thread unwind.
+            if ((rebuild == RDPBridgeStatusOK) && !session->stop_requested) {
+                if (freerdp_connect(session->instance)) {
+                    goto connected;
+                }
+                code = freerdp_get_last_error(session->instance->context);
+            }
+        }
         const char *description = freerdp_get_last_error_string(code);
         session->last_error_code = code;
+        // A local disconnect that raced the connect (incl. the TLS-1.2 retry
+        // bailed via bridge_pre_connect) is NOT a real failure — report it as a
+        // local request with no failure callback so no spurious error surfaces.
+        if (session->stop_requested) {
+            bridge_log(session, "FreeRDP connect aborted by local disconnect request.");
+            session->connected = false;
+            bridge_disconnect_event(session, RDPBridgeDisconnectLocalRequest, code);
+            return 1;
+        }
         bridge_logf(session, "FreeRDP connect failed: %s [0x%08x].", description, code);
         bridge_failure(session, bridge_failure_kind_for_error(session, code), code, description);
         session->connected = false;
@@ -928,6 +993,7 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
         return 1;
     }
 
+connected:
     session->connected = true;
     bridge_attach_cliprdr(session);
     bridge_log(session, "FreeRDP connected.");
@@ -965,18 +1031,73 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     bridge_disconnect_event(session, disconnect_kind, code);
     return 0;
 }
-#endif
 
-RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
-    if ((session == NULL) || (options == NULL) || (options->host == NULL) || (strlen(options->host) == 0)) {
-        return RDPBridgeStatusInvalidArgument;
+// OpenSSL/FreeRDP TLS protocol version value for TLS 1.2 (== OpenSSL
+// TLS1_2_VERSION). Defined locally to avoid pulling an OpenSSL header in.
+#define RDP_BRIDGE_TLS1_2_VERSION 0x0303
+
+static char *bridge_strdup_or_null(const char *value) {
+    return (value != NULL) ? strdup(value) : NULL;
+}
+
+static void bridge_free_retry_options(RDPBridgeSession *session) {
+    if ((session == NULL) || !session->retry_options_valid) {
+        return;
     }
+    free((void *)session->retry_options.host);
+    free((void *)session->retry_options.username);
+    free((void *)session->retry_options.password);
+    free((void *)session->retry_options.domain);
+    free((void *)session->retry_options.redirectedFolderPath);
+    free((void *)session->retry_options.redirectedFolderName);
+    free((void *)session->retry_options.logLevel);
+    free((void *)session->retry_options.logFilters);
+    memset(&session->retry_options, 0, sizeof(session->retry_options));
+    session->retry_options_valid = false;
+}
 
-#if defined(RDP_FREERDP_REAL)
-    if (session->instance != NULL) {
-        return RDPBridgeStatusInvalidArgument;
+// Deep-copy the connection options (owning every string) so the TLS-1.2 retry
+// can rebuild the FreeRDP instance even after the caller's options have gone.
+// Returns false (and reclaims any partial copy) if any strdup fails, so the
+// retry never runs with NULL host/credentials/redirect fields on OOM.
+static bool bridge_store_retry_options(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
+    bridge_free_retry_options(session);
+    RDPBridgeConnectionOptions copy = *options; // scalars first
+    copy.host = bridge_strdup_or_null(options->host);
+    copy.username = bridge_strdup_or_null(options->username);
+    copy.password = bridge_strdup_or_null(options->password);
+    copy.domain = bridge_strdup_or_null(options->domain);
+    copy.redirectedFolderPath = bridge_strdup_or_null(options->redirectedFolderPath);
+    copy.redirectedFolderName = bridge_strdup_or_null(options->redirectedFolderName);
+    copy.logLevel = bridge_strdup_or_null(options->logLevel);
+    copy.logFilters = bridge_strdup_or_null(options->logFilters);
+    session->retry_options = copy;
+    session->retry_options_valid = true; // so bridge_free_retry_options can reclaim
+    // A non-NULL source that produced a NULL copy means strdup failed → bail.
+    const bool dup_failed =
+        (options->host && !copy.host) ||
+        (options->username && !copy.username) ||
+        (options->password && !copy.password) ||
+        (options->domain && !copy.domain) ||
+        (options->redirectedFolderPath && !copy.redirectedFolderPath) ||
+        (options->redirectedFolderName && !copy.redirectedFolderName) ||
+        (options->logLevel && !copy.logLevel) ||
+        (options->logFilters && !copy.logFilters);
+    if (dup_failed) {
+        bridge_free_retry_options(session);
+        return false;
     }
+    return true;
+}
 
+// Build (or rebuild) the FreeRDP instance from `options`. When `force_tls12` is
+// TRUE the TLS protocol window is pinned to 1.2 — used for the connect-time
+// fallback when a server (e.g. an Entra-hardened Azure VM) rejects the default
+// TLS 1.3/negotiated handshake. On any failure the partial instance is freed
+// and session->instance is left NULL.
+static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
+                                             const RDPBridgeConnectionOptions *options,
+                                             BOOL force_tls12) {
     session->instance = freerdp_new();
     if (session->instance == NULL) {
         return RDPBridgeStatusInternalError;
@@ -1000,6 +1121,45 @@ RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeCon
         session->instance = NULL;
         return RDPBridgeStatusInvalidArgument;
     }
+    if (force_tls12) {
+        rdpSettings *settings = session->instance->context->settings;
+        const BOOL min_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMinVersion, RDP_BRIDGE_TLS1_2_VERSION);
+        const BOOL max_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMaxVersion, RDP_BRIDGE_TLS1_2_VERSION);
+        if (min_ok && max_ok) {
+            bridge_log(session, "RDP TLS fallback: enforcing TLS 1.2 for retry.");
+        } else {
+            bridge_log(session, "RDP TLS fallback: failed to pin TLS 1.2 settings; retrying with defaults.");
+        }
+    }
+    return RDPBridgeStatusOK;
+}
+#endif
+
+RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
+    if ((session == NULL) || (options == NULL) || (options->host == NULL) || (strlen(options->host) == 0)) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+
+#if defined(RDP_FREERDP_REAL)
+    // Reject while a session is still active. Check the worker thread too: a
+    // failed TLS-1.2 retry rebuild leaves instance == NULL while the thread is
+    // still unwinding, until bridge_disconnect reaps it.
+    if ((session->instance != NULL) || (session->thread != NULL)) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+
+    // Stash a deep copy of the options so the event loop can rebuild the
+    // instance and retry with TLS 1.2 if the first connect fails at TLS connect.
+    session->tls12_retry_done = false;
+    if (!bridge_store_retry_options(session, options)) {
+        return RDPBridgeStatusInternalError;
+    }
+
+    RDPBridgeStatus build = bridge_build_instance(session, options, FALSE);
+    if (build != RDPBridgeStatusOK) {
+        bridge_free_retry_options(session);
+        return build;
+    }
 
     session->stop_requested = false;
     session->thread = CreateThread(NULL, 0, rdp_event_loop, session, 0, NULL);
@@ -1007,6 +1167,7 @@ RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeCon
         freerdp_context_free(session->instance);
         freerdp_free(session->instance);
         session->instance = NULL;
+        bridge_free_retry_options(session);
         return RDPBridgeStatusInternalError;
     }
     return RDPBridgeStatusOK;
@@ -1038,9 +1199,13 @@ static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_t
     }
 
     session->stop_requested = true;
+    // Lock around the instance deref so it can't race the retry path's
+    // free/rebuild of session->instance in the worker thread.
+    EnterCriticalSection(&session->instance_lock);
     if ((session->instance != NULL) && (session->instance->context != NULL)) {
         freerdp_abort_connect_context(session->instance->context);
     }
+    LeaveCriticalSection(&session->instance_lock);
     if (session->thread != NULL) {
         DWORD wait_status = WaitForSingleObject(session->thread, wait_timeout);
         if (wait_status == WAIT_TIMEOUT) {
@@ -1063,6 +1228,7 @@ static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_t
     session->local_text = NULL;
     session->local_text_length = 0;
     bridge_clear_local_files(session);
+    bridge_free_retry_options(session);
     session->disp = NULL;
     session->cliprdr = NULL;
     session->connected = false;
