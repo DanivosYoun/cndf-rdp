@@ -323,12 +323,14 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         port: UInt16
     ) async -> Bool {
         guard !isShutdown else { return false }
+        // Fail CLOSED: with no delegate to make a trust decision, reject rather
+        // than silently accepting the certificate.
         return await delegate?.rdpConnectionView(
             self,
             shouldTrustCertificateFingerprint: fingerprint,
             hostname: hostname,
             port: port
-        ) ?? true
+        ) ?? false
     }
 
     public func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {

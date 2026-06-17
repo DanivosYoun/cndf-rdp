@@ -95,7 +95,7 @@ public final class RDPSession {
             session.emitLog(String(cString: message))
         }
         callbacks.certificateTrust = { fingerprint, hostname, port, context in
-            guard let context else { return true }
+            guard let context else { return false }  // fail closed: no session → reject
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
             return session.evaluateCertificateTrust(
                 fingerprint: fingerprint.map(String.init(cString:)) ?? "",
@@ -458,10 +458,13 @@ public final class RDPSession {
     }
 
     private func evaluateCertificateTrust(fingerprint: String, hostname: String, port: UInt16) -> Bool {
-        guard let delegate else { return true }
+        // Fail CLOSED on every non-affirmative path: no delegate, or the trust
+        // decision not returning within the timeout, must REJECT (not accept) so
+        // an unverified / changed certificate is never silently trusted.
+        guard let delegate else { return false }
         let semaphore = DispatchSemaphore(value: 0)
         let resultQueue = DispatchQueue(label: "rdp.cert-trust.result")
-        var trusted = true
+        var trusted = false
         Task {
             let result = await delegate.rdpSession(
                 self,

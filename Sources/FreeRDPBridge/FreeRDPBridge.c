@@ -739,8 +739,16 @@ static DWORD bridge_verify_changed_certificate_ex(
     (void)flags;
 
     RDPBridgeSession *session = session_from_context(instance->context);
-    if ((session == NULL) || (session->callbacks.certificateTrust == NULL)) {
-        return 1;
+    // Fail CLOSED for a CHANGED certificate: a known_hosts mismatch is a strong
+    // MITM/host-alias signal, so without an explicit trust decision (no session
+    // or no trust callback) reject rather than accept-and-store. (The new-cert
+    // path may TOFU-accept on first contact; a *changed* cert must not.)
+    if (session == NULL) {
+        return 0;
+    }
+    if (session->callbacks.certificateTrust == NULL) {
+        session->certificate_rejected = TRUE;
+        return 0;
     }
 
     bridge_logf(session, "RDP cert verify (changed) host=%s:%u newfp=%s oldfp=%s", host ? host : "",
