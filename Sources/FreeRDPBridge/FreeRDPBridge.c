@@ -8,6 +8,7 @@
 
 #if defined(RDP_FREERDP_REAL)
 #include <freerdp/freerdp.h>
+#include <winpr/wlog.h>
 #include <freerdp/client/cmdline.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
@@ -81,6 +82,51 @@ static void bridge_log(RDPBridgeSession *session, const char *message) {
     if ((session != NULL) && (session->callbacks.log != NULL)) {
         session->callbacks.log(message, session->callbacks.context);
     }
+}
+
+// DIAGNOSTIC: route FreeRDP's own WLog output (incl. the OpenSSL TLS handshake
+// error from crypto/tls.c) into the active session's bridge log so the exact
+// TLS failure reason surfaces in the rdp-*.log. `g_diag_log_session` is only set
+// for the duration of the connect attempt(s) (set right before freerdp_connect,
+// cleared once the connect resolves) so the WLog callback — which fires
+// synchronously on the worker thread during the TLS handshake — never touches a
+// freed session.
+static RDPBridgeSession *g_diag_log_session = NULL;
+static BOOL g_wlog_capture_installed = FALSE;
+
+static BOOL bridge_wlog_message(const wLogMessage *msg) {
+    RDPBridgeSession *s = g_diag_log_session;
+    if ((s != NULL) && (msg != NULL) && (msg->TextString != NULL)) {
+        char line[512] = { 0 };
+        snprintf(line, sizeof(line), "[FreeRDP] %s", msg->TextString);
+        bridge_log(s, line);
+    }
+    return TRUE;
+}
+
+static void bridge_install_wlog_capture(void) {
+    if (g_wlog_capture_installed) {
+        return;
+    }
+    g_wlog_capture_installed = TRUE;
+    wLog *root = WLog_GetRoot();
+    if (root == NULL) {
+        return;
+    }
+    // WARN captures WARN/ERROR/FATAL — the TLS handshake error is logged at
+    // ERROR, so this surfaces the OpenSSL reason without a TRACE-level flood.
+    WLog_SetLogLevel(root, WLOG_WARN);
+    if (!WLog_SetLogAppenderType(root, WLOG_APPENDER_CALLBACK)) {
+        return;
+    }
+    wLogAppender *appender = WLog_GetLogAppender(root);
+    if (appender == NULL) {
+        return;
+    }
+    static wLogCallbacks callbacks = { 0 };
+    callbacks.message = bridge_wlog_message;
+    WLog_ConfigureAppender(appender, "callbacks", (void *)&callbacks);
+    WLog_OpenAppender(root);
 }
 
 static void bridge_logf(RDPBridgeSession *session, const char *format, ...) {
@@ -948,6 +994,12 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     RDPBridgeSession *session = (RDPBridgeSession *)arg;
     HANDLE events[64] = { 0 };
 
+    // DIAGNOSTIC: capture FreeRDP's WLog into this session's log for the
+    // duration of the connect attempt(s). Cleared once the connect resolves
+    // (connected label / before the failure path) so no WLog callback touches a
+    // freed session.
+    bridge_install_wlog_capture();
+    g_diag_log_session = session;
     if (!freerdp_connect(session->instance)) {
         UINT32 code = freerdp_get_last_error(session->instance->context);
         // TLS connect 단계 실패(인증서 거부/사용자 중단 아님)면 레거시-호환 설정
@@ -977,6 +1029,7 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
                 code = freerdp_get_last_error(session->instance->context);
             }
         }
+        g_diag_log_session = NULL;  // connect resolved (failed): stop WLog capture
         const char *description = freerdp_get_last_error_string(code);
         session->last_error_code = code;
         // A local disconnect that raced the connect (incl. the TLS-1.2 retry
@@ -996,6 +1049,7 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     }
 
 connected:
+    g_diag_log_session = NULL;  // connect resolved (success): stop WLog capture
     session->connected = true;
     bridge_attach_cliprdr(session);
     bridge_log(session, "FreeRDP connected.");
@@ -1140,18 +1194,23 @@ static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
         const BOOL min_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMinVersion, RDP_BRIDGE_TLS1_0_VERSION);
         const BOOL max_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMaxVersion, RDP_BRIDGE_TLS1_2_VERSION);
         const BOOL sec_ok = freerdp_settings_set_uint32(settings, FreeRDP_TlsSecLevel, 0);
+        // Also widen the (TLS<=1.2) cipher list to the SECLEVEL-0 default so a
+        // legacy server whose only mutually-acceptable suite OpenSSL 3 drops at
+        // the default cipher string can still be selected. SSL_CTX_set_cipher_list
+        // governs TLS 1.2 and below — exactly the window this fallback uses.
+        const BOOL cipher_ok = freerdp_settings_set_string(settings, FreeRDP_AllowedTlsCiphers, "DEFAULT@SECLEVEL=0");
         // All-or-nothing: a partial apply (e.g. max set but seclevel not) would
         // connect under a TLS policy that is neither strict-default nor the
         // intended legacy profile. Treat any setter failure as a build failure
         // and abort the retry rather than connect with an indeterminate policy.
-        if (!(min_ok && max_ok && sec_ok)) {
+        if (!(min_ok && max_ok && sec_ok && cipher_ok)) {
             bridge_log(session, "RDP TLS fallback: failed to apply legacy-compatible TLS settings; aborting retry.");
             freerdp_context_free(session->instance);
             freerdp_free(session->instance);
             session->instance = NULL;
             return RDPBridgeStatusInternalError;
         }
-        bridge_log(session, "RDP TLS fallback: retrying with TLS 1.0-1.2 and OpenSSL security level 0 (legacy-compatible).");
+        bridge_log(session, "RDP TLS fallback: retrying with TLS 1.0-1.2, OpenSSL security level 0, cipher list DEFAULT@SECLEVEL=0 (legacy-compatible).");
     }
     return RDPBridgeStatusOK;
 }
