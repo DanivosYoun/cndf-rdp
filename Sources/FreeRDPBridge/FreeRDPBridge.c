@@ -8,7 +8,6 @@
 
 #if defined(RDP_FREERDP_REAL)
 #include <freerdp/freerdp.h>
-#include <winpr/wlog.h>
 #include <freerdp/client/cmdline.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
@@ -82,51 +81,6 @@ static void bridge_log(RDPBridgeSession *session, const char *message) {
     if ((session != NULL) && (session->callbacks.log != NULL)) {
         session->callbacks.log(message, session->callbacks.context);
     }
-}
-
-// DIAGNOSTIC: route FreeRDP's own WLog output (incl. the OpenSSL TLS handshake
-// error from crypto/tls.c) into the active session's bridge log so the exact
-// TLS failure reason surfaces in the rdp-*.log. `g_diag_log_session` is only set
-// for the duration of the connect attempt(s) (set right before freerdp_connect,
-// cleared once the connect resolves) so the WLog callback — which fires
-// synchronously on the worker thread during the TLS handshake — never touches a
-// freed session.
-static RDPBridgeSession *g_diag_log_session = NULL;
-static BOOL g_wlog_capture_installed = FALSE;
-
-static BOOL bridge_wlog_message(const wLogMessage *msg) {
-    RDPBridgeSession *s = g_diag_log_session;
-    if ((s != NULL) && (msg != NULL) && (msg->TextString != NULL)) {
-        char line[512] = { 0 };
-        snprintf(line, sizeof(line), "[FreeRDP] %s", msg->TextString);
-        bridge_log(s, line);
-    }
-    return TRUE;
-}
-
-static void bridge_install_wlog_capture(void) {
-    if (g_wlog_capture_installed) {
-        return;
-    }
-    g_wlog_capture_installed = TRUE;
-    wLog *root = WLog_GetRoot();
-    if (root == NULL) {
-        return;
-    }
-    // WARN captures WARN/ERROR/FATAL — the TLS handshake error is logged at
-    // ERROR, so this surfaces the OpenSSL reason without a TRACE-level flood.
-    WLog_SetLogLevel(root, WLOG_WARN);
-    if (!WLog_SetLogAppenderType(root, WLOG_APPENDER_CALLBACK)) {
-        return;
-    }
-    wLogAppender *appender = WLog_GetLogAppender(root);
-    if (appender == NULL) {
-        return;
-    }
-    static wLogCallbacks callbacks = { 0 };
-    callbacks.message = bridge_wlog_message;
-    WLog_ConfigureAppender(appender, "callbacks", (void *)&callbacks);
-    WLog_OpenAppender(root);
 }
 
 static void bridge_logf(RDPBridgeSession *session, const char *format, ...) {
@@ -1044,12 +998,6 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     RDPBridgeSession *session = (RDPBridgeSession *)arg;
     HANDLE events[64] = { 0 };
 
-    // DIAGNOSTIC: capture FreeRDP's WLog into this session's log for the
-    // duration of the connect attempt(s). Cleared once the connect resolves
-    // (connected label / before the failure path) so no WLog callback touches a
-    // freed session.
-    bridge_install_wlog_capture();
-    g_diag_log_session = session;
     if (!freerdp_connect(session->instance)) {
         UINT32 code = freerdp_get_last_error(session->instance->context);
         // TLS connect 단계 실패(인증서 거부/사용자 중단 아님)면 레거시-호환 설정
@@ -1079,7 +1027,6 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
                 code = freerdp_get_last_error(session->instance->context);
             }
         }
-        g_diag_log_session = NULL;  // connect resolved (failed): stop WLog capture
         const char *description = freerdp_get_last_error_string(code);
         session->last_error_code = code;
         // A local disconnect that raced the connect (incl. the TLS-1.2 retry
@@ -1099,7 +1046,6 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
     }
 
 connected:
-    g_diag_log_session = NULL;  // connect resolved (success): stop WLog capture
     session->connected = true;
     bridge_attach_cliprdr(session);
     bridge_log(session, "FreeRDP connected.");
