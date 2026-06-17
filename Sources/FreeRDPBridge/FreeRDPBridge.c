@@ -1140,11 +1140,18 @@ static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
         const BOOL min_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMinVersion, RDP_BRIDGE_TLS1_0_VERSION);
         const BOOL max_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMaxVersion, RDP_BRIDGE_TLS1_2_VERSION);
         const BOOL sec_ok = freerdp_settings_set_uint32(settings, FreeRDP_TlsSecLevel, 0);
-        if (min_ok && max_ok && sec_ok) {
-            bridge_log(session, "RDP TLS fallback: retrying with TLS 1.0-1.2 and OpenSSL security level 0 (legacy-compatible).");
-        } else {
-            bridge_log(session, "RDP TLS fallback: failed to apply legacy-compatible TLS settings; retrying with defaults.");
+        // All-or-nothing: a partial apply (e.g. max set but seclevel not) would
+        // connect under a TLS policy that is neither strict-default nor the
+        // intended legacy profile. Treat any setter failure as a build failure
+        // and abort the retry rather than connect with an indeterminate policy.
+        if (!(min_ok && max_ok && sec_ok)) {
+            bridge_log(session, "RDP TLS fallback: failed to apply legacy-compatible TLS settings; aborting retry.");
+            freerdp_context_free(session->instance);
+            freerdp_free(session->instance);
+            session->instance = NULL;
+            return RDPBridgeStatusInternalError;
         }
+        bridge_log(session, "RDP TLS fallback: retrying with TLS 1.0-1.2 and OpenSSL security level 0 (legacy-compatible).");
     }
     return RDPBridgeStatusOK;
 }
