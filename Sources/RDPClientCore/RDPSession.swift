@@ -56,7 +56,7 @@ public extension RDPSessionDelegate {
         shouldTrustCertificateFingerprint fingerprint: String,
         hostname: String,
         port: UInt16
-    ) async -> Bool { true }
+    ) async -> Bool { false }  // fail closed: a conformer that omits this must NOT auto-trust certs
 
     func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {}
     func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {}

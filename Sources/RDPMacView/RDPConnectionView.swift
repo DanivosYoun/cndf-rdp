@@ -25,7 +25,7 @@ public extension RDPConnectionViewDelegate {
         shouldTrustCertificateFingerprint fingerprint: String,
         hostname: String,
         port: UInt16
-    ) async -> Bool { true }
+    ) async -> Bool { false }  // fail closed: a conformer that omits this must NOT auto-trust certs
     func rdpConnectionView(_ view: RDPConnectionView, didFailWith error: RDPSessionError) {}
     func rdpConnectionView(_ view: RDPConnectionView, didDisconnectWith reason: RDPDisconnectReason) {}
     func rdpConnectionView(_ view: RDPConnectionView, didReceiveRemoteText text: String) {}
