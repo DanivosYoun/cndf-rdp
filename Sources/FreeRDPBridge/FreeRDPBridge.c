@@ -742,8 +742,57 @@ static DWORD bridge_verify_certificate_ex(
         return 1;
     }
 
+    bridge_logf(session, "RDP cert verify (new) host=%s:%u fp=%s", host ? host : "", port,
+                fingerprint ? fingerprint : "");
     const BOOL trusted = session->callbacks.certificateTrust(
         fingerprint != NULL ? fingerprint : "",
+        host != NULL ? host : "",
+        port,
+        session->callbacks.context);
+    if (!trusted) {
+        session->certificate_rejected = TRUE;
+        return 0;
+    }
+    return 1;
+}
+
+// Called when the server's certificate DIFFERS from the one stored in
+// FreeRDP's known_hosts (~/.config/freerdp/server/<host>_<port>.pem) — i.e. the
+// cert was re-issued / changed (common for AD-joined hosts reached via a VPN
+// alias). Without registering this, FreeRDP falls back to its default CLI
+// handler which reads stdin and, in a windowed app with no TTY, rejects ->
+// ERRCONNECT_TLS_CONNECT_FAILED. Route it to the SAME app trust callback as the
+// new-cert path so the app's "certificate changed — trust?" prompt (TOFU /
+// fingerprint update) decides, instead of a silent reject.
+static DWORD bridge_verify_changed_certificate_ex(
+    freerdp *instance,
+    const char *host,
+    UINT16 port,
+    const char *common_name,
+    const char *subject,
+    const char *issuer,
+    const char *new_fingerprint,
+    const char *old_subject,
+    const char *old_issuer,
+    const char *old_fingerprint,
+    DWORD flags) {
+    (void)common_name;
+    (void)subject;
+    (void)issuer;
+    (void)old_subject;
+    (void)old_issuer;
+    (void)old_fingerprint;
+    (void)flags;
+
+    RDPBridgeSession *session = session_from_context(instance->context);
+    if ((session == NULL) || (session->callbacks.certificateTrust == NULL)) {
+        return 1;
+    }
+
+    bridge_logf(session, "RDP cert verify (changed) host=%s:%u newfp=%s oldfp=%s", host ? host : "",
+                port, new_fingerprint ? new_fingerprint : "", old_fingerprint ? old_fingerprint : "");
+    const BOOL trusted = session->callbacks.certificateTrust(
+        new_fingerprint != NULL ? new_fingerprint : "",
         host != NULL ? host : "",
         port,
         session->callbacks.context);
@@ -858,6 +907,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
     instance->VerifyCertificateEx = bridge_verify_certificate_ex;
+    instance->VerifyChangedCertificateEx = bridge_verify_changed_certificate_ex;
     bridge_apply_log_options(options);
 
     if (!set_string(settings, FreeRDP_ServerHostname, options->host)) {
