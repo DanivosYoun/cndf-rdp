@@ -74,7 +74,7 @@ typedef struct RDPBridgeContext {
 static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_timeout);
 static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
                                              const RDPBridgeConnectionOptions *options,
-                                             BOOL force_tls12);
+                                             BOOL compat_retry);
 #endif
 
 static void bridge_log(RDPBridgeSession *session, const char *message) {
@@ -950,14 +950,16 @@ static DWORD WINAPI rdp_event_loop(LPVOID arg) {
 
     if (!freerdp_connect(session->instance)) {
         UINT32 code = freerdp_get_last_error(session->instance->context);
-        // TLS connect 단계 실패(인증서 거부/사용자 중단 아님)면 TLS 1.2를 강제한
-        // 새 인스턴스로 딱 한 번 재시도한다. Entra 하드닝 Azure VM이 기본 협상
-        // (TLS 1.3/SCHANNEL)으로는 거부하지만 TLS 1.2로는 받는 경우를 흡수.
+        // TLS connect 단계 실패(인증서 거부/사용자 중단 아님)면 레거시-호환 설정
+        // (TLS 1.0~1.2 + OpenSSL SECLEVEL 0)으로 인스턴스를 다시 만들어 딱 한 번
+        // 재시도한다. Entra 하드닝 Azure VM(TLS 1.3/SCHANNEL 거부, 1.2는 수용)과
+        // 레거시 Windows 호스트(SHA1 자체서명 cert / OpenSSL 3가 막는 옛 cipher)를
+        // 둘 다 흡수. strict 기본 첫 시도가 실패한 뒤에만 적용된다.
         if ((code == FREERDP_ERROR_TLS_CONNECT_FAILED) &&
             !session->certificate_rejected && !session->stop_requested &&
             !session->tls12_retry_done && session->retry_options_valid) {
             session->tls12_retry_done = true;
-            bridge_logf(session, "FreeRDP TLS connect failed [0x%08x]; rebuilding with TLS 1.2 and retrying.", code);
+            bridge_logf(session, "FreeRDP TLS connect failed [0x%08x]; rebuilding with legacy-compatible TLS (1.0-1.2, SECLEVEL 0) and retrying.", code);
             // Serialize the instance free/rebuild against a concurrent
             // bridge_disconnect abort (both touch session->instance).
             EnterCriticalSection(&session->instance_lock);
@@ -1032,8 +1034,9 @@ connected:
     return 0;
 }
 
-// OpenSSL/FreeRDP TLS protocol version value for TLS 1.2 (== OpenSSL
+// OpenSSL/FreeRDP TLS protocol version values (== OpenSSL TLS1_VERSION /
 // TLS1_2_VERSION). Defined locally to avoid pulling an OpenSSL header in.
+#define RDP_BRIDGE_TLS1_0_VERSION 0x0301
 #define RDP_BRIDGE_TLS1_2_VERSION 0x0303
 
 static char *bridge_strdup_or_null(const char *value) {
@@ -1090,14 +1093,22 @@ static bool bridge_store_retry_options(RDPBridgeSession *session, const RDPBridg
     return true;
 }
 
-// Build (or rebuild) the FreeRDP instance from `options`. When `force_tls12` is
-// TRUE the TLS protocol window is pinned to 1.2 — used for the connect-time
-// fallback when a server (e.g. an Entra-hardened Azure VM) rejects the default
-// TLS 1.3/negotiated handshake. On any failure the partial instance is freed
-// and session->instance is left NULL.
+// Build (or rebuild) the FreeRDP instance from `options`. When `compat_retry`
+// is TRUE the instance is built for the connect-time COMPATIBILITY fallback used
+// after the first (strict-default) connect fails at the TLS stage:
+//   - TLS protocol window widened to 1.0 .. 1.2. Capping the max at 1.2 absorbs
+//     servers that reject the default TLS 1.3/SCHANNEL negotiation (e.g. an
+//     Entra-hardened Azure VM); lowering the min to 1.0 re-admits legacy
+//     Windows hosts.
+//   - OpenSSL security level dropped to 0 (FreeRDP default is 1), so a legacy
+//     self-signed RDP cert (SHA-1 / RSA-1024) or a cipher OpenSSL 3 disables at
+//     SECLEVEL>=1 is accepted. This is the same tradeoff mstsc makes for old
+//     servers, and it ONLY applies on the fallback AFTER the strict default
+//     attempt has already failed — the first attempt stays fully strict.
+// On any failure the partial instance is freed and session->instance is NULL.
 static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
                                              const RDPBridgeConnectionOptions *options,
-                                             BOOL force_tls12) {
+                                             BOOL compat_retry) {
     session->instance = freerdp_new();
     if (session->instance == NULL) {
         return RDPBridgeStatusInternalError;
@@ -1121,14 +1132,18 @@ static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
         session->instance = NULL;
         return RDPBridgeStatusInvalidArgument;
     }
-    if (force_tls12) {
+    if (compat_retry) {
         rdpSettings *settings = session->instance->context->settings;
-        const BOOL min_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMinVersion, RDP_BRIDGE_TLS1_2_VERSION);
+        // Widen the protocol window to 1.0..1.2 (cap below 1.3 for Azure; admit
+        // 1.0 for legacy hosts) and drop the OpenSSL security level to 0 so a
+        // legacy cert/cipher the strict default rejected is accepted.
+        const BOOL min_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMinVersion, RDP_BRIDGE_TLS1_0_VERSION);
         const BOOL max_ok = freerdp_settings_set_uint16(settings, FreeRDP_TLSMaxVersion, RDP_BRIDGE_TLS1_2_VERSION);
-        if (min_ok && max_ok) {
-            bridge_log(session, "RDP TLS fallback: enforcing TLS 1.2 for retry.");
+        const BOOL sec_ok = freerdp_settings_set_uint32(settings, FreeRDP_TlsSecLevel, 0);
+        if (min_ok && max_ok && sec_ok) {
+            bridge_log(session, "RDP TLS fallback: retrying with TLS 1.0-1.2 and OpenSSL security level 0 (legacy-compatible).");
         } else {
-            bridge_log(session, "RDP TLS fallback: failed to pin TLS 1.2 settings; retrying with defaults.");
+            bridge_log(session, "RDP TLS fallback: failed to apply legacy-compatible TLS settings; retrying with defaults.");
         }
     }
     return RDPBridgeStatusOK;
