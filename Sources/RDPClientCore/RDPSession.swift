@@ -432,6 +432,18 @@ public final class RDPSession {
         }
     }
 
+    /// Send a character as a Unicode keyboard event (NumLock-independent). Used for the
+    /// numeric keypad digits/decimal so they type on any server regardless of host
+    /// NumLock state. `code` is the UTF-16 code unit.
+    public func sendUnicode(code: UInt16, pressed: Bool) throws {
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(rdp_bridge_send_unicode(bridgeSession, code, pressed))
+        }
+    }
+
     private func throwIfNeeded(_ status: RDPBridgeStatus) throws {
         guard status == RDPBridgeStatusOK else {
             throw RDPSessionError.bridgeRejectedOperation(Int32(status.rawValue))

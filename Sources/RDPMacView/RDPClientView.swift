@@ -144,8 +144,34 @@ public final class RDPClientView: NSView {
         )
     }
 
+    // Mac numeric-keypad digit (0-9) and decimal keycodes. Their RDP keypad scancodes
+    // (0x47-0x53) are NumLock-dependent, so on hosts that ignore the connect-time
+    // lock-sync (e.g. xrdp) they register as navigation keys instead of digits. We send
+    // these as NumLock-independent Unicode keyboard events instead — but only when bare
+    // (no ⌘/⌃/⌥), so shortcut combos and paste keep the scancode path.
+    private static let numpadUnicodeKeyCodes: Set<UInt16> = [82, 83, 84, 85, 86, 87, 88, 89, 91, 92, 65]
+    // Tracks keycodes whose keyDown was sent as Unicode, so the matching keyUp is sent
+    // the same way (symmetric down/up; never a Unicode-down paired with a scancode-up).
+    private var unicodeNumpadDown: [UInt16: UInt16] = [:]
+
+    private func unicodeForBareNumpad(_ event: NSEvent) -> UInt16? {
+        guard Self.numpadUnicodeKeyCodes.contains(event.keyCode) else { return nil }
+        let mods = event.modifierFlags
+        if mods.contains(.command) || mods.contains(.control) || mods.contains(.option) {
+            return nil
+        }
+        guard let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first,
+              scalar.value != 0, scalar.value <= 0xFFFF else { return nil }
+        return UInt16(scalar.value)
+    }
+
     public override func keyDown(with event: NSEvent) {
         if sendCommandShortcutIfNeeded(event) {
+            return
+        }
+        if let code = unicodeForBareNumpad(event) {
+            unicodeNumpadDown[event.keyCode] = code
+            try? session?.sendUnicode(code: code, pressed: true)
             return
         }
         sendKey(event.keyCode, pressed: true)
@@ -154,6 +180,10 @@ public final class RDPClientView: NSView {
     public override func keyUp(with event: NSEvent) {
         if event.modifierFlags.contains(.command),
            RDPKeyboardMapper.commandShortcutScancode(for: event.keyCode) != nil {
+            return
+        }
+        if let code = unicodeNumpadDown.removeValue(forKey: event.keyCode) {
+            try? session?.sendUnicode(code: code, pressed: false)
             return
         }
         sendKey(event.keyCode, pressed: false)

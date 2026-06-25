@@ -1681,3 +1681,35 @@ RDPBridgeStatus rdp_bridge_send_key_ex(
 RDPBridgeStatus rdp_bridge_send_key(RDPBridgeSession *session, uint16_t key_code, bool pressed) {
     return rdp_bridge_send_key_ex(session, key_code, pressed, false);
 }
+
+// Send a character as a Unicode keyboard event (NumLock-independent). Used for the
+// numeric keypad digits/decimal so they type regardless of the host's NumLock state:
+// the RDP keypad SCANCODES (0x47-0x53) are NumLock-dependent and some servers (e.g.
+// xrdp) ignore the lock-sync, leaving the keypad in navigation mode. Unicode input
+// carries the character directly, so '0'-'9' and the locale decimal separator always
+// type. `code` is the UTF-16 code unit. (CNDF numpad fix.)
+RDPBridgeStatus rdp_bridge_send_unicode(RDPBridgeSession *session, uint16_t code, bool pressed) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+#if defined(RDP_FREERDP_REAL)
+    if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+    // Press = absence of KBD_FLAGS_RELEASE; release = KBD_FLAGS_RELEASE.
+    UINT16 flags = pressed ? 0 : KBD_FLAGS_RELEASE;
+    if (!freerdp_input_send_unicode_keyboard_event(
+            session->instance->context->input,
+            flags,
+            code)) {
+        return RDPBridgeStatusInternalError;
+    }
+#else
+    (void)code;
+    (void)pressed;
+#endif
+    return RDPBridgeStatusOK;
+}

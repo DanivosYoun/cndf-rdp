@@ -163,6 +163,7 @@ RDPBridgeStatus rdp_bridge_send_key_ex(
     uint16_t key_code,
     bool pressed,
     bool extended);
+RDPBridgeStatus rdp_bridge_send_unicode(RDPBridgeSession *session, uint16_t code, bool pressed);
 
 #ifdef __cplusplus
 }
