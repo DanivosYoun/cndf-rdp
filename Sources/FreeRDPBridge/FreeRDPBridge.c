@@ -775,6 +775,13 @@ static BOOL bridge_post_connect(freerdp *instance) {
     instance->context->update->BeginPaint = bridge_begin_paint;
     instance->context->update->EndPaint = bridge_end_paint;
     instance->context->update->DesktopResize = bridge_desktop_resize;
+    // Sync the server keyboard toggle state to NumLock-ON so the numeric keypad sends DIGITS, not
+    // navigation. A fresh session starts NumLock OFF and macOS does not expose the local NumLock state,
+    // so the keypad scancodes (0x47-0x53) would otherwise register as Home/End/arrows/Insert/Delete
+    // instead of 0-9. A connect-time synchronize is the robust fix. (CNDF numpad fix.)
+    if (instance->context->input != NULL) {
+        freerdp_input_send_synchronize_event(instance->context->input, KBD_SYNC_NUM_LOCK);
+    }
     return TRUE;
 }
 
