@@ -6,23 +6,26 @@ SRC_DIR="${ROOT_DIR}/Vendor/FreeRDP/src"
 BUILD_DIR="${ROOT_DIR}/Vendor/FreeRDP/build"
 INSTALL_DIR="${ROOT_DIR}/Vendor/FreeRDP/install"
 FREERDP_REPO="https://github.com/FreeRDP/FreeRDP.git"
-FREERDP_COMMIT="3f6d7cb1f8973cc84c66b258a9a61c4e2b2f30a6"
+FREERDP_COMMIT="bf217a504e54cc719880c228e82353382cd7d4fa"
 
 if [[ ! -d "${SRC_DIR}/.git" ]]; then
   mkdir -p "$(dirname "${SRC_DIR}")"
-  git clone --depth 1 --branch 3.26.0 "${FREERDP_REPO}" "${SRC_DIR}"
+  git clone --depth 1 --branch 3.32.1 "${FREERDP_REPO}" "${SRC_DIR}"
 fi
 
-git -C "${SRC_DIR}" fetch --depth 1 origin tag 3.26.0
+git -C "${SRC_DIR}" fetch --depth 1 origin tag 3.32.1
 git -C "${SRC_DIR}" checkout --detach "${FREERDP_COMMIT}"
 git -C "${SRC_DIR}" reset --hard "${FREERDP_COMMIT}"
 
 git -C "${SRC_DIR}" apply <<'PATCH'
 diff --git a/channels/cliprdr/client/cliprdr_main.c b/channels/cliprdr/client/cliprdr_main.c
-index 8639cc711..c64f7bef4 100644
 --- a/channels/cliprdr/client/cliprdr_main.c
 +++ b/channels/cliprdr/client/cliprdr_main.c
-@@ -709,7 +709,8 @@ static UINT cliprdr_client_format_list(CliprdrClientContext* context,
+@@ -706,11 +706,12 @@ static UINT cliprdr_client_format_list(CliprdrClientContext* context,
+ 			const CLIPRDR_FORMAT* format = &filterList.formats[x];
+ 			WLog_Print(cliprdr->log, level, "[%" PRIuz "]: id=0x%08" PRIx32 " [%s|%s]", x,
+ 			           format->formatId, ClipboardGetFormatIdString(format->formatId),
+ 			           format->formatName);
  		}
  	}
  
