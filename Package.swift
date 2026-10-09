@@ -70,6 +70,10 @@ let package = Package(
             dependencies: ["ClipboardBridge"]
         ),
         .testTarget(
+            name: "FreeRDPBridgeTests",
+            dependencies: ["FreeRDPBridge"]
+        ),
+        .testTarget(
             name: "FileTransferStagingTests",
             dependencies: ["FileTransferStaging"]
         ),

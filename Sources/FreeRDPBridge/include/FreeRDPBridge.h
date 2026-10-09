@@ -118,6 +118,29 @@ typedef struct RDPBridgeLocalFile {
     uint64_t size;
 } RDPBridgeLocalFile;
 
+// Connect-time TLS profile ladder. A connect that fails at the TLS stage is
+// retried once per step, in order, so no host connects with a weaker profile
+// than the earliest one it accepts.
+typedef enum RDPBridgeTLSStage {
+    // FreeRDP defaults (3.27+: TLS >= 1.2, SECLEVEL 2).
+    RDPBridgeTLSStageDefault = 0,
+    // FreeRDP 3.26 defaults: TLS >= 1.0, SECLEVEL 1.
+    RDPBridgeTLSStagePrevious = 1,
+    // Legacy-compatible: TLS 1.0-1.2, SECLEVEL 0, DEFAULT@SECLEVEL=0 ciphers.
+    RDPBridgeTLSStageLegacy = 2
+} RDPBridgeTLSStage;
+
+typedef struct RDPBridgeTLSSettings {
+    uint16_t minVersion;
+    uint16_t maxVersion;
+    uint32_t secLevel;
+    char allowedCiphers[64];
+} RDPBridgeTLSSettings;
+
+// Reports the TLS settings a fresh client instance ends up with at `stage`.
+// Exposed so the ladder can be pinned by unit tests.
+bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSettings *out);
+
 RDPBridgeSession *rdp_bridge_session_create(const RDPBridgeCallbacks *callbacks);
 void rdp_bridge_session_destroy(RDPBridgeSession *session);
 
