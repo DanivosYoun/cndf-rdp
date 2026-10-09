@@ -37,7 +37,17 @@ diff --git a/channels/cliprdr/client/cliprdr_main.c b/channels/cliprdr/client/cl
  	if (!s)
 PATCH
 
+# Homebrew openssl@3 is keg-only, so CMake's default search (and pkg-config)
+# does not see it. Point FindOpenSSL at it explicitly and fail loudly instead of
+# letting CMake fall back to some other OpenSSL on the machine.
+OPENSSL_ROOT_DIR="$(brew --prefix openssl@3 2>/dev/null || true)"
+if [[ -z "${OPENSSL_ROOT_DIR}" || ! -f "${OPENSSL_ROOT_DIR}/include/openssl/ssl.h" ]]; then
+  echo "error: Homebrew openssl@3 not found (expected 'brew --prefix openssl@3' with include/openssl/ssl.h)." >&2
+  exit 1
+fi
+
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
+  -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR}" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
@@ -79,5 +89,11 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -DCHANNEL_PRINTER=OFF \
   -DCHANNEL_SERIAL=OFF \
   -DCHANNEL_PARALLEL=OFF
+
+OPENSSL_CRYPTO_LIBRARY="$(sed -n 's/^OPENSSL_CRYPTO_LIBRARY:[A-Z]*=//p' "${BUILD_DIR}/CMakeCache.txt")"
+if [[ "${OPENSSL_CRYPTO_LIBRARY}" != "${OPENSSL_ROOT_DIR}"/* ]]; then
+  echo "error: CMake selected OpenSSL '${OPENSSL_CRYPTO_LIBRARY}', not the one under ${OPENSSL_ROOT_DIR}." >&2
+  exit 1
+fi
 
 cmake --build "${BUILD_DIR}" --target install --parallel "$(sysctl -n hw.ncpu)"
