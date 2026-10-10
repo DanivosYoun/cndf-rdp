@@ -75,6 +75,7 @@ public final class RDPSession {
     private var logFileURL: URL?
     private let logLock = NSLock()
     private let sessionLock = NSRecursiveLock()
+    private var inputConnectionGeneration: UInt64 = 0
     private let statisticsLock = NSLock()
     private var statisticsStorage = MutableRDPConnectionStatistics()
     private var lastConnectionOptions: RDPConnectionOptions?
@@ -206,6 +207,25 @@ public final class RDPSession {
         }
     }
 
+    /// Identifies a native connection attempt, including reconnects on this session.
+    public var connectionGeneration: UInt64 {
+        withSessionLock { inputConnectionGeneration }
+    }
+
+    public func isInputConnectionCurrent(generation: UInt64) -> Bool {
+        withSessionLock { inputConnectionGeneration == generation && isConnected }
+    }
+
+    /// Keeps an input transaction on its original connection across reconnect races.
+    public func withInputConnection(generation: UInt64, _ body: () throws -> Void) throws {
+        try withSessionLock {
+            guard isInputConnectionCurrent(generation: generation) else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try body()
+        }
+    }
+
     public var statistics: RDPConnectionStatistics {
         statisticsLock.lock()
         defer { statisticsLock.unlock() }
@@ -278,6 +298,7 @@ public final class RDPSession {
             }
 
             try throwIfNeeded(status)
+            inputConnectionGeneration &+= 1
             lastConnectionOptions = options
         }
     }
@@ -398,11 +419,13 @@ public final class RDPSession {
         }
     }
 
-    public func sendScroll(deltaX: Int32, deltaY: Int32) throws {
+    @discardableResult
+    public func sendScroll(deltaX: Int32, deltaY: Int32) throws -> Bool {
         try sendScroll(at: RDPPointerLocation(pixelX: 0, pixelY: 0), deltaX: deltaX, deltaY: deltaY)
     }
 
-    public func sendScroll(at location: RDPPointerLocation, deltaX: Int32, deltaY: Int32) throws {
+    @discardableResult
+    public func sendScroll(at location: RDPPointerLocation, deltaX: Int32, deltaY: Int32) throws -> Bool {
         try withSessionLock {
             guard let bridgeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
@@ -416,6 +439,7 @@ public final class RDPSession {
                     deltaY
                 )
             )
+            return true
         }
     }
 

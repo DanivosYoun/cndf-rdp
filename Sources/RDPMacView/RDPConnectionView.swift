@@ -193,6 +193,16 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         clientView.injectScroll(x: x, y: y, deltaY: deltaY, deltaX: deltaX)
     }
 
+    /// A new shared-input handle bound to the current native connection. A shut-down or
+    /// disconnected view returns a handle that can never activate.
+    @MainActor
+    public func makeSharedInputSession() -> RDPSharedInputSession {
+        guard !isShutdown else {
+            return RDPSharedInputSession.unavailable()
+        }
+        return clientView.makeSharedInputSession()
+    }
+
     private func configure() {
         autoresizesSubviews = true
         clientView.frame = bounds

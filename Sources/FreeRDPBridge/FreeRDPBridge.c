@@ -1665,18 +1665,22 @@ RDPBridgeStatus rdp_bridge_send_scroll_at(
         return RDPBridgeStatusNotConnected;
     }
     if (delta_y != 0) {
-        UINT16 flags = PTR_FLAGS_WHEEL | (abs(delta_y) & WheelRotationMask);
+        UINT16 flags = PTR_FLAGS_WHEEL | ((uint32_t)(delta_y < 0 ? -(int64_t)delta_y : (int64_t)delta_y) & WheelRotationMask);
         if (delta_y < 0) {
             flags |= PTR_FLAGS_WHEEL_NEGATIVE;
         }
-        freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y);
+        if (!freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y)) {
+            return RDPBridgeStatusInternalError;
+        }
     }
     if (delta_x != 0) {
-        UINT16 flags = PTR_FLAGS_HWHEEL | (abs(delta_x) & WheelRotationMask);
+        UINT16 flags = PTR_FLAGS_HWHEEL | ((uint32_t)(delta_x < 0 ? -(int64_t)delta_x : (int64_t)delta_x) & WheelRotationMask);
         if (delta_x < 0) {
             flags |= PTR_FLAGS_WHEEL_NEGATIVE;
         }
-        freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y);
+        if (!freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y)) {
+            return RDPBridgeStatusInternalError;
+        }
     }
 #else
     (void)x;
@@ -1709,8 +1713,8 @@ RDPBridgeStatus rdp_bridge_send_key_ex(
     if (!freerdp_input_send_keyboard_event_ex(
             session->instance->context->input,
             pressed ? TRUE : FALSE,
-            extended ? TRUE : FALSE,
-            key_code)) {
+            FALSE,
+            (uint32_t)key_code | (extended ? 0x100u : 0))) {
         return RDPBridgeStatusInternalError;
     }
 #else

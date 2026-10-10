@@ -8,7 +8,6 @@ public final class RDPClientView: NSView {
     public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)?
 
     private var trackingArea: NSTrackingArea?
-    private var modifierState: Set<UInt16> = []
     private var remoteFrameSize: CGSize = .zero
     private var pendingResizeWorkItem: DispatchWorkItem?
     private var isRenderPipelineShutdown = false
@@ -138,7 +137,8 @@ public final class RDPClientView: NSView {
     }
 
     public override func scrollWheel(with event: NSEvent) {
-        try? session?.sendScroll(
+        inputExecutor()?.hostScroll(
+            at: pointerLocation(for: event),
             deltaX: Int32(event.scrollingDeltaX.rounded()),
             deltaY: Int32(event.scrollingDeltaY.rounded())
         )
@@ -171,7 +171,7 @@ public final class RDPClientView: NSView {
         }
         if let code = unicodeForBareNumpad(event) {
             unicodeNumpadDown[event.keyCode] = code
-            try? session?.sendUnicode(code: code, pressed: true)
+            inputExecutor()?.hostUnicode(code: code, pressed: true)
             return
         }
         sendKey(event.keyCode, pressed: true)
@@ -183,16 +183,19 @@ public final class RDPClientView: NSView {
             return
         }
         if let code = unicodeNumpadDown.removeValue(forKey: event.keyCode) {
-            try? session?.sendUnicode(code: code, pressed: false)
+            inputExecutor()?.hostUnicode(code: code, pressed: false)
             return
         }
         sendKey(event.keyCode, pressed: false)
     }
 
     public override func flagsChanged(with event: NSEvent) {
-        updateModifier(RDPKeyboardMapper.leftShift, enabled: event.modifierFlags.contains(.shift))
-        updateModifier(RDPKeyboardMapper.leftControl, enabled: event.modifierFlags.contains(.control))
-        updateModifier(RDPKeyboardMapper.leftAlt, enabled: event.modifierFlags.contains(.option))
+        let mappings: [(NSEvent.ModifierFlags, UInt16)] = [
+            (.shift, RDPKeyboardMapper.leftShift),
+            (.control, RDPKeyboardMapper.leftControl),
+            (.option, RDPKeyboardMapper.leftAlt)
+        ]
+        inputExecutor()?.hostModifiers(mappings.compactMap { event.modifierFlags.contains($0.0) ? $0.1 : nil })
     }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -237,52 +240,29 @@ public final class RDPClientView: NSView {
     }
 
     public func injectMouse(x: Int32, y: Int32, button: RDPMouseButton?, flags: RDPMouseFlags) {
-        guard !isRenderPipelineShutdown, let session else {
-            return
-        }
-        let location = RDPPointerLocation(pixelX: clampedPixelCoordinate(x), pixelY: clampedPixelCoordinate(y))
-        injectedInputQueue.async {
-            guard session.isConnected else { return }
-            if flags.contains(.move) {
-                try? session.sendPointerMove(location)
-            }
-            guard let pointerButton = button?.pointerButton else {
-                return
-            }
-            if flags.contains(.down) {
-                try? session.sendPointerButton(pointerButton, at: location, pressed: true)
-            }
-            if flags.contains(.up) {
-                try? session.sendPointerButton(pointerButton, at: location, pressed: false)
-            }
-        }
+        inputExecutor()?.hostMouse(x: x, y: y, button: button, flags: flags)
     }
 
     public func injectKey(virtualKeyCode: UInt16, scanCode: UInt16, flags: RDPKeyFlags) {
-        guard !isRenderPipelineShutdown, let session else {
-            return
-        }
-        injectedInputQueue.async {
-            guard session.isConnected else { return }
-            let extended = flags.contains(.extended)
-            if flags.contains(.down) {
-                try? session.sendKey(keyCode: scanCode, pressed: true, extended: extended)
-            }
-            if flags.contains(.up) {
-                try? session.sendKey(keyCode: scanCode, pressed: false, extended: extended)
-            }
-        }
+        inputExecutor()?.hostInjectKey(scanCode: scanCode, flags: flags)
     }
 
     public func injectScroll(x: Int32, y: Int32, deltaY: Int32, deltaX: Int32) {
-        guard !isRenderPipelineShutdown, let session else {
-            return
+        inputExecutor()?.hostScroll(
+            at: RDPPointerLocation(clampingX: x, y: y),
+            deltaX: deltaX,
+            deltaY: deltaY
+        )
+    }
+
+    /// A new input handle bound to the current native connection. It starts inactive; a view
+    /// without a usable connection returns a handle that can never activate.
+    @MainActor
+    public func makeSharedInputSession() -> RDPSharedInputSession {
+        guard let executor = inputExecutor() else {
+            return RDPSharedInputSession.unavailable()
         }
-        let location = RDPPointerLocation(pixelX: clampedPixelCoordinate(x), pixelY: clampedPixelCoordinate(y))
-        injectedInputQueue.async {
-            guard session.isConnected else { return }
-            try? session.sendScroll(at: location, deltaX: deltaX, deltaY: deltaY)
-        }
+        return executor.makeSharedSession()
     }
 
     @discardableResult
@@ -298,7 +278,6 @@ public final class RDPClientView: NSView {
             removeTrackingArea(trackingArea)
             self.trackingArea = nil
         }
-        modifierState.removeAll()
         remoteFrameSize = .zero
         isHidden = true
         session = nil
@@ -384,19 +363,31 @@ public final class RDPClientView: NSView {
         return pixelBuffer
     }
 
+    // Bound to the session and its connection generation; a reconnect gets a fresh executor so
+    // nothing recorded on the old connection is released onto the new one.
+    private func inputExecutor() -> RDPInputExecutor? {
+        guard !isRenderPipelineShutdown, let session else {
+            return nil
+        }
+        let queue = injectedInputQueue
+        return RDPInputExecutorRegistry.executor(for: session, schedule: { work in
+            queue.async { work() }
+        })
+    }
+
     private func sendPointerMove(_ event: NSEvent) {
-        try? session?.sendPointerMove(pointerLocation(for: event))
+        inputExecutor()?.hostPointerMove(pointerLocation(for: event))
     }
 
     private func sendPointerButton(_ button: RDPPointerButton, event: NSEvent, pressed: Bool) {
-        try? session?.sendPointerButton(button, at: pointerLocation(for: event), pressed: pressed)
+        inputExecutor()?.hostPointerButton(button, at: pointerLocation(for: event), pressed: pressed)
     }
 
     private func sendKey(_ macKeyCode: UInt16, pressed: Bool) {
         guard let scancode = RDPKeyboardMapper.scancode(for: macKeyCode) else {
             return
         }
-        try? session?.sendKey(keyCode: scancode, pressed: pressed)
+        inputExecutor()?.hostKey(scanCode: scancode, pressed: pressed)
     }
 
     private func sendCommandShortcutIfNeeded(_ event: NSEvent) -> Bool {
@@ -406,33 +397,16 @@ public final class RDPClientView: NSView {
             return false
         }
 
-        try? session?.sendKey(keyCode: RDPKeyboardMapper.leftControl, pressed: true)
-        try? session?.sendKey(keyCode: scancode, pressed: true)
-        try? session?.sendKey(keyCode: scancode, pressed: false)
-        try? session?.sendKey(keyCode: RDPKeyboardMapper.leftControl, pressed: false)
+        inputExecutor()?.hostChord([RDPKeyboardMapper.leftControl, scancode])
         NSLog("[RDP] command shortcut forwarded as Ctrl scancode 0x%02x", scancode)
         return true
     }
 
-    private func updateModifier(_ scancode: UInt16, enabled: Bool) {
-        if enabled {
-            guard modifierState.insert(scancode).inserted else {
-                return
-            }
-            try? session?.sendKey(keyCode: scancode, pressed: true)
-        } else if modifierState.remove(scancode) != nil {
-            try? session?.sendKey(keyCode: scancode, pressed: false)
-        }
-    }
-
     private func pasteOfferedFilesAfterDrop() {
         window?.makeFirstResponder(self)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            guard let self, let session = self.session else { return }
-            try? session.sendKey(keyCode: RDPKeyboardMapper.leftControl, pressed: true)
-            try? session.sendKey(keyCode: 0x2F, pressed: true)
-            try? session.sendKey(keyCode: 0x2F, pressed: false)
-            try? session.sendKey(keyCode: RDPKeyboardMapper.leftControl, pressed: false)
+        guard let executor = inputExecutor() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            executor.hostChord([RDPKeyboardMapper.leftControl, 0x2F])
             NSLog("[RDP] local file drag forwarded as Ctrl+V.")
         }
     }
@@ -493,21 +467,4 @@ public final class RDPClientView: NSView {
     private func fileURLs(from sender: NSDraggingInfo) -> [URL] {
         sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
     }
-}
-
-private extension RDPMouseButton {
-    var pointerButton: RDPPointerButton {
-        switch self {
-        case .left:
-            return .left
-        case .right:
-            return .right
-        case .middle:
-            return .middle
-        }
-    }
-}
-
-private func clampedPixelCoordinate(_ value: Int32) -> UInt32 {
-    UInt32(max(0, value))
 }
