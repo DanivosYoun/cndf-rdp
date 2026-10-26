@@ -13,6 +13,9 @@ public final class RDPClientView: NSView {
 
     private var trackingArea: NSTrackingArea?
     private var remoteFrameSize: CGSize = .zero
+    private var remotePointer: RDPRemotePointer?
+    // The cursor shown over this view; nil keeps the local default until the server sends one.
+    private(set) var remoteCursor: NSCursor?
     private var pendingResizeWorkItem: DispatchWorkItem?
     private var isRenderPipelineShutdown = false
     private let frameColorSpace = CGColorSpaceCreateDeviceRGB()
@@ -74,6 +77,14 @@ public final class RDPClientView: NSView {
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         scheduleDesktopSize()
+        refreshRemoteCursor()
+    }
+
+    public override func resetCursorRects() {
+        super.resetCursorRects()
+        if let remoteCursor {
+            addCursorRect(visibleRect, cursor: remoteCursor)
+        }
     }
 
     public override func viewDidChangeBackingProperties() {
@@ -232,7 +243,9 @@ public final class RDPClientView: NSView {
     public func display(_ frame: RDPFrame) {
         guard !isRenderPipelineShutdown else { return }
         guard let image = makeImage(from: frame) else { return }
-        remoteFrameSize = CGSize(width: frame.width, height: frame.height)
+        let frameSize = CGSize(width: frame.width, height: frame.height)
+        let frameSizeChanged = frameSize != remoteFrameSize
+        remoteFrameSize = frameSize
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer?.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
@@ -241,6 +254,16 @@ public final class RDPClientView: NSView {
         if let onRenderedFrame, let pixelBuffer = makePixelBuffer(from: frame) {
             onRenderedFrame(pixelBuffer, CACurrentMediaTime())
         }
+        if frameSizeChanged {
+            refreshRemoteCursor()
+        }
+    }
+
+    /// Shows the server's pointer shape as the cursor over this view. Ignored after shutdown.
+    public func updateRemotePointer(_ pointer: RDPRemotePointer) {
+        guard !isRenderPipelineShutdown else { return }
+        remotePointer = pointer
+        refreshRemoteCursor()
     }
 
     public func injectMouse(x: Int32, y: Int32, button: RDPMouseButton?, flags: RDPMouseFlags) {
@@ -283,6 +306,9 @@ public final class RDPClientView: NSView {
             self.trackingArea = nil
         }
         remoteFrameSize = .zero
+        remotePointer = nil
+        remoteCursor = nil
+        window?.invalidateCursorRects(for: self)
         isHidden = true
         session = nil
         onRenderedFrame = nil
@@ -319,6 +345,75 @@ public final class RDPClientView: NSView {
             intent: .defaultIntent
         )
     }
+
+    private func refreshRemoteCursor() {
+        guard !isRenderPipelineShutdown, let remotePointer else { return }
+        switch remotePointer {
+        case .image(let image):
+            remoteCursor = makeCursor(from: image) ?? NSCursor.arrow
+        case .hidden:
+            remoteCursor = Self.hiddenCursor
+        case .systemDefault:
+            remoteCursor = NSCursor.arrow
+        }
+        guard let window else { return }
+        window.invalidateCursorRects(for: self)
+        // Cursor rects only apply on the next mouse move; show the new shape now if the
+        // mouse is already over the view.
+        let mouse = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        if window.isKeyWindow, visibleRect.contains(mouse) {
+            remoteCursor?.set()
+        }
+    }
+
+    // Remote view points per remote desktop pixel, as the frame is currently displayed.
+    private var pointsPerRemotePixel: CGFloat {
+        guard remoteFrameSize.width > 0, remoteFrameSize.height > 0 else {
+            return 1 / (window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1)
+        }
+        let displayRect = remoteDisplayRect(targetWidth: remoteFrameSize.width, targetHeight: remoteFrameSize.height)
+        return displayRect.width / remoteFrameSize.width
+    }
+
+    private func makeCursor(from pointer: RDPPointerImage) -> NSCursor? {
+        guard pointer.width > 0, pointer.height > 0, pointer.stride >= pointer.width * 4,
+              let provider = CGDataProvider(data: pointer.bgra as CFData) else {
+            return nil
+        }
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.first.rawValue)
+        )
+        guard let image = CGImage(
+            width: pointer.width,
+            height: pointer.height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: pointer.stride,
+            space: frameColorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+        ) else {
+            return nil
+        }
+        let geometry = RDPCursorGeometry(
+            pixelWidth: pointer.width,
+            pixelHeight: pointer.height,
+            hotSpotX: pointer.hotSpotX,
+            hotSpotY: pointer.hotSpotY,
+            pointsPerRemotePixel: pointsPerRemotePixel
+        )
+        return NSCursor(image: NSImage(cgImage: image, size: geometry.size), hotSpot: geometry.hotSpot)
+    }
+
+    // A transparent 1x1 cursor for a hidden server pointer; NSCursor.hide is a global
+    // counter and is never used.
+    private static let hiddenCursor = NSCursor(
+        image: NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true },
+        hotSpot: .zero
+    )
 
     private func makePixelBuffer(from frame: RDPFrame) -> CVPixelBuffer? {
         guard frame.width > 0, frame.height > 0, frame.stride >= frame.width * 4 else {

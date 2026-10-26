@@ -14,6 +14,8 @@
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/client/disp.h>
 #include <freerdp/client/rdpgfx.h>
+#include <freerdp/codec/color.h>
+#include <freerdp/graphics.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/error.h>
 #include <freerdp/event.h>
@@ -87,6 +89,12 @@ typedef struct RDPBridgeContext {
     rdpContext _p;
     RDPBridgeSession *session;
 } RDPBridgeContext;
+
+// FreeRDP allocates pointers at the prototype's size, so the converted image rides along.
+typedef struct RDPBridgePointer {
+    rdpPointer pointer;
+    BYTE *bgra;
+} RDPBridgePointer;
 
 static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_timeout);
 static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
@@ -926,6 +934,84 @@ static DWORD bridge_verify_changed_certificate_ex(
     return 1;
 }
 
+static BOOL bridge_pointer_to_bgra(const rdpPointer *pointer, const gdiPalette *palette, BYTE *bgra) {
+    return freerdp_image_copy_from_pointer_data(
+        bgra, PIXEL_FORMAT_BGRA32, 0, 0, 0, pointer->width, pointer->height,
+        pointer->xorMaskData, pointer->lengthXorMask, pointer->andMaskData, pointer->lengthAndMask,
+        pointer->xorBpp, palette);
+}
+
+static void bridge_report_pointer(RDPBridgeSession *session, RDPBridgePointerKind kind, const RDPBridgePointer *pointer) {
+    if ((session == NULL) || (session->callbacks.pointer == NULL)) {
+        return;
+    }
+    if ((kind == RDPBridgePointerKindImage) && (pointer != NULL) && (pointer->bgra != NULL)) {
+        session->callbacks.pointer(
+            kind, pointer->bgra, pointer->pointer.width, pointer->pointer.height, pointer->pointer.width * 4,
+            pointer->pointer.xPos, pointer->pointer.yPos, session->callbacks.context);
+        return;
+    }
+    // A pointer without pixels (0x0) shows nothing.
+    if (kind == RDPBridgePointerKindImage) {
+        kind = RDPBridgePointerKindHidden;
+    }
+    session->callbacks.pointer(kind, NULL, 0, 0, 0, 0, 0, session->callbacks.context);
+}
+
+static BOOL bridge_pointer_new(rdpContext *context, rdpPointer *pointer) {
+    RDPBridgePointer *bridge_pointer = (RDPBridgePointer *)pointer;
+    if ((context == NULL) || (bridge_pointer == NULL)) {
+        return FALSE;
+    }
+    bridge_pointer->bgra = NULL;
+    if ((pointer->width == 0) || (pointer->height == 0)) {
+        return TRUE;
+    }
+    BYTE *bgra = (BYTE *)calloc((size_t)pointer->width * pointer->height, 4);
+    if (bgra == NULL) {
+        return FALSE;
+    }
+    const gdiPalette *palette = (context->gdi != NULL) ? &context->gdi->palette : NULL;
+    if (!bridge_pointer_to_bgra(pointer, palette, bgra)) {
+        free(bgra);
+        return FALSE;
+    }
+    bridge_pointer->bgra = bgra;
+    return TRUE;
+}
+
+static void bridge_pointer_free(rdpContext *context, rdpPointer *pointer) {
+    (void)context;
+    RDPBridgePointer *bridge_pointer = (RDPBridgePointer *)pointer;
+    if (bridge_pointer != NULL) {
+        free(bridge_pointer->bgra);
+        bridge_pointer->bgra = NULL;
+    }
+}
+
+static BOOL bridge_pointer_set(rdpContext *context, rdpPointer *pointer) {
+    bridge_report_pointer(session_from_context(context), RDPBridgePointerKindImage, (const RDPBridgePointer *)pointer);
+    return TRUE;
+}
+
+static BOOL bridge_pointer_set_null(rdpContext *context) {
+    bridge_report_pointer(session_from_context(context), RDPBridgePointerKindHidden, NULL);
+    return TRUE;
+}
+
+static BOOL bridge_pointer_set_default(rdpContext *context) {
+    bridge_report_pointer(session_from_context(context), RDPBridgePointerKindDefault, NULL);
+    return TRUE;
+}
+
+static BOOL bridge_pointer_set_position(rdpContext *context, UINT32 x, UINT32 y) {
+    // Server-initiated pointer warps are ignored: the local mouse is never moved.
+    (void)context;
+    (void)x;
+    (void)y;
+    return TRUE;
+}
+
 static BOOL bridge_post_connect(freerdp *instance) {
     if ((instance == NULL) || (instance->context == NULL)) {
         return FALSE;
@@ -936,6 +1022,15 @@ static BOOL bridge_post_connect(freerdp *instance) {
     instance->context->update->BeginPaint = bridge_begin_paint;
     instance->context->update->EndPaint = bridge_end_paint;
     instance->context->update->DesktopResize = bridge_desktop_resize;
+    rdpPointer pointer = { 0 };
+    pointer.size = sizeof(RDPBridgePointer);
+    pointer.New = bridge_pointer_new;
+    pointer.Free = bridge_pointer_free;
+    pointer.Set = bridge_pointer_set;
+    pointer.SetNull = bridge_pointer_set_null;
+    pointer.SetDefault = bridge_pointer_set_default;
+    pointer.SetPosition = bridge_pointer_set_position;
+    graphics_register_pointer(instance->context->graphics, &pointer);
     // Sync the server keyboard toggle state to NumLock-ON so the numeric keypad sends DIGITS, not
     // navigation. A fresh session starts NumLock OFF and macOS does not expose the local NumLock state,
     // so the keypad scancodes (0x47-0x53) would otherwise register as Home/End/arrows/Insert/Delete
@@ -1456,6 +1551,37 @@ bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSett
     return ok;
 #else
     (void)stage;
+    return false;
+#endif
+}
+
+bool rdp_bridge_pointer_to_bgra(
+    uint32_t width,
+    uint32_t height,
+    uint32_t xorBpp,
+    const uint8_t *xorMask,
+    uint32_t xorMaskLength,
+    const uint8_t *andMask,
+    uint32_t andMaskLength,
+    uint8_t *bgra) {
+    if ((bgra == NULL) || (width == 0) || (height == 0) || (xorBpp == 8)) {
+        return false;
+    }
+#if defined(RDP_FREERDP_REAL)
+    rdpPointer pointer = { 0 };
+    pointer.width = width;
+    pointer.height = height;
+    pointer.xorBpp = xorBpp;
+    pointer.xorMaskData = (BYTE *)xorMask;
+    pointer.lengthXorMask = xorMaskLength;
+    pointer.andMaskData = (BYTE *)andMask;
+    pointer.lengthAndMask = andMaskLength;
+    return bridge_pointer_to_bgra(&pointer, NULL, bgra);
+#else
+    (void)xorMask;
+    (void)xorMaskLength;
+    (void)andMask;
+    (void)andMaskLength;
     return false;
 #endif
 }

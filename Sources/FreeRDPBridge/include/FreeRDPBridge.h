@@ -90,6 +90,24 @@ typedef struct RDPBridgeNetworkCharacteristics {
     uint32_t bandwidthKbps;
 } RDPBridgeNetworkCharacteristics;
 
+typedef enum RDPBridgePointerKind {
+    RDPBridgePointerKindImage = 0,
+    RDPBridgePointerKindHidden = 1,
+    RDPBridgePointerKindDefault = 2
+} RDPBridgePointerKind;
+
+// Server pointer shape. For Image, `bgra` is top-down BGRA with straight (not
+// premultiplied) alpha and is only valid during the call; otherwise it is NULL.
+typedef void (*RDPBridgePointerCallback)(
+    RDPBridgePointerKind kind,
+    const uint8_t *bgra,
+    uint32_t width,
+    uint32_t height,
+    uint32_t stride,
+    uint32_t hotX,
+    uint32_t hotY,
+    void *context);
+
 typedef void (*RDPBridgeNetworkCharacteristicsCallback)(
     const RDPBridgeNetworkCharacteristics *result,
     void *context);
@@ -104,6 +122,7 @@ typedef struct RDPBridgeCallbacks {
     RDPBridgeRemoteFileContentsCallback remoteFileContents;
     RDPBridgeFrameCallback frame;
     RDPBridgeNetworkCharacteristicsCallback networkCharacteristics;
+    RDPBridgePointerCallback pointer;
     void *context;
 } RDPBridgeCallbacks;
 
@@ -157,6 +176,19 @@ typedef struct RDPBridgeTLSSettings {
 // Reports the TLS settings a fresh client instance ends up with at `stage`.
 // Exposed so the ladder can be pinned by unit tests.
 bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSettings *out);
+
+// Converts RDP pointer XOR/AND masks to what the pointer callback delivers (top-down,
+// straight-alpha BGRA, stride width * 4). `bgra` must hold width * height * 4 bytes.
+// 8bpp masks need the session palette and are rejected here. Exposed for unit tests.
+bool rdp_bridge_pointer_to_bgra(
+    uint32_t width,
+    uint32_t height,
+    uint32_t xorBpp,
+    const uint8_t *xorMask,
+    uint32_t xorMaskLength,
+    const uint8_t *andMask,
+    uint32_t andMaskLength,
+    uint8_t *bgra);
 
 // "<version> (<revision>)" of the FreeRDP library actually loaded at runtime.
 const char *rdp_bridge_freerdp_version(void);

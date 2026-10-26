@@ -52,6 +52,7 @@ public protocol RDPSessionDelegate: AnyObject {
     func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String)
     func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile])
     func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame)
+    func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer)
 }
 
 public extension RDPSessionDelegate {
@@ -64,6 +65,7 @@ public extension RDPSessionDelegate {
 
     func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {}
     func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {}
+    func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {}
 }
 
 public final class RDPSession {
@@ -182,6 +184,28 @@ public final class RDPSession {
                 stats.lastActivityAt = Date()
             }
             session.delegate?.rdpSession(session, didReceiveFrame: frame)
+        }
+        callbacks.pointer = { kind, bytes, width, height, stride, hotX, hotY, context in
+            guard let context else { return }
+            let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            let pointer: RDPRemotePointer
+            switch kind {
+            case RDPBridgePointerKindImage:
+                guard let bytes, width > 0, height > 0, stride >= width * 4 else { return }
+                pointer = .image(RDPPointerImage(
+                    bgra: Data(bytes: bytes, count: Int(stride) * Int(height)),
+                    width: Int(width),
+                    height: Int(height),
+                    stride: Int(stride),
+                    hotSpotX: Int(hotX),
+                    hotSpotY: Int(hotY)
+                ))
+            case RDPBridgePointerKindHidden:
+                pointer = .hidden
+            default:
+                pointer = .systemDefault
+            }
+            session.delegate?.rdpSession(session, didUpdatePointer: pointer)
         }
         callbacks.networkCharacteristics = { result, context in
             guard let result, let context else { return }

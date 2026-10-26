@@ -451,6 +451,14 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         delegate?.rdpConnectionView(self, didReceiveRemoteFiles: files)
     }
 
+    public func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {
+        guard !isShutdown else { return }
+        enqueueMainCallback { [weak self] in
+            guard let self, !self.isShutdown else { return }
+            self.clientView.updateRemotePointer(pointer)
+        }
+    }
+
     public func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
         guard !isShutdown else { return }
         enqueueMainCallback { [weak self] in
