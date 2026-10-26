@@ -81,6 +81,19 @@ typedef void (*RDPBridgeFrameCallback)(
     uint32_t stride,
     void *context);
 
+// A Network Characteristics Result the server sent after network auto-detection.
+typedef struct RDPBridgeNetworkCharacteristics {
+    bool hasBaseRTT;
+    bool hasBandwidth;
+    uint32_t baseRTTMs;
+    uint32_t averageRTTMs;
+    uint32_t bandwidthKbps;
+} RDPBridgeNetworkCharacteristics;
+
+typedef void (*RDPBridgeNetworkCharacteristicsCallback)(
+    const RDPBridgeNetworkCharacteristics *result,
+    void *context);
+
 typedef struct RDPBridgeCallbacks {
     RDPBridgeLogCallback log;
     RDPBridgeCertificateTrustCallback certificateTrust;
@@ -90,6 +103,7 @@ typedef struct RDPBridgeCallbacks {
     RDPBridgeRemoteFileListCallback remoteFileList;
     RDPBridgeRemoteFileContentsCallback remoteFileContents;
     RDPBridgeFrameCallback frame;
+    RDPBridgeNetworkCharacteristicsCallback networkCharacteristics;
     void *context;
 } RDPBridgeCallbacks;
 
@@ -110,6 +124,9 @@ typedef struct RDPBridgeConnectionOptions {
     uint32_t desktopWidth;
     uint32_t desktopHeight;
     double desktopScale;
+    // Advertise RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT so the server can measure RTT and
+    // bandwidth. Leaves ConnectionType, perf flags, Heartbeat and Multitransport alone.
+    bool networkAutoDetect;
 } RDPBridgeConnectionOptions;
 
 typedef struct RDPBridgeLocalFile {

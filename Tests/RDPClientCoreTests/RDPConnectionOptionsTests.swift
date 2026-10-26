@@ -19,6 +19,7 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertTrue(options.preferDeviceNativeResolution)
         XCTAssertEqual(options.colorDepth, .depth32)
         XCTAssertNil(options.forcedDesktopSize)
+        XCTAssertFalse(options.networkAutoDetect)
     }
 
     func testStoresConnectionOptions() {
@@ -35,7 +36,8 @@ final class RDPConnectionOptionsTests: XCTestCase {
             logFilters: ["com.freerdp.channels.cliprdr": .trace],
             preferDeviceNativeResolution: false,
             colorDepth: .depth24,
-            forcedDesktopSize: CGSize(width: 1920, height: 1080)
+            forcedDesktopSize: CGSize(width: 1920, height: 1080),
+            networkAutoDetect: true
         )
 
         XCTAssertEqual(options.securePassword, securePassword)
@@ -48,6 +50,7 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertFalse(options.preferDeviceNativeResolution)
         XCTAssertEqual(options.colorDepth, .depth24)
         XCTAssertEqual(options.forcedDesktopSize, CGSize(width: 1920, height: 1080))
+        XCTAssertTrue(options.networkAutoDetect)
     }
 
     func testSecureStringCanBeZeroized() {
@@ -76,6 +79,9 @@ final class RDPConnectionOptionsTests: XCTestCase {
 
         XCTAssertEqual(session.statistics.framesReceived, 0)
         XCTAssertEqual(session.statistics.localFilesOffered, 0)
+        XCTAssertNil(session.statistics.networkBandwidthKbps)
+        XCTAssertNil(session.statistics.networkBaseRTTMs)
+        XCTAssertNil(session.statistics.networkAverageRTTMs)
         XCTAssertThrowsError(try session.reconnect()) { error in
             XCTAssertEqual(
                 error as? RDPSessionError,

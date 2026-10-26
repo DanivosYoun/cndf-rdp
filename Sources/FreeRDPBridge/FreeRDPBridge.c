@@ -8,6 +8,7 @@
 
 #if defined(RDP_FREERDP_REAL)
 #include <freerdp/freerdp.h>
+#include <freerdp/autodetect.h>
 #include <freerdp/client/cmdline.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
@@ -74,6 +75,10 @@ struct RDPBridgeSession {
     bool gfx_caps_confirmed;
     bool first_frame_seen;
     uint64_t codec_counts[RDP_BRIDGE_CODEC_SLOTS];
+    // Network auto-detect results received on this connection; the first is logged
+    // as it arrives, the count and the last one at disconnect.
+    uint32_t netchar_result_count;
+    RDPBridgeNetworkCharacteristics last_netchar;
 #endif
 };
 
@@ -643,6 +648,8 @@ static void bridge_reset_graphics_diagnostics(RDPBridgeSession *session) {
     session->gfx_caps_confirmed = false;
     session->first_frame_seen = false;
     memset(session->codec_counts, 0, sizeof(session->codec_counts));
+    session->netchar_result_count = 0;
+    memset(&session->last_netchar, 0, sizeof(session->last_netchar));
 }
 
 static void bridge_log_graphics_summary(RDPBridgeSession *session) {
@@ -766,6 +773,42 @@ static BOOL bridge_load_channels(freerdp *instance) {
     return TRUE;
 }
 
+static BOOL bridge_network_characteristics_result(
+    rdpAutoDetect *autodetect,
+    RDP_TRANSPORT_TYPE transport,
+    UINT16 sequence_number,
+    const rdpNetworkCharacteristicsResult *result) {
+    (void)transport;
+    (void)sequence_number;
+    RDPBridgeSession *session = (autodetect != NULL) ? session_from_context(autodetect->context) : NULL;
+    if ((session == NULL) || (result == NULL)) {
+        return TRUE;
+    }
+
+    RDPBridgeNetworkCharacteristics netchar = { 0 };
+    netchar.hasBaseRTT = (result->type == RDP_NETCHAR_RESULT_TYPE_BASE_RTT_AVG_RTT) ||
+                         (result->type == RDP_NETCHAR_RESULT_TYPE_BASE_RTT_BW_AVG_RTT);
+    netchar.hasBandwidth = (result->type == RDP_NETCHAR_RESULT_TYPE_BW_AVG_RTT) ||
+                           (result->type == RDP_NETCHAR_RESULT_TYPE_BASE_RTT_BW_AVG_RTT);
+    netchar.baseRTTMs = result->baseRTT;
+    netchar.averageRTTMs = result->averageRTT;
+    netchar.bandwidthKbps = result->bandwidth;
+    session->last_netchar = netchar;
+    if (session->netchar_result_count++ == 0) {
+        bridge_logf(
+            session,
+            "Network auto-detect result: type=0x%04x baseRTT=%ums averageRTT=%ums bandwidth=%ukbps.",
+            (unsigned)result->type,
+            result->baseRTT,
+            result->averageRTT,
+            result->bandwidth);
+    }
+    if (session->callbacks.networkCharacteristics != NULL) {
+        session->callbacks.networkCharacteristics(&netchar, session->callbacks.context);
+    }
+    return TRUE;
+}
+
 static BOOL bridge_pre_connect(freerdp *instance) {
     if ((instance == NULL) || (instance->context == NULL) || (instance->context->settings == NULL)) {
         return FALSE;
@@ -786,6 +829,12 @@ static BOOL bridge_pre_connect(freerdp *instance) {
     }
     PubSub_SubscribeChannelConnected(instance->context->pubSub, bridge_channel_connected);
     PubSub_SubscribeChannelDisconnected(instance->context->pubSub, bridge_channel_disconnected);
+    // The client side leaves this callback unset; it only fires when the server runs
+    // auto-detection, which needs FreeRDP_NetworkAutoDetect.
+    rdpAutoDetect *autodetect = autodetect_get(instance->context);
+    if (autodetect != NULL) {
+        autodetect->NetworkCharacteristicsResult = bridge_network_characteristics_result;
+    }
     return TRUE;
 }
 
@@ -1063,7 +1112,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE);
+           freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, options->networkAutoDetect);
 }
 
 static RDPBridgeFailureKind bridge_failure_kind_for_error(RDPBridgeSession *session, UINT32 code) {
@@ -1187,6 +1236,10 @@ connected:
         freerdp_get_version_string(),
         freerdp_get_build_revision(),
         bridge_build_flag("WITH_GFX_H264"));
+    bridge_logf(
+        session,
+        "Network auto-detect: %s.",
+        freerdp_settings_get_bool(session->instance->context->settings, FreeRDP_NetworkAutoDetect) ? "requested" : "off");
 
     while (!session->stop_requested && !freerdp_shall_disconnect_context(session->instance->context)) {
         DWORD count = freerdp_get_event_handles(session->instance->context, events, 64);
@@ -1218,6 +1271,15 @@ connected:
     freerdp_disconnect(session->instance);
     session->connected = false;
     bridge_log_graphics_summary(session);
+    if (session->netchar_result_count > 0) {
+        bridge_logf(
+            session,
+            "Network auto-detect summary: results=%u last baseRTT=%ums averageRTT=%ums bandwidth=%ukbps.",
+            session->netchar_result_count,
+            session->last_netchar.baseRTTMs,
+            session->last_netchar.averageRTTMs,
+            session->last_netchar.bandwidthKbps);
+    }
     bridge_log(session, "FreeRDP disconnected.");
     bridge_disconnect_event(session, disconnect_kind, code);
     return 0;

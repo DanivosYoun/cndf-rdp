@@ -33,6 +33,10 @@ public struct RDPConnectionStatistics: Equatable, Sendable {
     public let localFileBytesOffered: UInt64
     public let startedAt: Date?
     public let lastActivityAt: Date?
+    /// Last network auto-detect result from the server; nil until one arrives.
+    public let networkBandwidthKbps: UInt32?
+    public let networkBaseRTTMs: UInt32?
+    public let networkAverageRTTMs: UInt32?
 }
 
 public protocol RDPSessionDelegate: AnyObject {
@@ -179,6 +183,20 @@ public final class RDPSession {
             }
             session.delegate?.rdpSession(session, didReceiveFrame: frame)
         }
+        callbacks.networkCharacteristics = { result, context in
+            guard let result, let context else { return }
+            let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            let netchar = result.pointee
+            session.updateStatistics { stats in
+                stats.networkAverageRTTMs = netchar.averageRTTMs
+                if netchar.hasBandwidth {
+                    stats.networkBandwidthKbps = netchar.bandwidthKbps
+                }
+                if netchar.hasBaseRTT {
+                    stats.networkBaseRTTMs = netchar.baseRTTMs
+                }
+            }
+        }
 
         self.bridgeSession = rdp_bridge_session_create(&callbacks)
         guard let bridgeSession else {
@@ -285,7 +303,8 @@ public final class RDPSession {
                                                 colorDepth: options.colorDepth.rawValue,
                                                 desktopWidth: bridgeDesktopSize?.pixelWidth ?? 0,
                                                 desktopHeight: bridgeDesktopSize?.pixelHeight ?? 0,
-                                                desktopScale: bridgeDesktopSize?.scale ?? 1.0
+                                                desktopScale: bridgeDesktopSize?.scale ?? 1.0,
+                                                networkAutoDetect: options.networkAutoDetect
                                             )
                                             return rdp_bridge_connect(bridgeSession, &bridgeOptions)
                                         }
@@ -618,6 +637,9 @@ private struct MutableRDPConnectionStatistics {
     var localFileBytesOffered: UInt64 = 0
     var startedAt: Date?
     var lastActivityAt: Date?
+    var networkBandwidthKbps: UInt32?
+    var networkBaseRTTMs: UInt32?
+    var networkAverageRTTMs: UInt32?
 
     func snapshot() -> RDPConnectionStatistics {
         RDPConnectionStatistics(
@@ -630,7 +652,10 @@ private struct MutableRDPConnectionStatistics {
             localFilesOffered: localFilesOffered,
             localFileBytesOffered: localFileBytesOffered,
             startedAt: startedAt,
-            lastActivityAt: lastActivityAt
+            lastActivityAt: lastActivityAt,
+            networkBandwidthKbps: networkBandwidthKbps,
+            networkBaseRTTMs: networkBaseRTTMs,
+            networkAverageRTTMs: networkAverageRTTMs
         )
     }
 }
