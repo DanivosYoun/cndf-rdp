@@ -1,3 +1,4 @@
+import CoreVideo
 import XCTest
 @testable import RDPMacView
 import RDPClientCore
@@ -45,6 +46,32 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
                 .configurationInvalid(reason: "RDPConnectionView has been shut down.")
             )
         }
+    }
+
+    func testFramesArrivingFasterThanMainAreCoalescedToLatest() throws {
+        let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+        let session = try RDPSession()
+        var shownFirstBytes: [UInt8] = []
+        view.onRenderedFrame = { pixelBuffer, _ in
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                shownFirstBytes.append(base.assumingMemoryBound(to: UInt8.self).pointee)
+            }
+        }
+
+        for marker: UInt8 in [1, 2, 3] {
+            view.rdpSession(session, didReceiveFrame: solidFrame(marker))
+        }
+        drainRunLoop()
+
+        XCTAssertEqual(shownFirstBytes, [3])
+
+        view.rdpSession(session, didReceiveFrame: solidFrame(4))
+        drainRunLoop()
+
+        XCTAssertEqual(shownFirstBytes, [3, 4])
+        view.shutdown()
     }
 
     func testShutdownThenWindowCloseSurvivesAutoreleaseDrain() {
@@ -160,6 +187,10 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
             XCTAssertNil(releasedWindow)
         }
     }
+}
+
+private func solidFrame(_ marker: UInt8) -> RDPFrame {
+    RDPFrame(bgra: Data(repeating: marker, count: 4 * 2 * 4), width: 4, height: 2, stride: 4 * 4)
 }
 
 private func drainRunLoop(cycles: Int = 5) {

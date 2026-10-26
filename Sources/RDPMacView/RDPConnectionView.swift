@@ -63,6 +63,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     private var isShutdown = false
     private let mainCallbackLock = NSLock()
     private var pendingMainCallbacks = 0
+    // Newest frame not yet shown. A frame arriving while one waits replaces it, so main
+    // only ever has one frame delivery queued and stale frames never reach it.
+    private let frameSlotLock = NSLock()
+    private var pendingFrame: RDPFrame?
     private var outputSuppression = RDPOutputSuppressionPolicy()
     private var outputSuppressionRecheck: DispatchWorkItem?
     private var occlusionObserver: NSObjectProtocol?
@@ -461,8 +465,18 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     public func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
         guard !isShutdown else { return }
+        frameSlotLock.lock()
+        let deliveryQueued = pendingFrame != nil
+        pendingFrame = frame
+        frameSlotLock.unlock()
+        guard !deliveryQueued else { return }
         enqueueMainCallback { [weak self] in
-            guard let self, !self.isShutdown else { return }
+            guard let self else { return }
+            self.frameSlotLock.lock()
+            let frame = self.pendingFrame
+            self.pendingFrame = nil
+            self.frameSlotLock.unlock()
+            guard !self.isShutdown, let frame else { return }
             self.clientView.display(frame)
         }
     }
