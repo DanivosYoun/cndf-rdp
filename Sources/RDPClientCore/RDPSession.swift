@@ -412,6 +412,16 @@ public final class RDPSession {
         }
     }
 
+    /// Asks the server to stop (true) or resume (false) sending display updates.
+    public func setOutputSuppressed(_ suppressed: Bool) throws {
+        try withSessionLock {
+            guard let bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            try throwIfNeeded(rdp_bridge_set_output_suppressed(bridgeSession, suppressed))
+        }
+    }
+
     public func sendPointerMove(_ location: RDPPointerLocation) throws {
         try withSessionLock {
             guard let bridgeSession else {

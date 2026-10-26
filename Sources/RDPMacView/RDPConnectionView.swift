@@ -63,6 +63,9 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     private var isShutdown = false
     private let mainCallbackLock = NSLock()
     private var pendingMainCallbacks = 0
+    private var outputSuppression = RDPOutputSuppressionPolicy()
+    private var outputSuppressionRecheck: DispatchWorkItem?
+    private var occlusionObserver: NSObjectProtocol?
 
     public override init(frame frameRect: NSRect) {
         self.clientView = RDPClientView(frame: frameRect)
@@ -77,6 +80,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     deinit {
+        stopObservingOcclusion()
         detachSessionForAsyncDisconnect()
         clientView.shutdownRendering()
     }
@@ -87,6 +91,13 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     public var statistics: RDPConnectionStatistics? {
         session?.statistics
+    }
+
+    /// Ask the server to stop sending display updates while this view's window is not
+    /// visible (occluded, minimized, on another Space, screen locked). Never while a frame
+    /// tap (`onRenderedFrame`) is attached. Off by default.
+    public var suppressesOutputWhenHidden = false {
+        didSet { evaluateOutputSuppression() }
     }
 
     public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)? {
@@ -108,6 +119,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         session.delegate = self
         self.session = session
         clientView.session = session
+        outputSuppression.connectionDidReset()
 
         try session.connect(options, initialPointSize: clientView.bounds.size, scale: desktopScale)
         clientView.sendForcedDesktopSize()
@@ -121,6 +133,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         try? session?.disconnect()
         session = nil
         clientView.session = nil
+        resetOutputSuppression()
         if !isShutdown {
             delegate?.rdpConnectionView(self, didChangeConnected: false)
         }
@@ -130,6 +143,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         guard !isShutdown else {
             throw RDPSessionError.configurationInvalid(reason: "RDPConnectionView has been shut down.")
         }
+        resetOutputSuppression()
         try session?.reconnect()
         clientView.sendForcedDesktopSize()
     }
@@ -150,6 +164,8 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
             )
         }
         isShutdown = true
+        resetOutputSuppression()
+        stopObservingOcclusion()
         let closeWindow = prepareWindowForClose()
         let callbackDelegate = delegate
         delegate = nil
@@ -203,11 +219,76 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         return clientView.makeSharedInputSession()
     }
 
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        stopObservingOcclusion()
+        if let window, !isShutdown {
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                self?.evaluateOutputSuppression()
+            }
+        }
+        evaluateOutputSuppression()
+    }
+
     private func configure() {
         autoresizesSubviews = true
         clientView.frame = bounds
         clientView.autoresizingMask = [.width, .height]
+        clientView.frameTapDidChange = { [weak self] in
+            self?.evaluateOutputSuppression()
+        }
         addSubview(clientView)
+    }
+
+    private func stopObservingOcclusion() {
+        if let occlusionObserver {
+            NotificationCenter.default.removeObserver(occlusionObserver)
+        }
+        occlusionObserver = nil
+    }
+
+    private func resetOutputSuppression() {
+        outputSuppressionRecheck?.cancel()
+        outputSuppressionRecheck = nil
+        outputSuppression.connectionDidReset()
+    }
+
+    private func evaluateOutputSuppression() {
+        guard !isShutdown else { return }
+        outputSuppressionRecheck?.cancel()
+        outputSuppressionRecheck = nil
+        let inputs = RDPOutputSuppressionPolicy.Inputs(
+            enabled: suppressesOutputWhenHidden,
+            connected: session?.isConnected ?? false,
+            visible: window.map { $0.occlusionState.contains(.visible) } ?? true,
+            frameTapAttached: clientView.onRenderedFrame != nil
+        )
+        switch outputSuppression.evaluate(inputs, now: ProcessInfo.processInfo.systemUptime) {
+        case .none:
+            break
+        case .suppress:
+            applyOutputSuppressed(true)
+        case .release:
+            applyOutputSuppressed(false)
+        case .recheck(let delay):
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.evaluateOutputSuppression()
+            }
+            outputSuppressionRecheck = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+    }
+
+    private func applyOutputSuppressed(_ suppressed: Bool) {
+        do {
+            try session?.setOutputSuppressed(suppressed)
+        } catch {
+            delegate?.rdpConnectionView(self, didLog: "Output suppression update failed: \(error)")
+        }
     }
 
     private var desktopScale: Double {
@@ -321,6 +402,13 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
             guard let self, !self.isShutdown else { return }
             if message == "FreeRDP connected." || message == "Display control channel connected." {
                 self.clientView.sendForcedDesktopSize()
+            }
+            if message == "FreeRDP connected." {
+                // A fresh FreeRDP connection starts with output allowed; re-evaluate from there.
+                self.outputSuppression.connectionDidReset()
+                self.evaluateOutputSuppression()
+            } else if message == "FreeRDP disconnected." {
+                self.evaluateOutputSuppression()
             }
             self.delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
         }

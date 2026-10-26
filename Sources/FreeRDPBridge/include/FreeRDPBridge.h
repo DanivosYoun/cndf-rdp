@@ -186,6 +186,9 @@ RDPBridgeStatus rdp_bridge_request_remote_file_range(
     uint64_t offset,
     uint32_t length);
 RDPBridgeStatus rdp_bridge_update_desktop_size(RDPBridgeSession *session, uint32_t width, uint32_t height, double scale);
+// Sends Suppress Output (suppressed) or Allow Display Updates (!suppressed). A no-op
+// when the server did not advertise support. Call from the caller's thread.
+RDPBridgeStatus rdp_bridge_set_output_suppressed(RDPBridgeSession *session, bool suppressed);
 RDPBridgeStatus rdp_bridge_send_pointer_move(RDPBridgeSession *session, uint32_t x, uint32_t y);
 RDPBridgeStatus rdp_bridge_send_pointer_button(
     RDPBridgeSession *session,

@@ -1791,6 +1791,32 @@ RDPBridgeStatus rdp_bridge_update_desktop_size(RDPBridgeSession *session, uint32
 #endif
 }
 
+RDPBridgeStatus rdp_bridge_set_output_suppressed(RDPBridgeSession *session, bool suppressed) {
+    if (session == NULL) {
+        return RDPBridgeStatusInvalidArgument;
+    }
+    if (!session->connected) {
+        return RDPBridgeStatusNotConnected;
+    }
+#if defined(RDP_FREERDP_REAL)
+    if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->gdi == NULL)) {
+        return RDPBridgeStatusNotConnected;
+    }
+    if (!gdi_send_suppress_output(session->instance->context->gdi, suppressed ? TRUE : FALSE)) {
+        bridge_logf(session, "Output suppression %s failed.", suppressed ? "request" : "release");
+        return RDPBridgeStatusInternalError;
+    }
+    bridge_logf(
+        session,
+        "Output suppression %s (server support=%s).",
+        suppressed ? "requested" : "released",
+        freerdp_settings_get_bool(session->instance->context->settings, FreeRDP_SuppressOutput) ? "yes" : "no");
+#else
+    (void)suppressed;
+#endif
+    return RDPBridgeStatusOK;
+}
+
 RDPBridgeStatus rdp_bridge_send_pointer_move(RDPBridgeSession *session, uint32_t x, uint32_t y) {
     if (session == NULL) {
         return RDPBridgeStatusInvalidArgument;

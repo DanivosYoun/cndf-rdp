@@ -5,7 +5,11 @@ import RDPClientCore
 
 public final class RDPClientView: NSView {
     public weak var session: RDPSession?
-    public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)?
+    public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)? {
+        didSet { frameTapDidChange?() }
+    }
+    // Lets the owning RDPConnectionView release output suppression the moment a tap attaches.
+    var frameTapDidChange: (() -> Void)?
 
     private var trackingArea: NSTrackingArea?
     private var remoteFrameSize: CGSize = .zero
