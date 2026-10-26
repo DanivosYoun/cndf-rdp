@@ -12,6 +12,7 @@
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/client/disp.h>
+#include <freerdp/client/rdpgfx.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/error.h>
 #include <freerdp/event.h>
@@ -21,6 +22,8 @@
 #include <freerdp/settings.h>
 #include <freerdp/settings_keys.h>
 #include <freerdp/utils/cliprdr_utils.h>
+#include <freerdp/utils/gfx.h>
+#include <freerdp/version.h>
 #include <winpr/file.h>
 #include <winpr/shell.h>
 #include <winpr/string.h>
@@ -32,6 +35,8 @@
 
 #define RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW 0xC001
 #define RDP_BRIDGE_FORMAT_FILECONTENTS 0xC002
+// RDPGFX codec ids are < RDPGFX_CODECID_MAX (0x10); the last slot counts anything else.
+#define RDP_BRIDGE_CODEC_SLOTS 17
 
 struct RDPBridgeSession {
     RDPBridgeCallbacks callbacks;
@@ -62,6 +67,13 @@ struct RDPBridgeSession {
     // against freerdp_abort_connect_context in bridge_disconnect (caller thread).
     CRITICAL_SECTION instance_lock;
     bool instance_lock_initialized;
+    // Graphics-path diagnostics, reset per connection: whether RDPGFX caps were
+    // confirmed, how many surface commands each codec carried, and whether the
+    // first frame has been classified (GFX vs legacy bitmap path).
+    pcRdpgfxSurfaceCommand gfx_surface_command;
+    bool gfx_caps_confirmed;
+    bool first_frame_seen;
+    uint64_t codec_counts[RDP_BRIDGE_CODEC_SLOTS];
 #endif
 };
 
@@ -163,6 +175,12 @@ static BOOL bridge_begin_paint(rdpContext *context) {
 
 static BOOL bridge_end_paint(rdpContext *context) {
     RDPBridgeSession *session = session_from_context(context);
+    if ((session != NULL) && !session->first_frame_seen) {
+        session->first_frame_seen = true;
+        if (!session->gfx_caps_confirmed) {
+            bridge_log(session, "Graphics: first frame arrived without RDPGFX caps confirm; legacy bitmap path.");
+        }
+    }
     if ((session == NULL) || (session->callbacks.frame == NULL) || (context == NULL) || (context->gdi == NULL)) {
         return TRUE;
     }
@@ -561,6 +579,95 @@ static UINT bridge_cliprdr_server_file_contents_response(
     return CHANNEL_RC_OK;
 }
 
+static const char *bridge_build_flag(const char *name) {
+    const char *config = freerdp_get_build_config();
+    if ((config == NULL) || (name == NULL)) {
+        return "unknown";
+    }
+    const size_t name_length = strlen(name);
+    for (const char *match = strstr(config, name); match != NULL; match = strstr(match + 1, name)) {
+        const bool starts_token = (match == config) || (match[-1] == ' ');
+        if (starts_token && (match[name_length] == '=')) {
+            return (strncmp(match + name_length + 1, "ON", 2) == 0) ? "ON" : "OFF";
+        }
+    }
+    return "unknown";
+}
+
+static UINT bridge_gfx_caps_confirm(RdpgfxClientContext *gfx, const RDPGFX_CAPS_CONFIRM_PDU *confirm) {
+    rdpGdi *gdi = (gfx != NULL) ? (rdpGdi *)gfx->custom : NULL;
+    RDPBridgeSession *session = (gdi != NULL) ? session_from_context(gdi->context) : NULL;
+    if ((session != NULL) && (confirm != NULL) && (confirm->capsSet != NULL)) {
+        session->gfx_caps_confirmed = true;
+        bridge_logf(
+            session,
+            "Graphics: RDPGFX caps confirmed: version=%s [0x%08x] flags=0x%08x.",
+            rdpgfx_caps_version_str(confirm->capsSet->version),
+            confirm->capsSet->version,
+            confirm->capsSet->flags);
+    }
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_gfx_surface_command(RdpgfxClientContext *gfx, const RDPGFX_SURFACE_COMMAND *cmd) {
+    rdpGdi *gdi = (gfx != NULL) ? (rdpGdi *)gfx->custom : NULL;
+    RDPBridgeSession *session = (gdi != NULL) ? session_from_context(gdi->context) : NULL;
+    if ((session == NULL) || (session->gfx_surface_command == NULL)) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (cmd != NULL) {
+        const size_t slot = (cmd->codecId < RDP_BRIDGE_CODEC_SLOTS - 1) ? cmd->codecId : RDP_BRIDGE_CODEC_SLOTS - 1;
+        if (session->codec_counts[slot]++ == 0) {
+            bridge_logf(
+                session,
+                "Graphics: first RDPGFX surface command with codec %s [0x%04x].",
+                rdpgfx_get_codec_id_string((UINT16)cmd->codecId),
+                cmd->codecId);
+        }
+    }
+    return session->gfx_surface_command(gfx, cmd);
+}
+
+// Wraps the gdi RDPGFX handlers installed by freerdp_client_OnChannelConnectedEventHandler
+// so the caps the server confirmed and the codecs it actually uses are logged.
+static void bridge_attach_gfx_diagnostics(RDPBridgeSession *session, RdpgfxClientContext *gfx) {
+    if ((gfx == NULL) || (gfx->SurfaceCommand == NULL) || (gfx->SurfaceCommand == bridge_gfx_surface_command)) {
+        return;
+    }
+    session->gfx_surface_command = gfx->SurfaceCommand;
+    gfx->SurfaceCommand = bridge_gfx_surface_command;
+    gfx->CapsConfirm = bridge_gfx_caps_confirm;
+}
+
+static void bridge_reset_graphics_diagnostics(RDPBridgeSession *session) {
+    session->gfx_caps_confirmed = false;
+    session->first_frame_seen = false;
+    memset(session->codec_counts, 0, sizeof(session->codec_counts));
+}
+
+static void bridge_log_graphics_summary(RDPBridgeSession *session) {
+    char summary[192] = { 0 };
+    size_t used = 0;
+    for (size_t slot = 0; slot < RDP_BRIDGE_CODEC_SLOTS; slot++) {
+        if ((session->codec_counts[slot] == 0) || (used >= sizeof(summary))) {
+            continue;
+        }
+        const int written = (slot < RDP_BRIDGE_CODEC_SLOTS - 1)
+            ? snprintf(summary + used, sizeof(summary) - used, " 0x%04zx=%llu", slot,
+                       (unsigned long long)session->codec_counts[slot])
+            : snprintf(summary + used, sizeof(summary) - used, " other=%llu",
+                       (unsigned long long)session->codec_counts[slot]);
+        if (written > 0) {
+            used += (size_t)written;
+        }
+    }
+    bridge_logf(
+        session,
+        "Graphics summary: rdpgfx=%s surfaceCommands:%s.",
+        session->gfx_caps_confirmed ? "yes" : "no",
+        used > 0 ? summary : " none");
+}
+
 static void bridge_channel_connected(void *context, const ChannelConnectedEventArgs *event) {
     freerdp_client_OnChannelConnectedEventHandler(context, event);
 
@@ -575,6 +682,11 @@ static void bridge_channel_connected(void *context, const ChannelConnectedEventA
     bridge_log(session, message);
 
     if (event->pInterface == NULL) {
+        return;
+    }
+
+    if (strcmp(event->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
+        bridge_attach_gfx_diagnostics(session, (RdpgfxClientContext *)event->pInterface);
         return;
     }
 
@@ -1069,6 +1181,12 @@ connected:
     session->connected = true;
     bridge_attach_cliprdr(session);
     bridge_log(session, "FreeRDP connected.");
+    bridge_logf(
+        session,
+        "FreeRDP runtime: version=%s revision=%s GFX_H264=%s.",
+        freerdp_get_version_string(),
+        freerdp_get_build_revision(),
+        bridge_build_flag("WITH_GFX_H264"));
 
     while (!session->stop_requested && !freerdp_shall_disconnect_context(session->instance->context)) {
         DWORD count = freerdp_get_event_handles(session->instance->context, events, 64);
@@ -1099,6 +1217,7 @@ connected:
     }
     freerdp_disconnect(session->instance);
     session->connected = false;
+    bridge_log_graphics_summary(session);
     bridge_log(session, "FreeRDP disconnected.");
     bridge_disconnect_event(session, disconnect_kind, code);
     return 0;
@@ -1242,6 +1361,15 @@ static RDPBridgeStatus bridge_build_instance(RDPBridgeSession *session,
 }
 #endif
 
+#if defined(RDP_FREERDP_REAL)
+static BOOL CALLBACK bridge_format_freerdp_version(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)context;
+    snprintf((char *)parameter, 64, "%s (%s)", freerdp_get_version_string(), freerdp_get_build_revision());
+    return TRUE;
+}
+#endif
+
 bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSettings *out) {
     if (out == NULL) {
         return false;
@@ -1267,6 +1395,19 @@ bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSett
 #else
     (void)stage;
     return false;
+#endif
+}
+
+const char *rdp_bridge_freerdp_version(void) {
+#if defined(RDP_FREERDP_REAL)
+    static char version[64];
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    if (InitOnceExecuteOnce(&once, bridge_format_freerdp_version, version, NULL)) {
+        return version;
+    }
+    return freerdp_get_version_string();
+#else
+    return "unavailable";
 #endif
 }
 
@@ -1297,6 +1438,7 @@ RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeCon
     }
 
     session->stop_requested = false;
+    bridge_reset_graphics_diagnostics(session);
     session->thread = CreateThread(NULL, 0, rdp_event_loop, session, 0, NULL);
     if (session->thread == NULL) {
         freerdp_context_free(session->instance);

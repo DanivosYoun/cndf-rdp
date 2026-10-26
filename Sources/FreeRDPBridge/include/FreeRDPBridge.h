@@ -141,6 +141,9 @@ typedef struct RDPBridgeTLSSettings {
 // Exposed so the ladder can be pinned by unit tests.
 bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSettings *out);
 
+// "<version> (<revision>)" of the FreeRDP library actually loaded at runtime.
+const char *rdp_bridge_freerdp_version(void);
+
 RDPBridgeSession *rdp_bridge_session_create(const RDPBridgeCallbacks *callbacks);
 void rdp_bridge_session_destroy(RDPBridgeSession *session);
 
