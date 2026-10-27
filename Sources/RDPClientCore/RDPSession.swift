@@ -72,6 +72,7 @@ public final class RDPSession {
     public weak var delegate: RDPSessionDelegate?
 
     private var bridgeSession: OpaquePointer?
+    private var lastRemotePointer: RDPRemotePointer?
     private let staging: FileTransferStaging
     private let resizeCoordinator: DisplayResizeCoordinator
     private var clipboardCoordinator: ClipboardCoordinator?
@@ -119,6 +120,7 @@ public final class RDPSession {
         callbacks.disconnect = { kind, code, context in
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            session.lastRemotePointer = nil
             session.delegate?.rdpSession(session, didDisconnectWith: RDPDisconnectReason(kind: kind, code: code))
         }
         callbacks.remoteText = { bytes, length, context in
@@ -205,7 +207,7 @@ public final class RDPSession {
             default:
                 pointer = .systemDefault
             }
-            session.delegate?.rdpSession(session, didUpdatePointer: pointer)
+            session.deliverRemotePointer(pointer)
         }
         callbacks.networkCharacteristics = { result, context in
             guard let result, let context else { return }
@@ -433,6 +435,20 @@ public final class RDPSession {
                     size.scale
                 )
             )
+        }
+    }
+
+    // Pointer and disconnect callbacks are serialized on the FreeRDP worker.
+    func deliverRemotePointer(_ pointer: RDPRemotePointer) {
+        guard lastRemotePointer != pointer else { return }
+        lastRemotePointer = pointer
+        delegate?.rdpSession(self, didUpdatePointer: pointer)
+    }
+
+    public var supportsOutputSuppression: Bool {
+        withSessionLock {
+            guard let bridgeSession else { return false }
+            return rdp_bridge_supports_output_suppression(bridgeSession)
         }
     }
 

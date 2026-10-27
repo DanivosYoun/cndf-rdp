@@ -74,6 +74,24 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
         view.shutdown()
     }
 
+    func testPointerBurstQueuesOneDeliveryAndKeepsLastState() throws {
+        let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+        let session = try RDPSession()
+        let image = RDPRemotePointer.image(RDPPointerImage(
+            bgra: Data(repeating: 255, count: 384 * 384 * 4), width: 384, height: 384,
+            stride: 384 * 4, hotSpotX: 0, hotSpotY: 0))
+        for last in [RDPRemotePointer.hidden, .systemDefault, image] {
+            for pointer in [image, .hidden, .systemDefault, last] {
+                view.rdpSession(session, didUpdatePointer: pointer)
+            }
+            XCTAssertEqual(Mirror(reflecting: view).children.first { $0.label == "pendingMainCallbacks" }?.value as? Int, 1)
+            drainRunLoop()
+            let stored = Mirror(reflecting: view.clientView).children.first { $0.label == "remotePointer" }?.value
+            XCTAssertEqual(stored as? RDPRemotePointer, last)
+        }
+        view.shutdown()
+    }
+
     func testShutdownThenWindowCloseSurvivesAutoreleaseDrain() {
         for _ in 0..<10 {
             autoreleasepool {

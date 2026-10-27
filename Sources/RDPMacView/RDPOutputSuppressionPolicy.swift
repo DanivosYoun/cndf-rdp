@@ -8,20 +8,22 @@ public struct RDPOutputSuppressionPolicy: Equatable {
     public static let hideDebounce: TimeInterval = 1.0
 
     public struct Inputs: Equatable {
+        public var supported: Bool
         public var enabled: Bool
         public var connected: Bool
         public var visible: Bool
         public var frameTapAttached: Bool
 
-        public init(enabled: Bool, connected: Bool, visible: Bool, frameTapAttached: Bool) {
+        public init(enabled: Bool, supported: Bool = true, connected: Bool, visible: Bool, frameTapAttached: Bool) {
             self.enabled = enabled
+            self.supported = supported
             self.connected = connected
             self.visible = visible
             self.frameTapAttached = frameTapAttached
         }
 
         var wantsSuppression: Bool {
-            enabled && connected && !visible && !frameTapAttached
+            supported && enabled && connected && !visible && !frameTapAttached
         }
     }
 

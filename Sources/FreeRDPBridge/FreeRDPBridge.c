@@ -1325,6 +1325,8 @@ connected:
     session->connected = true;
     bridge_attach_cliprdr(session);
     bridge_log(session, "FreeRDP connected.");
+    bridge_logf(session, "Output suppression server support=%s.",
+        rdp_bridge_supports_output_suppression(session) ? "yes" : "no");
     bridge_logf(
         session,
         "FreeRDP runtime: version=%s revision=%s GFX_H264=%s.",
@@ -1917,6 +1919,16 @@ RDPBridgeStatus rdp_bridge_update_desktop_size(RDPBridgeSession *session, uint32
 #endif
 }
 
+bool rdp_bridge_supports_output_suppression(RDPBridgeSession *session) {
+#if defined(RDP_FREERDP_REAL)
+    return session && session->connected && session->instance && session->instance->context &&
+        freerdp_settings_get_bool(session->instance->context->settings, FreeRDP_SuppressOutput);
+#else
+    (void)session;
+    return false;
+#endif
+}
+
 RDPBridgeStatus rdp_bridge_set_output_suppressed(RDPBridgeSession *session, bool suppressed) {
     if (session == NULL) {
         return RDPBridgeStatusInvalidArgument;
@@ -1928,9 +1940,25 @@ RDPBridgeStatus rdp_bridge_set_output_suppressed(RDPBridgeSession *session, bool
     if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->gdi == NULL)) {
         return RDPBridgeStatusNotConnected;
     }
+    // FreeRDP mutates local GDI even when the server capability makes the PDU a no-op.
+    if (!rdp_bridge_supports_output_suppression(session)) {
+        bridge_logf(session, "Output suppression unsupported; leaving local output enabled.");
+        return RDPBridgeStatusBackendUnavailable;
+    }
     if (!gdi_send_suppress_output(session->instance->context->gdi, suppressed ? TRUE : FALSE)) {
         bridge_logf(session, "Output suppression %s failed.", suppressed ? "request" : "release");
         return RDPBridgeStatusInternalError;
+    }
+    // Resume sends AllowDisplayUpdates, but does not flush GFX invalid regions itself.
+    // Request a full repaint so an otherwise idle desktop cannot remain stale.
+    if (!suppressed && freerdp_settings_get_bool(session->instance->context->settings, FreeRDP_RefreshRect)) {
+        rdpContext *context = session->instance->context;
+        const UINT32 width = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+        const UINT32 height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+        const RECTANGLE_16 rect = { 0, 0, (UINT16)(width - 1), (UINT16)(height - 1) };
+        if (!context->update->RefreshRect(context, 1, &rect)) {
+            return RDPBridgeStatusInternalError;
+        }
     }
     bridge_logf(
         session,

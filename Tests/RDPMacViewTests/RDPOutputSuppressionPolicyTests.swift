@@ -6,6 +6,16 @@ final class RDPOutputSuppressionPolicyTests: XCTestCase {
 
     private let hidden = Inputs(enabled: true, connected: true, visible: false, frameTapAttached: false)
 
+    func testUnsupportedServerNeverSchedulesSuppression() {
+        var policy = RDPOutputSuppressionPolicy()
+        var unsupported = hidden
+        unsupported.supported = false
+        XCTAssertEqual(policy.evaluate(unsupported, now: 0), .none)
+        XCTAssertEqual(policy.evaluate(unsupported, now: 10), .none)
+        XCTAssertFalse(policy.isSuppressed)
+        XCTAssertEqual(policy.evaluate(hidden, now: 11), .recheck(after: 1))
+    }
+
     func testHiddenSuppressesOnlyAfterDebounce() {
         var policy = RDPOutputSuppressionPolicy()
 

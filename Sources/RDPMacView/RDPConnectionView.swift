@@ -67,6 +67,8 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     // only ever has one frame delivery queued and stale frames never reach it.
     private let frameSlotLock = NSLock()
     private var pendingFrame: RDPFrame?
+    private let pointerSlotLock = NSLock()
+    private var pendingPointer: RDPRemotePointer?
     private var outputSuppression = RDPOutputSuppressionPolicy()
     private var outputSuppressionRecheck: DispatchWorkItem?
     private var occlusionObserver: NSObjectProtocol?
@@ -267,6 +269,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         outputSuppressionRecheck = nil
         let inputs = RDPOutputSuppressionPolicy.Inputs(
             enabled: suppressesOutputWhenHidden,
+            supported: session?.supportsOutputSuppression ?? false,
             connected: session?.isConnected ?? false,
             visible: window.map { $0.occlusionState.contains(.visible) } ?? true,
             frameTapAttached: clientView.onRenderedFrame != nil
@@ -457,8 +460,18 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     public func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {
         guard !isShutdown else { return }
+        pointerSlotLock.lock()
+        let deliveryQueued = pendingPointer != nil
+        pendingPointer = pointer
+        pointerSlotLock.unlock()
+        guard !deliveryQueued else { return }
         enqueueMainCallback { [weak self] in
-            guard let self, !self.isShutdown else { return }
+            guard let self else { return }
+            self.pointerSlotLock.lock()
+            let pointer = self.pendingPointer
+            self.pendingPointer = nil
+            self.pointerSlotLock.unlock()
+            guard !self.isShutdown, let pointer else { return }
             self.clientView.updateRemotePointer(pointer)
         }
     }
