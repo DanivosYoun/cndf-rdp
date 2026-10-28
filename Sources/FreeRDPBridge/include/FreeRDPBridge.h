@@ -112,6 +112,8 @@ typedef void (*RDPBridgeNetworkCharacteristicsCallback)(
     const RDPBridgeNetworkCharacteristics *result,
     void *context);
 
+typedef void (*RDPBridgeOutputResumedForInputCallback)(void *context);
+
 typedef struct RDPBridgeCallbacks {
     RDPBridgeLogCallback log;
     RDPBridgeCertificateTrustCallback certificateTrust;
@@ -123,6 +125,7 @@ typedef struct RDPBridgeCallbacks {
     RDPBridgeFrameCallback frame;
     RDPBridgeNetworkCharacteristicsCallback networkCharacteristics;
     RDPBridgePointerCallback pointer;
+    RDPBridgeOutputResumedForInputCallback outputResumedForInput;
     void *context;
 } RDPBridgeCallbacks;
 

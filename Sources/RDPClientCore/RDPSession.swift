@@ -53,6 +53,7 @@ public protocol RDPSessionDelegate: AnyObject {
     func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile])
     func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame)
     func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer)
+    func rdpSessionOutputResumedForInput(_ session: RDPSession)
 }
 
 public extension RDPSessionDelegate {
@@ -66,6 +67,7 @@ public extension RDPSessionDelegate {
     func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {}
     func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {}
     func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {}
+    func rdpSessionOutputResumedForInput(_ session: RDPSession) {}
 }
 
 public final class RDPSession {
@@ -208,6 +210,11 @@ public final class RDPSession {
                 pointer = .systemDefault
             }
             session.deliverRemotePointer(pointer)
+        }
+        callbacks.outputResumedForInput = { context in
+            guard let context else { return }
+            let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            session.delegate?.rdpSessionOutputResumedForInput(session)
         }
         callbacks.networkCharacteristics = { result, context in
             guard let result, let context else { return }

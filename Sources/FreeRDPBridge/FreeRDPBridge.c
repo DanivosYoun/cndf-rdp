@@ -805,7 +805,7 @@ static BOOL bridge_network_characteristics_result(
     if (session->netchar_result_count++ == 0) {
         bridge_logf(
             session,
-            "Network auto-detect result: type=0x%04x baseRTT=%ums averageRTT=%ums bandwidth=%ukbps.",
+            "Network auto-detect initial server values (may be defaults, not a measured link estimate): type=0x%04x baseRTT=%ums averageRTT=%ums bandwidth=%ukbps.",
             (unsigned)result->type,
             result->baseRTT,
             result->averageRTT,
@@ -1371,11 +1371,12 @@ connected:
     if (session->netchar_result_count > 0) {
         bridge_logf(
             session,
-            "Network auto-detect summary: results=%u last baseRTT=%ums averageRTT=%ums bandwidth=%ukbps.",
+            "Network auto-detect summary: results=%u last baseRTT=%ums averageRTT=%ums bandwidth=%ukbps (bandwidthPresent=%s; absent means this result carries no bandwidth, zero is not a measured zero-throughput link).",
             session->netchar_result_count,
             session->last_netchar.baseRTTMs,
             session->last_netchar.averageRTTMs,
-            session->last_netchar.bandwidthKbps);
+            session->last_netchar.bandwidthKbps,
+            session->last_netchar.hasBandwidth ? "yes" : "no");
     }
     bridge_log(session, "FreeRDP disconnected.");
     bridge_disconnect_event(session, disconnect_kind, code);
@@ -1941,9 +1942,12 @@ RDPBridgeStatus rdp_bridge_set_output_suppressed(RDPBridgeSession *session, bool
         return RDPBridgeStatusNotConnected;
     }
     // FreeRDP mutates local GDI even when the server capability makes the PDU a no-op.
-    if (!rdp_bridge_supports_output_suppression(session)) {
+    if (suppressed && !rdp_bridge_supports_output_suppression(session)) {
         bridge_logf(session, "Output suppression unsupported; leaving local output enabled.");
         return RDPBridgeStatusBackendUnavailable;
+    }
+    if (session->instance->context->gdi->suppressOutput == suppressed) {
+        return RDPBridgeStatusOK;
     }
     if (!gdi_send_suppress_output(session->instance->context->gdi, suppressed ? TRUE : FALSE)) {
         bridge_logf(session, "Output suppression %s failed.", suppressed ? "request" : "release");
@@ -1970,6 +1974,22 @@ RDPBridgeStatus rdp_bridge_set_output_suppressed(RDPBridgeSession *session, bool
 #endif
     return RDPBridgeStatusOK;
 }
+
+#if defined(RDP_FREERDP_REAL)
+// Called inside the input API's existing session-lock transaction. Never hop to
+// main here: Allow + RefreshRect must be queued before input on this thread.
+static RDPBridgeStatus bridge_release_output_for_input(RDPBridgeSession *session) {
+    if (!session->instance->context->gdi || !session->instance->context->gdi->suppressOutput) {
+        return RDPBridgeStatusOK;
+    }
+    RDPBridgeStatus status = rdp_bridge_set_output_suppressed(session, false);
+    // Allow may succeed even when RefreshRect fails. Report the actual wire state.
+    if (!session->instance->context->gdi->suppressOutput && session->callbacks.outputResumedForInput) {
+        session->callbacks.outputResumedForInput(session->callbacks.context);
+    }
+    return status;
+}
+#endif
 
 RDPBridgeStatus rdp_bridge_send_pointer_move(RDPBridgeSession *session, uint32_t x, uint32_t y) {
     if (session == NULL) {
@@ -2008,6 +2028,8 @@ RDPBridgeStatus rdp_bridge_send_pointer_button(
     if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
         return RDPBridgeStatusNotConnected;
     }
+    RDPBridgeStatus status = bridge_release_output_for_input(session);
+    if (status != RDPBridgeStatusOK) return status;
     UINT16 flags = pressed ? PTR_FLAGS_DOWN : 0;
     switch (button) {
         case RDPBridgePointerButtonLeft:
@@ -2047,6 +2069,10 @@ RDPBridgeStatus rdp_bridge_send_scroll_at(
 #if defined(RDP_FREERDP_REAL)
     if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
         return RDPBridgeStatusNotConnected;
+    }
+    if (delta_x != 0 || delta_y != 0) {
+        RDPBridgeStatus status = bridge_release_output_for_input(session);
+        if (status != RDPBridgeStatusOK) return status;
     }
     if (delta_y != 0) {
         UINT16 flags = PTR_FLAGS_WHEEL | ((uint32_t)(delta_y < 0 ? -(int64_t)delta_y : (int64_t)delta_y) & WheelRotationMask);
@@ -2094,6 +2120,8 @@ RDPBridgeStatus rdp_bridge_send_key_ex(
     if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
         return RDPBridgeStatusNotConnected;
     }
+    RDPBridgeStatus status = bridge_release_output_for_input(session);
+    if (status != RDPBridgeStatusOK) return status;
     if (!freerdp_input_send_keyboard_event_ex(
             session->instance->context->input,
             pressed ? TRUE : FALSE,
@@ -2130,6 +2158,8 @@ RDPBridgeStatus rdp_bridge_send_unicode(RDPBridgeSession *session, uint16_t code
     if ((session->instance == NULL) || (session->instance->context == NULL) || (session->instance->context->input == NULL)) {
         return RDPBridgeStatusNotConnected;
     }
+    RDPBridgeStatus status = bridge_release_output_for_input(session);
+    if (status != RDPBridgeStatusOK) return status;
     // Press = absence of KBD_FLAGS_RELEASE; release = KBD_FLAGS_RELEASE.
     UINT16 flags = pressed ? 0 : KBD_FLAGS_RELEASE;
     if (!freerdp_input_send_unicode_keyboard_event(

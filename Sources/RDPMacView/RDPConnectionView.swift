@@ -402,6 +402,14 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         max(0, Int(Date().timeIntervalSince(startDate) * 1000))
     }
 
+    public func rdpSessionOutputResumedForInput(_ session: RDPSession) {
+        enqueueMainCallback { [weak self, weak session] in
+            guard let self, !self.isShutdown, let session, self.session === session else { return }
+            self.outputSuppression.outputResumedForInput()
+            self.evaluateOutputSuppression()
+        }
+    }
+
     public func rdpSession(_ session: RDPSession, didLog message: String) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didLog: message)

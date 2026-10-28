@@ -29,6 +29,7 @@ final class ScrollSendResultTests: XCTestCase {
         typedef struct { void *input; } Context;
         typedef struct { Context *context; } Instance;
         typedef struct { bool connected; Instance *instance; } RDPBridgeSession;
+        static RDPBridgeStatus bridge_release_output_for_input(RDPBridgeSession *s) { return RDPBridgeStatusOK; }
         static int calls, fail_at;
         static int freerdp_input_send_mouse_event(void *input, uint16_t flags, uint16_t x, uint16_t y) {
             return ++calls != fail_at;

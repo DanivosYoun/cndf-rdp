@@ -21,6 +21,7 @@ final class KeyboardSendResultTests: XCTestCase {
         typedef struct { void *input; } Context;
         typedef struct { Context *context; } Instance;
         typedef struct { bool connected; Instance *instance; } RDPBridgeSession;
+        static RDPBridgeStatus bridge_release_output_for_input(RDPBridgeSession *s) { return RDPBridgeStatusOK; }
         static int last_down, last_repeat, success = 1;
         static uint32_t last_code;
         static int freerdp_input_send_keyboard_event_ex(void *input, int down, int repeat, uint32_t code) {

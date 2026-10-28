@@ -109,6 +109,20 @@ final class RDPOutputSuppressionPolicyTests: XCTestCase {
         XCTAssertEqual(policy.evaluate(hidden, now: 21.0), .suppress)
     }
 
+    func testInputResumeRestartsHiddenDebounceAndStillHonorsFrameTap() {
+        var policy = suppressedPolicy()
+        policy.outputResumedForInput()
+        XCTAssertFalse(policy.isSuppressed)
+        XCTAssertEqual(policy.evaluate(hidden, now: 20), .recheck(after: 1))
+        XCTAssertEqual(policy.evaluate(hidden, now: 20.5), .recheck(after: 0.5))
+        XCTAssertEqual(policy.evaluate(hidden, now: 21), .suppress)
+        policy.outputResumedForInput()
+        var tapped = hidden
+        tapped.frameTapAttached = true
+        XCTAssertEqual(policy.evaluate(tapped, now: 22), .none)
+        XCTAssertEqual(policy.evaluate(hidden, now: 25), .recheck(after: 1))
+    }
+
     private func suppressedPolicy() -> RDPOutputSuppressionPolicy {
         var policy = RDPOutputSuppressionPolicy()
         _ = policy.evaluate(hidden, now: 0)

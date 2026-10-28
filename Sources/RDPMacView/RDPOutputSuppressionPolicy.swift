@@ -67,6 +67,13 @@ public struct RDPOutputSuppressionPolicy: Equatable {
         return .recheck(after: Self.hideDebounce - elapsed)
     }
 
+    /// The bridge already allowed output before input. Restart the hidden debounce
+    /// when main receives the asynchronous notification.
+    public mutating func outputResumedForInput() {
+        isSuppressed = false
+        hiddenSince = nil
+    }
+
     /// A new connection starts with output allowed.
     public mutating func connectionDidReset() {
         isSuppressed = false
