@@ -52,6 +52,10 @@ struct RDPBridgeSession {
     uint32_t desktop_height;
     double desktop_scale;
     UINT32 last_error_code;
+    // Furthest CONNECTION_STATE reached by this connect (across TLS-ladder
+    // retries). FreeRDP resets its own state to INITIAL before the failure is
+    // reported, so the failure stage has to be tracked as it happens.
+    CONNECTION_STATE furthest_state;
     BOOL certificate_rejected;
     DispClientContext *disp;
     CliprdrClientContext *cliprdr;
@@ -123,7 +127,11 @@ static void bridge_logf(RDPBridgeSession *session, const char *format, ...) {
 
 static void bridge_failure(RDPBridgeSession *session, RDPBridgeFailureKind kind, UINT32 code, const char *description) {
     if ((session != NULL) && (session->callbacks.failure != NULL)) {
-        session->callbacks.failure(kind, code, description != NULL ? description : "", session->callbacks.context);
+        RDPBridgeConnectStage stage = RDPBridgeConnectStageUnknown;
+#if defined(RDP_FREERDP_REAL)
+        stage = rdp_bridge_connect_stage_for_state((uint32_t)session->furthest_state);
+#endif
+        session->callbacks.failure(kind, code, stage, description != NULL ? description : "", session->callbacks.context);
     }
 }
 
@@ -174,6 +182,13 @@ static RDPBridgeSession *session_from_context(rdpContext *context) {
         return NULL;
     }
     return ((RDPBridgeContext *)context)->session;
+}
+
+static void bridge_state_changed(void *context, const StateChangedEventArgs *event) {
+    RDPBridgeSession *session = session_from_context((rdpContext *)context);
+    if ((session != NULL) && (event != NULL) && (event->newState > session->furthest_state)) {
+        session->furthest_state = event->newState;
+    }
 }
 
 static BOOL bridge_begin_paint(rdpContext *context) {
@@ -837,6 +852,7 @@ static BOOL bridge_pre_connect(freerdp *instance) {
     }
     PubSub_SubscribeChannelConnected(instance->context->pubSub, bridge_channel_connected);
     PubSub_SubscribeChannelDisconnected(instance->context->pubSub, bridge_channel_disconnected);
+    PubSub_SubscribeStateChanged(instance->context->pubSub, bridge_state_changed);
     // The client side leaves this callback unset; it only fires when the server runs
     // auto-detection, which needs FreeRDP_NetworkAutoDetect.
     rdpAutoDetect *autodetect = autodetect_get(instance->context);
@@ -1530,6 +1546,58 @@ static BOOL CALLBACK bridge_format_freerdp_version(PINIT_ONCE once, PVOID parame
 }
 #endif
 
+RDPBridgeConnectStage rdp_bridge_connect_stage_for_state(uint32_t state) {
+#if defined(RDP_FREERDP_REAL)
+    switch ((CONNECTION_STATE)state) {
+        case CONNECTION_STATE_INITIAL:
+            return RDPBridgeConnectStageInitial;
+        // TCP, X.224, TLS and CredSSP all run inside nego_connect at this state.
+        case CONNECTION_STATE_NEGO:
+            return RDPBridgeConnectStageNegotiation;
+        case CONNECTION_STATE_NLA:
+        case CONNECTION_STATE_AAD:
+            return RDPBridgeConnectStageAuthentication;
+        case CONNECTION_STATE_MCS_CREATE_REQUEST:
+        case CONNECTION_STATE_MCS_CREATE_RESPONSE:
+        case CONNECTION_STATE_MCS_ERECT_DOMAIN:
+        case CONNECTION_STATE_MCS_ATTACH_USER:
+        case CONNECTION_STATE_MCS_ATTACH_USER_CONFIRM:
+        case CONNECTION_STATE_MCS_CHANNEL_JOIN_REQUEST:
+        case CONNECTION_STATE_MCS_CHANNEL_JOIN_RESPONSE:
+        case CONNECTION_STATE_RDP_SECURITY_COMMENCEMENT:
+        case CONNECTION_STATE_SECURE_SETTINGS_EXCHANGE:
+        case CONNECTION_STATE_CONNECT_TIME_AUTO_DETECT_REQUEST:
+        case CONNECTION_STATE_CONNECT_TIME_AUTO_DETECT_RESPONSE:
+            return RDPBridgeConnectStageChannelSetup;
+        case CONNECTION_STATE_LICENSING:
+        case CONNECTION_STATE_MULTITRANSPORT_BOOTSTRAPPING_REQUEST:
+        case CONNECTION_STATE_MULTITRANSPORT_BOOTSTRAPPING_RESPONSE:
+            return RDPBridgeConnectStageLicensing;
+        case CONNECTION_STATE_CAPABILITIES_EXCHANGE_DEMAND_ACTIVE:
+        case CONNECTION_STATE_CAPABILITIES_EXCHANGE_MONITOR_LAYOUT:
+        case CONNECTION_STATE_CAPABILITIES_EXCHANGE_CONFIRM_ACTIVE:
+            return RDPBridgeConnectStageCapabilities;
+        case CONNECTION_STATE_FINALIZATION_SYNC:
+        case CONNECTION_STATE_FINALIZATION_COOPERATE:
+        case CONNECTION_STATE_FINALIZATION_REQUEST_CONTROL:
+        case CONNECTION_STATE_FINALIZATION_PERSISTENT_KEY_LIST:
+        case CONNECTION_STATE_FINALIZATION_FONT_LIST:
+        case CONNECTION_STATE_FINALIZATION_CLIENT_SYNC:
+        case CONNECTION_STATE_FINALIZATION_CLIENT_COOPERATE:
+        case CONNECTION_STATE_FINALIZATION_CLIENT_GRANTED_CONTROL:
+        case CONNECTION_STATE_FINALIZATION_CLIENT_FONT_MAP:
+            return RDPBridgeConnectStageFinalization;
+        case CONNECTION_STATE_ACTIVE:
+            return RDPBridgeConnectStageActive;
+        default:
+            return RDPBridgeConnectStageUnknown;
+    }
+#else
+    (void)state;
+    return RDPBridgeConnectStageUnknown;
+#endif
+}
+
 bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSettings *out) {
     if (out == NULL) {
         return false;
@@ -1618,6 +1686,7 @@ RDPBridgeStatus rdp_bridge_connect(RDPBridgeSession *session, const RDPBridgeCon
     // Stash a deep copy of the options so the event loop can rebuild the
     // instance and retry with TLS 1.2 if the first connect fails at TLS connect.
     session->tls_stage = RDPBridgeTLSStageDefault;
+    session->furthest_state = CONNECTION_STATE_INITIAL;
     if (!bridge_store_retry_options(session, options)) {
         return RDPBridgeStatusInternalError;
     }

@@ -4,11 +4,26 @@ import FileTransferStaging
 import Foundation
 import FreeRDPBridge
 
+/// Where in FreeRDP's connection sequence a failure was reported. `negotiation`
+/// covers TCP, X.224, TLS and CredSSP, which FreeRDP runs as one step.
+public enum RDPConnectStage: Equatable, Sendable {
+    case unknown
+    case initial
+    case negotiation
+    case authentication
+    case channelSetup
+    case licensing
+    case capabilities
+    case finalization
+    case active
+}
+
 public enum RDPSessionError: Error, Equatable, Sendable {
     case unableToCreateBridgeSession
     case bridgeRejectedOperation(Int32)
-    case networkUnreachable(underlying: String)
-    case tlsHandshakeFailed(reason: String)
+    /// `code` is the FreeRDP error code the bridge reported.
+    case networkUnreachable(underlying: String, code: UInt32, stage: RDPConnectStage)
+    case tlsHandshakeFailed(reason: String, code: UInt32, stage: RDPConnectStage)
     case authenticationFailed
     case certificateRejected
     case freerdp(code: UInt32, description: String)
@@ -113,11 +128,14 @@ public final class RDPSession {
                 port: port
             )
         }
-        callbacks.failure = { kind, code, description, context in
+        callbacks.failure = { kind, code, stage, description, context in
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
             let text = description.map(String.init(cString:)) ?? ""
-            session.delegate?.rdpSession(session, didFailWith: RDPSessionError(kind: kind, code: code, description: text))
+            session.delegate?.rdpSession(
+                session,
+                didFailWith: RDPSessionError(kind: kind, code: code, stage: RDPConnectStage(stage), description: text)
+            )
         }
         callbacks.disconnect = { kind, code, context in
             guard let context else { return }
@@ -649,13 +667,29 @@ private extension RDPPointerButton {
     }
 }
 
-private extension RDPSessionError {
-    init(kind: RDPBridgeFailureKind, code: UInt32, description: String) {
+extension RDPConnectStage {
+    init(_ stage: RDPBridgeConnectStage) {
+        switch stage {
+        case RDPBridgeConnectStageInitial: self = .initial
+        case RDPBridgeConnectStageNegotiation: self = .negotiation
+        case RDPBridgeConnectStageAuthentication: self = .authentication
+        case RDPBridgeConnectStageChannelSetup: self = .channelSetup
+        case RDPBridgeConnectStageLicensing: self = .licensing
+        case RDPBridgeConnectStageCapabilities: self = .capabilities
+        case RDPBridgeConnectStageFinalization: self = .finalization
+        case RDPBridgeConnectStageActive: self = .active
+        default: self = .unknown
+        }
+    }
+}
+
+extension RDPSessionError {
+    init(kind: RDPBridgeFailureKind, code: UInt32, stage: RDPConnectStage, description: String) {
         switch kind {
         case RDPBridgeFailureNetwork:
-            self = .networkUnreachable(underlying: description)
+            self = .networkUnreachable(underlying: description, code: code, stage: stage)
         case RDPBridgeFailureTLS:
-            self = .tlsHandshakeFailed(reason: description)
+            self = .tlsHandshakeFailed(reason: description, code: code, stage: stage)
         case RDPBridgeFailureAuthentication:
             self = .authenticationFailed
         case RDPBridgeFailureCertificate:

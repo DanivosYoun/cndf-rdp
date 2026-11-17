@@ -45,6 +45,21 @@ typedef enum RDPBridgeFailureKind {
     RDPBridgeFailureFreeRDP = 5
 } RDPBridgeFailureKind;
 
+// Coarse FreeRDP connection-sequence stage a failure was reported at. Derived from
+// FreeRDP's CONNECTION_STATE so diagnostics can tell a failure inside the
+// negotiation (TCP, X.224, TLS, CredSSP) from one after it.
+typedef enum RDPBridgeConnectStage {
+    RDPBridgeConnectStageUnknown = 0,
+    RDPBridgeConnectStageInitial = 1,
+    RDPBridgeConnectStageNegotiation = 2,
+    RDPBridgeConnectStageAuthentication = 3,
+    RDPBridgeConnectStageChannelSetup = 4,
+    RDPBridgeConnectStageLicensing = 5,
+    RDPBridgeConnectStageCapabilities = 6,
+    RDPBridgeConnectStageFinalization = 7,
+    RDPBridgeConnectStageActive = 8
+} RDPBridgeConnectStage;
+
 typedef enum RDPBridgeDisconnectKind {
     RDPBridgeDisconnectLocalRequest = 0,
     RDPBridgeDisconnectServer = 1,
@@ -61,6 +76,7 @@ typedef bool (*RDPBridgeCertificateTrustCallback)(
 typedef void (*RDPBridgeFailureCallback)(
     RDPBridgeFailureKind kind,
     uint32_t code,
+    RDPBridgeConnectStage stage,
     const char *description,
     void *context);
 typedef void (*RDPBridgeDisconnectCallback)(
@@ -192,6 +208,9 @@ bool rdp_bridge_pointer_to_bgra(
     const uint8_t *andMask,
     uint32_t andMaskLength,
     uint8_t *bgra);
+
+// Maps a FreeRDP CONNECTION_STATE value to its coarse stage. Exposed for unit tests.
+RDPBridgeConnectStage rdp_bridge_connect_stage_for_state(uint32_t state);
 
 // "<version> (<revision>)" of the FreeRDP library actually loaded at runtime.
 const char *rdp_bridge_freerdp_version(void);
