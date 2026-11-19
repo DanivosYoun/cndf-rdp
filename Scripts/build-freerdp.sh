@@ -46,6 +46,7 @@ if [[ -z "${OPENSSL_ROOT_DIR}" || ! -f "${OPENSSL_ROOT_DIR}/include/openssl/ssl.
   exit 1
 fi
 
+# NTLM uses WinPR RC4 and MD4. The packaged app does not ship OpenSSL's legacy provider.
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR}" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -76,6 +77,7 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -DWITH_OPENH264=OFF \
   -DWITH_WEBVIEW=OFF \
   -DWITH_AAD=OFF \
+  -DWITH_INTERNAL_RC4=ON \
   -DWITH_INTERNAL_MD4=ON \
   -DWITH_INTERNAL_MD5=ON \
   -DWITH_VERBOSE_WINPR_ASSERT=OFF \
