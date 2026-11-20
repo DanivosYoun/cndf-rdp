@@ -4,6 +4,10 @@ pub const CNDF_IRON_CERT_CHAIN_UNTRUSTED: u32 = 0x1;
 pub const CNDF_IRON_CERT_NAME_MISMATCH: u32 = 0x2;
 pub const CNDF_IRON_CERT_EXPIRED: u32 = 0x4;
 pub const CNDF_IRON_CERT_OTHER: u32 = 0x8;
+/// rustls, TLS 1.2-1.3.
+pub const CNDF_IRON_TLS_MODERN: u32 = 0;
+/// OpenSSL, TLS 1.0-1.2 offered in one handshake (needs the `legacy-tls` build feature).
+pub const CNDF_IRON_TLS_LEGACY: u32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CNDFIronStatus {
@@ -117,6 +121,8 @@ pub struct CNDFIronConnectOptions {
     pub color_depth: u32,
     pub graphics_pipeline: bool,
     pub log_level: CNDFIronLogLevel,
+    /// `CNDF_IRON_TLS_MODERN` or `CNDF_IRON_TLS_LEGACY`. Read only when `struct_size` covers it.
+    pub tls_profile: u32,
 }
 
 #[repr(C)]

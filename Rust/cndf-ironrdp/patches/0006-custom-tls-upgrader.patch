@@ -1,0 +1,154 @@
+diff --git a/crates/ironrdp-client/src/config.rs b/crates/ironrdp-client/src/config.rs
+index 370e762..085bcc8 100644
+--- a/crates/ironrdp-client/src/config.rs
++++ b/crates/ironrdp-client/src/config.rs
+@@ -12,6 +12,27 @@ use ironrdp_propertyset::PropertySet;
+ use ironrdp_rail::pdu::ExecutePdu;
+ use url::Url;
+ 
++/// Stream handed to and returned by a [`TlsUpgrader`].
++pub trait TlsUpgradeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync {}
++impl<T> TlsUpgradeIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync {}
++
++/// Result of a [`TlsUpgrader`]: the TLS stream and the peer's DER certificate chain as sent
++/// (leaf first, order and duplicates preserved).
++pub type TlsUpgradeOutput = std::io::Result<(Box<dyn TlsUpgradeIo>, Vec<Vec<u8>>, ironrdp_tls::NegotiatedTls)>;
++
++/// Replaces the built-in TLS upgrade of the main RDP connection.
++///
++/// The upgrader owns certificate validation: it must return only after the peer chain has been
++/// accepted, because the connector sends application data (CredSSP) right after it returns.
++pub trait TlsUpgrader: Send + Sync {
++    fn upgrade(
++        &self,
++        stream: Box<dyn TlsUpgradeIo>,
++        server_name: String,
++        endpoint: String,
++    ) -> core::pin::Pin<Box<dyn Future<Output = TlsUpgradeOutput> + Send>>;
++}
++
+ /// Local drive selection, as configured with [`ConfigBuilder::with_drive_redirection`].
+ #[cfg(feature = "rdpdr")]
+ pub use ironrdp_cfg::DriveRedirection;
+@@ -106,6 +127,7 @@ pub struct Config {
+     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
+     #[cfg(feature = "rustls")]
+     pub(crate) certificate_chain_validation_callback: Option<ironrdp_tls::CertificateChainValidationCallback>,
++    pub(crate) tls_upgrader: Option<Arc<dyn TlsUpgrader>>,
+     #[cfg(feature = "entra-auth")]
+     pub(crate) entra_auth: Option<Arc<crate::entra::EntraAuthSession>>,
+     #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+@@ -985,6 +1007,7 @@ pub struct ConfigBuilder {
+     certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
+     #[cfg(feature = "rustls")]
+     certificate_chain_validation_callback: Option<ironrdp_tls::CertificateChainValidationCallback>,
++    tls_upgrader: Option<Arc<dyn TlsUpgrader>>,
+     keyboard_type: Option<ironrdp_pdu::gcc::KeyboardType>,
+     keyboard_subtype: Option<u32>,
+     keyboard_functional_keys_count: Option<u32>,
+@@ -1514,6 +1537,13 @@ impl ConfigBuilder {
+         self
+     }
+ 
++    /// Replaces the built-in TLS upgrade of the main connection (see [`TlsUpgrader`]).
++    #[must_use]
++    pub fn with_tls_upgrader(mut self, upgrader: Arc<dyn TlsUpgrader>) -> Self {
++        self.tls_upgrader = Some(upgrader);
++        self
++    }
++
+ 
+     #[must_use]
+     pub fn with_server_pointer(mut self, enabled: bool) -> Self {
+@@ -2822,6 +2852,7 @@ impl ConfigBuilder {
+             certificate_validation_callback: self.certificate_validation_callback,
+             #[cfg(feature = "rustls")]
+             certificate_chain_validation_callback: self.certificate_chain_validation_callback,
++            tls_upgrader: self.tls_upgrader,
+             #[cfg(feature = "entra-auth")]
+             entra_auth: self.entra_auth,
+             #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 6526864..87ea9dc 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -3764,6 +3764,36 @@ async fn connect_rdcleanpath_transport(
+ 
+ // ── Shared security upgrade + finalize ────────────────────────────────────────
+ 
++type ErasedTlsUpgrade = (Box<dyn AsyncReadWrite + Unpin + Send + Sync>, x509_cert::Certificate);
++
++fn erase_tls_stream<T>((stream, cert): (T, x509_cert::Certificate)) -> ErasedTlsUpgrade
++where
++    T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
++{
++    (Box::new(stream), cert)
++}
++
++/// Runs a [`crate::config::TlsUpgrader`] and decodes the leaf of the chain it returns.
++async fn custom_tls_upgrade<S>(
++    upgrader: &dyn crate::config::TlsUpgrader,
++    stream: S,
++    config: &Config,
++) -> io::Result<ErasedTlsUpgrade>
++where
++    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
++{
++    use x509_cert::der::Decode as _;
++
++    let (stream, chain, _negotiated) = upgrader
++        .upgrade(Box::new(stream), config.destination.name().to_owned(), config.destination.to_string())
++        .await?;
++    let leaf = chain
++        .first()
++        .ok_or_else(|| io::Error::other("TLS upgrader returned no peer certificate"))?;
++    let cert = x509_cert::Certificate::from_der(leaf).map_err(io::Error::other)?;
++    Ok((Box::new(stream), cert))
++}
++
+ /// After X.224 negotiation, either perform TLS (enhanced security) or mark a no-op upgrade
+ /// for standard RDP security / plain local transports (Windows Sandbox named pipe).
+ async fn security_upgrade_and_finalize<S>(
+@@ -3819,7 +3849,9 @@ where
+     let chain_callback = config.certificate_chain_validation_callback.clone();
+     #[cfg(not(feature = "rustls"))]
+     let chain_callback: Option<ironrdp_tls::CertificateChainValidationCallback> = None;
+-    let tls_upgrade = if let Some(chain_callback) = chain_callback {
++    let tls_upgrade = if let Some(upgrader) = config.tls_upgrader.clone() {
++        custom_tls_upgrade(upgrader.as_ref(), initial_stream, config).await
++    } else if let Some(chain_callback) = chain_callback {
+         #[cfg(feature = "rustls")]
+         {
+             ironrdp_tls::upgrade_with_certificate_chain_validation_callback(
+@@ -3829,6 +3861,7 @@ where
+                 chain_callback,
+             )
+             .await
++            .map(erase_tls_stream)
+         }
+         #[cfg(not(feature = "rustls"))]
+         {
+@@ -3843,6 +3876,7 @@ where
+             callback,
+         )
+         .await
++        .map(erase_tls_stream)
+     } else {
+         ironrdp_tls::upgrade_with_certificate_validation(
+             initial_stream,
+@@ -3850,13 +3884,13 @@ where
+             config.certificate_validation(),
+         )
+         .await
++        .map(erase_tls_stream)
+     };
+-    let (tls_stream, tls_cert) = tls_upgrade.map_err(|e| ironrdp_connector::custom_err!("TLS upgrade", e))?;
++    let (erased_stream, tls_cert) = tls_upgrade.map_err(|e| ironrdp_connector::custom_err!("TLS upgrade", e))?;
+     warn_on_unexpected_target_certificate(config, &tls_cert);
+ 
+     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+ 
+-    let erased_stream: Box<dyn AsyncReadWrite + Unpin + Send + Sync> = Box::new(tls_stream);
+     let mut upgraded_framed = ironrdp_tokio::TokioFramed::new_with_leftover(erased_stream, leftover_bytes);
+ 
+     #[cfg(feature = "entra-auth")]

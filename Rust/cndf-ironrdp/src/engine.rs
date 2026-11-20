@@ -51,6 +51,8 @@ pub(super) fn start_workers(
 }
 
 const DISPLAY_LOG_TARGET: &str = "cndf_rdp_display";
+/// Negotiated TLS version and cipher only.
+pub(crate) const TLS_LOG_TARGET: &str = "cndf_rdp_tls";
 const DEVICE_SCALE_PERCENT: u32 = 100;
 
 #[derive(Default)]
@@ -72,7 +74,8 @@ struct Logs {
 impl<S: tracing::Subscriber> Layer<S> for Logs {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
-        if metadata.target() != DISPLAY_LOG_TARGET && !metadata.target().starts_with("ironrdp") {
+        let own = metadata.target() == DISPLAY_LOG_TARGET || metadata.target() == TLS_LOG_TARGET;
+        if !own && !metadata.target().starts_with("ironrdp") {
             return;
         }
         let level = match *metadata.level() {
@@ -82,8 +85,8 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
             tracing::Level::WARN => CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
             tracing::Level::ERROR => CNDFIronLogLevel::CNDF_IRON_LOG_ERROR,
         };
-        if metadata.target() == DISPLAY_LOG_TARGET {
-            // This target records only outgoing display geometry and scale factors.
+        if own {
+            // These targets record only display geometry, scale factors and TLS parameters.
             let mut message = DisplayLogMessage::default();
             event.record(&mut message);
             log(&self.connection, self.minimum, level, &message.0);
@@ -151,6 +154,7 @@ fn run(
         accepted
     });
 
+    let legacy_trust = Arc::clone(&trust);
     let desktop_scale = options.scale.clamp(100, 500);
     let mut builder = ConfigBuilder::new()
         .with_destination(Destination::from_parts(&options.host, options.port))
@@ -177,6 +181,23 @@ fn run(
     drop(options.password);
     if let Some(domain) = options.domain {
         builder = builder.with_domain(domain);
+    }
+    if options.tls_profile == CNDF_IRON_TLS_LEGACY {
+        #[cfg(feature = "legacy-tls")]
+        {
+            builder = builder.with_tls_upgrader(Arc::new(crate::legacy_tls::LegacyTlsUpgrader {
+                callback: legacy_trust,
+            }));
+        }
+        #[cfg(not(feature = "legacy-tls"))]
+        {
+            // Never fall back to the modern profile silently (design L10).
+            drop(legacy_trust);
+            let _ = output.blocking_send(Output::Failure(errors::LEGACY_TLS_UNAVAILABLE));
+            return;
+        }
+    } else {
+        drop(legacy_trust);
     }
     let Ok(config) = builder.build() else {
         let _ = output.blocking_send(Output::Failure(errors::CONFIGURATION));

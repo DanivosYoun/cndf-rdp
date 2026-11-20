@@ -271,6 +271,7 @@ mod tests {
             color_depth: 32,
             graphics_pipeline: true,
             log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
+            tls_profile: CNDF_IRON_TLS_MODERN,
         };
         let (generation, sequence, pixel) = unsafe {
             let session = cndf_iron_session_create(&callbacks);

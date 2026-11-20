@@ -52,8 +52,32 @@ fi
 export CARGO_TARGET_DIR="$root/Vendor/IronRDP/target"
 export MACOSX_DEPLOYMENT_TARGET=13.0
 target=${IRONRDP_TARGETS:-aarch64-apple-darwin}
+# Tentative C definitions (aws-lc, OpenSSL) stay global common symbols through `ld -r` below,
+# so C dependencies are compiled with real definitions.
+cflags_var="CFLAGS_${target//-/_}"
+export "$cflags_var=${!cflags_var:-} -fno-common"
 cd "$root/Rust/cndf-ironrdp"
 cargo build --locked --release --target "$target" "$@"
+
+# Prelink into one object that exports only the C ABI, so bundled Rust and C dependencies
+# (vendored OpenSSL with the legacy-tls feature) become local symbols (design L8).
+case "$target" in
+    aarch64-apple-darwin) arch=arm64 ;;
+    x86_64-apple-darwin) arch=x86_64 ;;
+    *) printf '%s\n' "Unsupported IronRDP target $target" >&2; exit 1 ;;
+esac
+prelink=$(mktemp -d "$root/Vendor/IronRDP/.prelink.XXXXXXXX")
+trap 'rm -rf -- "$prelink"' EXIT
+ld -r -arch "$arch" -platform_version macos "$MACOSX_DEPLOYMENT_TARGET" "$(xcrun --sdk macosx --show-sdk-version)" \
+    -exported_symbols_list "$root/Rust/cndf-ironrdp/cndf_iron.exports" \
+    -all_load "$CARGO_TARGET_DIR/$target/release/libcndf_ironrdp.a" -o "$prelink/cndf_ironrdp.o"
+libtool -static -o "$prelink/libcndf_ironrdp.a" "$prelink/cndf_ironrdp.o"
+exported=$(nm -gUj "$prelink/libcndf_ironrdp.a" | grep -v -e '^$' -e ':$' -e '^_cndf_iron_' || true)
+if [[ -n $exported ]]; then
+    printf '%s\n' "libcndf_ironrdp.a exports symbols outside _cndf_iron_*:" "$exported" >&2
+    exit 1
+fi
 install -d "$root/Vendor/IronRDP/install/lib"
-install -m 644 "$CARGO_TARGET_DIR/$target/release/libcndf_ironrdp.a" \
-    "$root/Vendor/IronRDP/install/lib/libcndf_ironrdp.a"
+install -m 644 "$prelink/libcndf_ironrdp.a" "$root/Vendor/IronRDP/install/lib/libcndf_ironrdp.a"
+rm -rf -- "$prelink"
+trap - EXIT

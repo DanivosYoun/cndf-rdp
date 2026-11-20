@@ -9,6 +9,8 @@ mod errors;
 mod frame;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 mod input;
+#[cfg(all(feature = "legacy-tls", not(feature = "stub")))]
+mod legacy_tls;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 use engine::start_workers;
 
@@ -143,6 +145,7 @@ struct Options {
     depth: u32,
     graphics: bool,
     log_level: CNDFIronLogLevel,
+    tls_profile: u32,
     password: Zeroizing<String>,
 }
 
@@ -320,6 +323,8 @@ fn dimensions(width: u32, height: u32) -> bool {
     (1..=8192).contains(&width) && (1..=8192).contains(&height)
 }
 
+const TLS_PROFILE_OFFSET: usize = std::mem::offset_of!(CNDFIronConnectOptions, tls_profile);
+
 /// Starts an asynchronous connection. The password is read during this call and the bridge copy is zeroized.
 #[no_mangle]
 pub unsafe extern "C" fn cndf_iron_connect(
@@ -335,13 +340,22 @@ pub unsafe extern "C" fn cndf_iron_connect(
         };
         if options.is_null()
             || out_generation.is_null()
-            || options.cast::<u32>().read() < std::mem::size_of::<CNDFIronConnectOptions>() as u32
+            || options.cast::<u32>().read() < TLS_PROFILE_OFFSET as u32
             || (password_utf8.is_null() && password_length != 0)
             || password_length > isize::MAX as usize
         {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
         if ptr::addr_of!((*options).log_level).cast::<u32>().read() > 6 {
+            return CNDF_IRON_INVALID_ARGUMENT;
+        }
+        // Callers built before `tls_profile` existed get the modern profile.
+        let tls_profile = if options.cast::<u32>().read() >= std::mem::size_of::<CNDFIronConnectOptions>() as u32 {
+            ptr::addr_of!((*options).tls_profile).read()
+        } else {
+            CNDF_IRON_TLS_MODERN
+        };
+        if !matches!(tls_profile, CNDF_IRON_TLS_MODERN | CNDF_IRON_TLS_LEGACY) {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
         let options = &*options;
@@ -377,6 +391,7 @@ pub unsafe extern "C" fn cndf_iron_connect(
             depth: options.color_depth,
             graphics: options.graphics_pipeline,
             log_level: options.log_level,
+            tls_profile,
             password: Zeroizing::new(password.to_owned()),
         };
         let mut state = lock(&session.state);

@@ -17,6 +17,16 @@
 
 #define CNDF_IRON_CERT_OTHER 8
 
+/**
+ * rustls, TLS 1.2-1.3.
+ */
+#define CNDF_IRON_TLS_MODERN 0
+
+/**
+ * OpenSSL, TLS 1.0-1.2 offered in one handshake (needs the `legacy-tls` build feature).
+ */
+#define CNDF_IRON_TLS_LEGACY 1
+
 typedef enum CNDFIronLogLevel {
   CNDF_IRON_LOG_TRACE = 0,
   CNDF_IRON_LOG_DEBUG = 1,
@@ -184,6 +194,10 @@ typedef struct CNDFIronConnectOptions {
   uint32_t color_depth;
   bool graphics_pipeline;
   enum CNDFIronLogLevel log_level;
+  /**
+   * `CNDF_IRON_TLS_MODERN` or `CNDF_IRON_TLS_LEGACY`. Read only when `struct_size` covers it.
+   */
+  uint32_t tls_profile;
 } CNDFIronConnectOptions;
 
 typedef struct CNDFIronInputEvent {

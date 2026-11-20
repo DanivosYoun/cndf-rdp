@@ -25,6 +25,14 @@ pub(super) const CONFIGURATION: Failure = Failure(
     "Invalid IronRDP connection configuration",
 );
 
+#[cfg_attr(feature = "legacy-tls", allow(dead_code))]
+pub(super) const LEGACY_TLS_UNAVAILABLE: Failure = Failure(
+    CNDF_IRON_FAILURE_CONFIGURATION,
+    0x4952000A,
+    CNDF_IRON_STAGE_INITIAL,
+    "Legacy TLS is not available in this IronRDP build",
+);
+
 pub(super) fn framebuffer_failure(error: DesktopFramebufferError, stage: CNDFIronStage) -> Failure {
     let (code, message) = match error {
         DesktopFramebufferError::Dimensions => (

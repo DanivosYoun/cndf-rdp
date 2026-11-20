@@ -249,7 +249,8 @@ public final class IronRDPSession: RDPEngineSession {
                                 scale_percent: scalePercent(desktopSize.scale),
                                 color_depth: options.colorDepth.rawValue,
                                 graphics_pipeline: options.graphicsMode != .compatibility,
-                                log_level: options.logLevel.ironLogLevel
+                                log_level: options.logLevel.ironLogLevel,
+                                tls_profile: options.tlsProfile == .legacy ? UInt32(CNDF_IRON_TLS_LEGACY) : UInt32(CNDF_IRON_TLS_MODERN)
                             )
                             return cndf_iron_connect(nativeSession, &nativeOptions, passwordPointer, passwordLength, &generation)
                         }

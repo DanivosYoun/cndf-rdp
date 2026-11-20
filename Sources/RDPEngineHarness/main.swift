@@ -343,7 +343,8 @@ private func runIteration(
         logLevel: .info,
         networkAutoDetect: run.networkAutoDetect ?? false,
         graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic,
-        engine: engine
+        engine: engine,
+        tlsProfile: RDPTLSProfile(rawValue: run.tlsProfile ?? "modern") ?? .modern
     )
 
     let size = run.window ?? HarnessSize(width: 1280, height: 800)

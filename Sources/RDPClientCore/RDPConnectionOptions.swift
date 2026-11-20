@@ -24,6 +24,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let graphicsMode: RDPGraphicsMode
     /// The engine `RDPConnectionView.connect` creates the session with. Fixed for the session.
     public let engine: RDPEngineKind
+    /// IronRDP TLS profile (design D-L1). FreeRDP ignores it.
+    public let tlsProfile: RDPTLSProfile
 
     public init(
         host: String,
@@ -45,7 +47,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         forcedDesktopSize: CGSize? = nil,
         networkAutoDetect: Bool = false,
         graphicsMode: RDPGraphicsMode = .automatic,
-        engine: RDPEngineKind = .freeRDP
+        engine: RDPEngineKind = .freeRDP,
+        tlsProfile: RDPTLSProfile = .modern
     ) {
         self.host = host
         self.port = port
@@ -67,7 +70,15 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.networkAutoDetect = networkAutoDetect
         self.graphicsMode = graphicsMode
         self.engine = engine
+        self.tlsProfile = tlsProfile
     }
+}
+
+public enum RDPTLSProfile: String, Codable, Sendable {
+    /// rustls, TLS 1.2-1.3.
+    case modern
+    /// OpenSSL, TLS 1.0-1.2 in one handshake. Needs a `legacy-tls` IronRDP build.
+    case legacy
 }
 
 public enum RDPGraphicsMode: String, Codable, Sendable {
