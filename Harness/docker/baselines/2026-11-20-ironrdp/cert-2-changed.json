@@ -1,0 +1,96 @@
+{
+  "engine" : "ironrdp",
+  "finishedAt" : "2026-11-20T12:48:56+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 540.8,
+        "min" : 540.8,
+        "p50" : 540.8,
+        "p95" : 540.8
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 902.5,
+        "min" : 902.5,
+        "p50" : 902.5,
+        "p95" : 902.5
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-cert-changed-approve",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 540.8,
+          "connected" : true,
+          "cpuSystemMs" : 60.88499999999999,
+          "cpuUserMs" : 119.298,
+          "durationMs" : 2012.9,
+          "firstFrameMs" : 902.5,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 8294400,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 1,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 31580964,
+          "physFootprintMaxBytes" : 39011120,
+          "prompts" : 1,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 99,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 102.1,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 8294400,
+          "trustCallbacks" : [
+            "changed"
+          ],
+          "trustStringCertificates" : [
+            [
+              "d4962b0965696c23b47d61e15a20648c1868407254fbd0df2f8f14b41dd0ca09",
+              "d4962b0965696c23b47d61e15a20648c1868407254fbd0df2f8f14b41dd0ca09"
+            ]
+          ],
+          "trustStringDigests" : [
+            "9f9373d60af89f57a8e04d54fc234ee4103fcbb3fec460fc796477567882aaf6"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 102.1,
+        "min" : 102.1,
+        "p50" : 102.1,
+        "p95" : 102.1
+      }
+    }
+  ],
+  "scenario" : "cert-2-changed",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-20T12:48:54+09:00"
+}

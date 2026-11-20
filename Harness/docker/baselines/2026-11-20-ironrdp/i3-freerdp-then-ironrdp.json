@@ -1,0 +1,341 @@
+{
+  "engine" : "ironrdp",
+  "finishedAt" : "2026-11-20T12:55:09+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.localdomain",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 402.1,
+        "min" : 402.1,
+        "p50" : 402.1,
+        "p95" : 402.1
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 960,
+        "min" : 960,
+        "p50" : 960,
+        "p95" : 960
+      },
+      "host" : "127.0.0.1",
+      "id" : "i3-freerdp-new",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 402.1,
+          "connected" : true,
+          "cpuSystemMs" : 77.641,
+          "cpuUserMs" : 59.126,
+          "durationMs" : 1965.1,
+          "firstFrameMs" : 960,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 16588800,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 2,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 49070872,
+          "physFootprintMaxBytes" : 68977456,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 2,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 8294400,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "0d36ac32d1404fb9cd120387616fd9ca6335e6c1acee4eff154f3d44e08d7672",
+              "0d36ac32d1404fb9cd120387616fd9ca6335e6c1acee4eff154f3d44e08d7672"
+            ]
+          ],
+          "trustStringDigests" : [
+            "25b04cfeb45f712d33a91e85d5e5630114f3006cb9b11f57a1b42625fa38b8e1"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 4,
+        "min" : 4,
+        "p50" : 4,
+        "p95" : 4
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 555.7,
+        "min" : 555.7,
+        "p50" : 555.7,
+        "p95" : 555.7
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 825.5,
+        "min" : 825.5,
+        "p50" : 825.5,
+        "p95" : 825.5
+      },
+      "host" : "127.0.0.1",
+      "id" : "i3-ironrdp-same",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 555.7,
+          "connected" : true,
+          "cpuSystemMs" : 72.65299999999999,
+          "cpuUserMs" : 119.132,
+          "durationMs" : 1877,
+          "firstFrameMs" : 825.5,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 8294400,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 1,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 72762176,
+          "physFootprintMaxBytes" : 74646344,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 44,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 46.3,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 8294400,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "0d36ac32d1404fb9cd120387616fd9ca6335e6c1acee4eff154f3d44e08d7672",
+              "0d36ac32d1404fb9cd120387616fd9ca6335e6c1acee4eff154f3d44e08d7672"
+            ]
+          ],
+          "trustStringDigests" : [
+            "25b04cfeb45f712d33a91e85d5e5630114f3006cb9b11f57a1b42625fa38b8e1"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 46.3,
+        "min" : 46.3,
+        "p50" : 46.3,
+        "p95" : 46.3
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 407,
+        "min" : 407,
+        "p50" : 407,
+        "p95" : 407
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 917.5,
+        "min" : 917.5,
+        "p50" : 917.5,
+        "p95" : 917.5
+      },
+      "host" : "127.0.0.1",
+      "id" : "i3-chain-freerdp-new",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 407,
+          "connected" : true,
+          "cpuSystemMs" : 83.14099999999999,
+          "cpuUserMs" : 73.51099999999997,
+          "durationMs" : 1926.6,
+          "firstFrameMs" : 917.5,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 8294400,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 1,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 82002760,
+          "physFootprintMaxBytes" : 85672776,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 2,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 8294400,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "28fa67faf74906c16a93b379de8e21e3c0a7c0b758bb2249364a755ad116f8b5",
+              "28fa67faf74906c16a93b379de8e21e3c0a7c0b758bb2249364a755ad116f8b5",
+              "1544e8d7bd9f98e32e65bd032d913e7929a141d17e7f88cd6c2243e70492522d"
+            ]
+          ],
+          "trustStringDigests" : [
+            "37114313dd3e599b5da1937b7ac49892dc039b5d644ca642145ec1ac7332f523"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33892,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 4,
+        "min" : 4,
+        "p50" : 4,
+        "p95" : 4
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 529.5,
+        "min" : 529.5,
+        "p50" : 529.5,
+        "p95" : 529.5
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 819.6,
+        "min" : 819.6,
+        "p50" : 819.6,
+        "p95" : 819.6
+      },
+      "host" : "127.0.0.1",
+      "id" : "i3-chain-ironrdp-same",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 529.5,
+          "connected" : true,
+          "cpuSystemMs" : 69.78399999999999,
+          "cpuUserMs" : 100.19999999999999,
+          "durationMs" : 1865,
+          "firstFrameMs" : 819.6,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 16588800,
+          "framesDisplayedWithTap" : 2,
+          "framesReceived" : 2,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 91303410,
+          "physFootprintMaxBytes" : 94110536,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 40,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 42.3,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 16588800,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "28fa67faf74906c16a93b379de8e21e3c0a7c0b758bb2249364a755ad116f8b5",
+              "28fa67faf74906c16a93b379de8e21e3c0a7c0b758bb2249364a755ad116f8b5",
+              "1544e8d7bd9f98e32e65bd032d913e7929a141d17e7f88cd6c2243e70492522d"
+            ]
+          ],
+          "trustStringDigests" : [
+            "37114313dd3e599b5da1937b7ac49892dc039b5d644ca642145ec1ac7332f523"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33892,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 42.3,
+        "min" : 42.3,
+        "p50" : 42.3,
+        "p95" : 42.3
+      }
+    }
+  ],
+  "scenario" : "i3-freerdp-then-ironrdp",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-20T12:54:59+09:00"
+}

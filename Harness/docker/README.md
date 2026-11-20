@@ -24,7 +24,14 @@ same host:port:
 2. `cert-2-changed` — cert B behind the same port: changed -> prompt -> approve -> connects.
 3. `cert-3-rejected` — cert A again: changed -> prompt -> deny -> `certificateRejected`.
 
-`trustStringCertificates` in the result lists the SHA-256 of each certificate inside each
+With `HARNESS_ENGINE=ironrdp` the same certificate scenarios run through IronRDP. IronRDP has
+no known_hosts of its own, so a stored certificate reaches the app as a `same` callback (no
+prompt) instead of no callback; runs state that with `expectByEngine`. That pass replaces the
+FreeRDP-only interop pin with `i3-freerdp-then-ironrdp`: each B1 server is accepted through
+FreeRDP first, then IronRDP must see `same` with 0 prompts (design I3).
+
+`trustStringDigests` holds the SHA-256 of each raw trust string (before lowercasing) for a
+byte-for-byte engine comparison; `trustStringCertificates` in the result lists the SHA-256 of each certificate inside each
 trust string the engine produced, which is what design I3 needs to compare engines.
 
 Scenario steps: `connect`, `waitConnected`, `waitFirstFrame`, `idle`, `tap`,
