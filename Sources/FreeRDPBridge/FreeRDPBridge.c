@@ -1361,6 +1361,17 @@ connected:
     session->connected = true;
     bridge_attach_cliprdr(session);
     bridge_log(session, "FreeRDP connected.");
+    switch (session->tls_stage) {
+        case RDPBridgeTLSStageDefault:
+            bridge_log(session, "RDP tls stage=default");
+            break;
+        case RDPBridgeTLSStagePrevious:
+            bridge_log(session, "RDP tls stage=previous");
+            break;
+        case RDPBridgeTLSStageLegacy:
+            bridge_log(session, "RDP tls stage=legacy");
+            break;
+    }
     bridge_logf(session, "Output suppression server support=%s.",
         rdp_bridge_supports_output_suppression(session) ? "yes" : "no");
     bridge_logf(
