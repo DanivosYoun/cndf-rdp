@@ -693,8 +693,11 @@ static void bridge_log_graphics_summary(RDPBridgeSession *session) {
     }
     bridge_logf(
         session,
-        "Graphics summary: rdpgfx=%s surfaceCommands:%s.",
+        "Graphics: summary rdpgfx=%s AVC420=%llu AVC444=%llu AVC444v2=%llu surfaceCommands:%s.",
         session->gfx_caps_confirmed ? "yes" : "no",
+        (unsigned long long)session->codec_counts[RDPGFX_CODECID_AVC420],
+        (unsigned long long)session->codec_counts[RDPGFX_CODECID_AVC444],
+        (unsigned long long)session->codec_counts[RDPGFX_CODECID_AVC444v2],
         used > 0 ? summary : " none");
 }
 
@@ -1220,6 +1223,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE) &&

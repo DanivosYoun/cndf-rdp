@@ -6,14 +6,15 @@ SRC_DIR="${ROOT_DIR}/Vendor/FreeRDP/src"
 BUILD_DIR="${ROOT_DIR}/Vendor/FreeRDP/build"
 INSTALL_DIR="${ROOT_DIR}/Vendor/FreeRDP/install"
 FREERDP_REPO="https://github.com/FreeRDP/FreeRDP.git"
-FREERDP_COMMIT="bf217a504e54cc719880c228e82353382cd7d4fa"
+FREERDP_TAG="3.33.1"
+FREERDP_COMMIT="65bcca1913a28cbdd7eb913599f692bd2b707991"
 
 if [[ ! -d "${SRC_DIR}/.git" ]]; then
   mkdir -p "$(dirname "${SRC_DIR}")"
-  git clone --depth 1 --branch 3.32.1 "${FREERDP_REPO}" "${SRC_DIR}"
+  git clone --depth 1 --branch "${FREERDP_TAG}" "${FREERDP_REPO}" "${SRC_DIR}"
 fi
 
-git -C "${SRC_DIR}" fetch --depth 1 origin tag 3.32.1
+git -C "${SRC_DIR}" fetch --depth 1 origin tag "${FREERDP_TAG}"
 git -C "${SRC_DIR}" checkout --detach "${FREERDP_COMMIT}"
 git -C "${SRC_DIR}" reset --hard "${FREERDP_COMMIT}"
 
@@ -74,6 +75,7 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -DWITH_CUPS=OFF \
   -DWITH_FUSE=OFF \
   -DWITH_MACAUDIO=ON \
+  -DWITH_APPLE_VIDEOTOOLBOX=ON \
   -DWITH_OPENH264=OFF \
   -DWITH_WEBVIEW=OFF \
   -DWITH_AAD=OFF \

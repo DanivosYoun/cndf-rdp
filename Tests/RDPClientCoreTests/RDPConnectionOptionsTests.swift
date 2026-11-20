@@ -69,8 +69,8 @@ final class RDPConnectionOptionsTests: XCTestCase {
 
     func testExposesBuildInfo() {
         XCTAssertFalse(RDPMacInfo.packageVersion.isEmpty)
-        // Reported by the loaded library, so it tracks Scripts/build-freerdp.sh (3.32.1 / bf217a5).
-        XCTAssertTrue(RDPMacInfo.freerdpVersion.hasPrefix("3.32.1 ("), RDPMacInfo.freerdpVersion)
+        // Reported by the loaded library, so it tracks Scripts/build-freerdp.sh (3.33.1 / 65bcca1).
+        XCTAssertTrue(RDPMacInfo.freerdpVersion.hasPrefix("3.33.1 ("), RDPMacInfo.freerdpVersion)
         XCTAssertTrue(RDPMacInfo.buildConfiguration.contains("rdpsnd"))
     }
 
