@@ -371,10 +371,13 @@ public final class IronRDPSession: RDPEngineSession {
 
     // Pointer and disconnect callbacks are serialized on the delivery thread; the local
     // disconnect report runs only after destroy, when no callback can start.
+    // The delegate hears the disconnect before the log line: a view that reacts to the
+    // preceding failure by shutting down detaches its delegate, and the log line's file write
+    // and delegate call in between were enough for that to drop the disconnect every time.
     private func deliverDisconnect(_ reason: RDPDisconnectReason) {
         lastRemotePointer = nil
-        emitLog("IronRDP disconnected.")
         delegate?.rdpSession(self, didDisconnectWith: reason)
+        emitLog("IronRDP disconnected.")
     }
 
     func deliverRemotePointer(_ pointer: RDPRemotePointer) {

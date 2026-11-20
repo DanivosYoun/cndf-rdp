@@ -186,6 +186,23 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(recorder.lifecycle, ["failure", "disconnect:error"])
     }
 
+    // stub. Nothing reaches the delegate between the failure and its disconnect: a view that
+    // shuts down on the failure detaches its delegate, so a log line in between lost the
+    // disconnect in the engine harness (cert-3-rejected).
+    func testFailureIsFollowedDirectlyByItsErrorDisconnect() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: false, logsInLifecycle: true)
+        session.delegate = recorder
+        try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+
+        XCTAssertTrue(waitUntil { recorder.lifecycle.contains("disconnect:error") })
+        let lifecycle = recorder.lifecycle
+        let failure = try XCTUnwrap(lifecycle.firstIndex(of: "failure"))
+        XCTAssertEqual(Array(lifecycle[failure...].prefix(2)), ["failure", "disconnect:error"])
+        try session.disconnect()
+    }
+
     // stub
     func testLocalDisconnectOfAConnectedSessionReportsOneLocalRequestBeforeReturning() throws {
         try skipUnlessStub()
@@ -396,9 +413,11 @@ private final class Recorder: RDPSessionDelegate {
     private var storedFrames: [CGSize] = []
     private var storedEvents = 0
     private var storedLifecycle: [String] = []
+    private let logsInLifecycle: Bool
 
-    init(trust: Bool? = false) {
+    init(trust: Bool? = false, logsInLifecycle: Bool = false) {
         self.trust = trust
+        self.logsInLifecycle = logsInLifecycle
     }
 
     var logs: [String] { locked { storedLogs } }
@@ -407,7 +426,7 @@ private final class Recorder: RDPSessionDelegate {
     var frameCount: Int { locked { storedFrames.count } }
     var lastFrameSize: CGSize? { locked { storedFrames.last } }
     var eventCount: Int { locked { storedEvents } }
-    /// `failure` and `disconnect:<reason>` in delivery order.
+    /// `failure` and `disconnect:<reason>` in delivery order, plus `log` with `logsInLifecycle`.
     var lifecycle: [String] { locked { storedLifecycle } }
 
     func answerTrust(_ trusted: Bool) {
@@ -415,7 +434,11 @@ private final class Recorder: RDPSessionDelegate {
     }
 
     func rdpSession(_ session: RDPEngineSession, didLog message: String) {
-        locked { storedLogs.append(message); storedEvents += 1 }
+        locked {
+            storedLogs.append(message)
+            if logsInLifecycle { storedLifecycle.append("log") }
+            storedEvents += 1
+        }
     }
 
     func rdpSession(
