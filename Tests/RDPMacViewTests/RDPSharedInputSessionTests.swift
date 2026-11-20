@@ -797,4 +797,69 @@ final class RDPSharedInputSessionTests: XCTestCase {
             XCTAssertEqual(result, .failed(.connectionLost))
         }
     }
+
+    // MARK: Two share handles on one executor
+
+    func testTwoSharesHoldSameKey_closingOneKeepsItDown_closingOtherReleases() async {
+        let h = Harness()
+        let first = h.activeSession()
+        let second = h.activeSession()
+        h.submit(first, .key(scanCode: keyA, pressed: true, modifiers: []), .mouse(x: 5, y: 6, button: .left, flags: [.down], modifiers: []))
+        h.submit(second, .key(scanCode: keyA, pressed: true, modifiers: []), .mouse(x: 7, y: 8, button: .left, flags: [.down], modifiers: []))
+        h.queue.runAll()
+        h.sender.events.removeAll()
+
+        let firstResult = await h.close(first)
+        XCTAssertEqual(firstResult, .released)
+        XCTAssertEqual(h.sender.events, [])
+
+        let secondResult = await h.close(second)
+        XCTAssertEqual(secondResult, .released)
+        XCTAssertEqual(h.sender.events, [.button(.left, 7, 8, pressed: false), up(keyA)])
+    }
+
+    func testShareKeyWithoutModifiersDoesNotReleaseOtherSharesModifier() async {
+        let h = Harness()
+        let first = h.activeSession()
+        let second = h.activeSession()
+        h.submit(first, .modifiers([shift]))
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(shift)])
+        h.sender.events.removeAll()
+
+        h.submit(second, .key(scanCode: keyB, pressed: true, modifiers: []), .key(scanCode: keyB, pressed: false, modifiers: []))
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(keyB), up(keyB)])
+        h.sender.events.removeAll()
+
+        let secondResult = await h.close(second)
+        XCTAssertEqual(secondResult, .released)
+        XCTAssertEqual(h.sender.events, [])
+
+        let firstResult = await h.close(first)
+        XCTAssertEqual(firstResult, .released)
+        XCTAssertEqual(h.sender.events, [up(shift)])
+    }
+
+    func testClosingOneShareDoesNotDiscardOtherSharesQueuedCommands() async {
+        let h = Harness()
+        let first = h.activeSession()
+        let second = h.activeSession()
+        h.submit(first, .key(scanCode: keyA, pressed: true, modifiers: []))
+        h.submit(second, .key(scanCode: keyB, pressed: true, modifiers: []))
+        XCTAssertEqual(h.queue.pendingCount, 2)
+
+        first.beginClose()
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(keyB)])
+        let firstResult = await first.finishClose()
+        XCTAssertEqual(firstResult, .released)
+
+        XCTAssertTrue(second.submit(.key(scanCode: keyV, pressed: true, modifiers: [])))
+        h.queue.runAll()
+        h.sender.events.removeAll()
+        let secondResult = await h.close(second)
+        XCTAssertEqual(secondResult, .released)
+        XCTAssertEqual(h.sender.events, [up(keyB), up(keyV)])
+    }
 }
