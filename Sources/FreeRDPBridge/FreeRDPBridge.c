@@ -1,5 +1,6 @@
 #include "FreeRDPBridge.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -848,7 +849,8 @@ static BOOL bridge_pre_connect(freerdp *instance) {
     if ((pre_session != NULL) && pre_session->stop_requested) {
         return FALSE;
     }
-    if (!freerdp_settings_set_bool(instance->context->settings, FreeRDP_CertificateCallbackPreferPEM, TRUE)) {
+    rdpSettings *settings = instance->context->settings;
+    if (!freerdp_settings_set_bool(settings, FreeRDP_CertificateCallbackPreferPEM, TRUE)) {
         return FALSE;
     }
     if (freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) != CHANNEL_RC_OK) {
@@ -863,6 +865,11 @@ static BOOL bridge_pre_connect(freerdp *instance) {
     if (autodetect != NULL) {
         autodetect->NetworkCharacteristicsResult = bridge_network_characteristics_result;
     }
+    bridge_logf(pre_session, "GCC display requested: %ux%u DesktopScaleFactor=%u DeviceScaleFactor=%u.",
+        freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
+        freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight),
+        freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor),
+        freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor));
     return TRUE;
 }
 
@@ -1159,6 +1166,10 @@ static BOOL bridge_apply_graphics_mode(rdpSettings *settings, bool compatibility
            freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, gfx);
 }
 
+static UINT32 bridge_desktop_scale_percent(double scale) {
+    return (UINT32)(fmin(5.0, fmax(1.0, scale)) * 100.0 + 0.5);
+}
+
 static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
@@ -1191,10 +1202,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
     if ((color_depth != 16) && (color_depth != 24) && (color_depth != 32)) {
         color_depth = 32;
     }
-    UINT32 desktop_scale_factor = (UINT32)(session->desktop_scale * 100.0);
-    if (desktop_scale_factor < 100) {
-        desktop_scale_factor = 100;
-    }
+    UINT32 desktop_scale_factor = bridge_desktop_scale_percent(session->desktop_scale);
     const BOOL has_redirected_folder =
         (options->redirectedFolderPath != NULL) && (strlen(options->redirectedFolderPath) > 0);
     const BOOL enable_device_redirection = options->enableDriveRedirection || has_redirected_folder ||
@@ -1995,26 +2003,25 @@ RDPBridgeStatus rdp_bridge_update_desktop_size(RDPBridgeSession *session, uint32
     }
 
     if ((session->disp != NULL) && (session->disp->SendMonitorLayout != NULL)) {
-        UINT32 scale_factor = (UINT32)(scale * 100.0);
-        if (scale_factor < 100) {
-            scale_factor = 100;
-        }
         DISPLAY_CONTROL_MONITOR_LAYOUT monitor = { 0 };
         monitor.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
         monitor.Left = 0;
         monitor.Top = 0;
-        monitor.Width = width;
-        monitor.Height = height;
+        // Match the dimensions the Display Control encoder writes.
+        monitor.Width = width < 200 ? 200 : (width > 8192 ? 8192 : width - width % 2);
+        monitor.Height = height < 200 ? 200 : (height > 8192 ? 8192 : height);
         monitor.PhysicalWidth = width;
         monitor.PhysicalHeight = height;
         monitor.Orientation = 0;
-        monitor.DesktopScaleFactor = scale_factor;
+        monitor.DesktopScaleFactor = bridge_desktop_scale_percent(scale);
         monitor.DeviceScaleFactor = 100;
         UINT status = session->disp->SendMonitorLayout(session->disp, 1, &monitor);
         if (status == CHANNEL_RC_OK) {
-            bridge_logf(session, "Display resize sent: %ux%u scale=%u.", width, height, scale_factor);
+            bridge_logf(session, "Display resize sent: %ux%u DesktopScaleFactor=%u DeviceScaleFactor=%u.",
+                monitor.Width, monitor.Height, monitor.DesktopScaleFactor, monitor.DeviceScaleFactor);
         } else {
-            bridge_logf(session, "Display resize failed: %ux%u scale=%u status=%u.", width, height, scale_factor, status);
+            bridge_logf(session, "Display resize failed: %ux%u DesktopScaleFactor=%u DeviceScaleFactor=%u status=%u.",
+                monitor.Width, monitor.Height, monitor.DesktopScaleFactor, monitor.DeviceScaleFactor, status);
             return RDPBridgeStatusInternalError;
         }
     } else {

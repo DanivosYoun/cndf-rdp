@@ -50,6 +50,20 @@ pub(super) fn start_workers(
     }
 }
 
+const DISPLAY_LOG_TARGET: &str = "cndf_rdp_display";
+const DEVICE_SCALE_PERCENT: u32 = 100;
+
+#[derive(Default)]
+struct DisplayLogMessage(String);
+
+impl tracing::field::Visit for DisplayLogMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
 struct Logs {
     connection: Arc<Connection>,
     minimum: CNDFIronLogLevel,
@@ -58,7 +72,7 @@ struct Logs {
 impl<S: tracing::Subscriber> Layer<S> for Logs {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
-        if !metadata.target().starts_with("ironrdp") {
+        if metadata.target() != DISPLAY_LOG_TARGET && !metadata.target().starts_with("ironrdp") {
             return;
         }
         let level = match *metadata.level() {
@@ -68,8 +82,15 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
             tracing::Level::WARN => CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
             tracing::Level::ERROR => CNDFIronLogLevel::CNDF_IRON_LOG_ERROR,
         };
-        // Metadata is static. Never visit event fields or format spans.
-        log(&self.connection, self.minimum, level, metadata.name());
+        if metadata.target() == DISPLAY_LOG_TARGET {
+            // This target records only outgoing display geometry and scale factors.
+            let mut message = DisplayLogMessage::default();
+            event.record(&mut message);
+            log(&self.connection, self.minimum, level, &message.0);
+        } else {
+            // Other IronRDP event fields may contain session data.
+            log(&self.connection, self.minimum, level, metadata.name());
+        }
     }
 }
 
@@ -130,6 +151,7 @@ fn run(
         accepted
     });
 
+    let desktop_scale = options.scale.clamp(100, 500);
     let mut builder = ConfigBuilder::new()
         .with_destination(Destination::from_parts(&options.host, options.port))
         .with_client_build(1)
@@ -140,7 +162,8 @@ fn run(
         .with_password(options.password.as_str())
         .with_desktop_width(options.width as u16)
         .with_desktop_height(options.height as u16)
-        .with_desktop_scale_factor(options.scale)
+        .with_desktop_scale_factor(desktop_scale)
+        .with_device_scale_factor(DEVICE_SCALE_PERCENT)
         // The pinned connector negotiates 16- or 32-bit color. Its 32-bit
         // path carries the 24 RGB bits requested by ABI callers at depth 24.
         .with_color_depth(if options.depth == 16 { 16 } else { 32 })
@@ -197,6 +220,15 @@ fn run(
             minimum,
             CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
             "Starting IronRDP connection",
+        );
+        log(
+            connection,
+            minimum,
+            CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+            &format!(
+                "GCC display requested: {}x{} DesktopScaleFactor={desktop_scale} DeviceScaleFactor={DEVICE_SCALE_PERCENT}.",
+                options.width, options.height
+            ),
         );
         runtime.block_on(async {
             let bridge = forward(

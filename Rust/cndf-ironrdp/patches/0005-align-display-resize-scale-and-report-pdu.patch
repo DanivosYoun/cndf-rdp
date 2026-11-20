@@ -1,0 +1,77 @@
+diff --git a/crates/ironrdp-displaycontrol/src/client.rs b/crates/ironrdp-displaycontrol/src/client.rs
+index 5ca0f45..3ac0136 100644
+--- a/crates/ironrdp-displaycontrol/src/client.rs
++++ b/crates/ironrdp-displaycontrol/src/client.rs
+@@ -5,7 +5,7 @@ use ironrdp_svc::{ChannelFlags, SvcMessage};
+ use tracing::debug;
+
+ use crate::CHANNEL_NAME;
+-use crate::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu};
++use crate::pdu::{DeviceScaleFactor, DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu};
+
+ /// A client for the Display Control Virtual Channel.
+ pub struct DisplayControlClient {
+@@ -73,9 +73,23 @@ impl DisplayControlClient {
+             Some(capabilities) => layout.fit_to_capabilities(capabilities)?,
+             None => layout,
+         };
+-        let pdu = DisplayControlPdu::from(layout);
+-        debug!(?pdu, "Sending monitor layout");
+-        encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())
++        // Use the same device scale as GCC and the CNDF FreeRDP bridge.
++        let monitor = layout.monitors()[0].clone();
++        let monitor = if scale_factor.is_some() {
++            monitor.with_device_scale_factor(DeviceScaleFactor::Scale100Percent)
++        } else {
++            monitor
++        };
++        let (width, height) = monitor.dimensions();
++        let desktop_scale = monitor.desktop_scale_factor().unwrap_or(0);
++        let device_scale = monitor.device_scale_factor().map_or(0, |scale| scale.value());
++        let pdu = DisplayControlPdu::from(DisplayControlMonitorLayout::new(&[monitor])?);
++        let messages = encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())?;
++        tracing::info!(
++            target: "cndf_rdp_display",
++            "Display resize encoded: {width}x{height} DesktopScaleFactor={desktop_scale} DeviceScaleFactor={device_scale}."
++        );
++        Ok(messages)
+     }
+
+     /// Builds a [`DisplayControlPdu::MonitorLayout`] carrying the complete client monitor `layout`,
+@@ -140,3 +154,36 @@ impl DvcProcessor for DisplayControlClient {
+ impl DvcClientProcessor for DisplayControlClient {}
+
+ type OnCapabilitiesReceived = Box<dyn Fn(DisplayControlCapabilities) -> PduResult<Vec<DvcMessage>> + Send>;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use ironrdp_dvc::pdu::{DrdynvcClientPdu, DrdynvcDataPdu};
++
++    #[test]
++    fn single_monitor_resize_encodes_desktop_scale_and_device_100() {
++        let client = DisplayControlClient::new(|_| Ok(Vec::new()));
++
++        for (width, height, scale) in [(1024, 700, 100), (2048, 1400, 200)] {
++            let messages = client
++                .encode_single_primary_monitor(1, width, height, Some(scale), None)
++                .unwrap();
++            let [message] = messages.as_slice() else {
++                panic!("expected one DVC message");
++            };
++            let wire = message.encode_unframed_pdu().unwrap();
++            let DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(data)) = decode(&wire).unwrap() else {
++                panic!("expected a DVC data PDU");
++            };
++            let DisplayControlPdu::MonitorLayout(layout) = decode(data.data()).unwrap() else {
++                panic!("expected a Display Control monitor layout");
++            };
++            let [monitor] = layout.monitors() else {
++                panic!("expected a single primary monitor");
++            };
++            assert_eq!(monitor.dimensions(), (width, height));
++            assert_eq!(monitor.desktop_scale_factor(), Some(scale));
++            assert_eq!(monitor.device_scale_factor().map(|factor| factor.value()), Some(100));
++        }
++    }
++}
