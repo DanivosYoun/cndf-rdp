@@ -454,6 +454,36 @@ private func runIteration(
             result.resizeFrameSize = lastFrameSize
             result.connectedAfterResize = view.isConnected && delegate.disconnectReason == nil
             result.steps.append("resize:\(Int(width))x\(Int(height))")
+        case "scroll":
+            let deltas = step.scrollDeltas ?? []
+            let deltasX = step.scrollDeltasX ?? []
+            let unit = step.scrollUnit ?? "line"
+            if let x = step.pointerX, let y = step.pointerY {
+                view.injectMouse(x: x, y: y, button: nil, flags: .move)
+                drainRunLoop(0.3)
+            }
+            var seen: [String] = []
+            for index in 0..<max(deltas.count, deltasX.count) {
+                let dy = index < deltas.count ? deltas[index] : 0
+                let dx = index < deltasX.count ? deltasX[index] : 0
+                if unit == "raw" {
+                    view.injectScroll(x: step.pointerX ?? 0, y: step.pointerY ?? 0, deltaY: dy, deltaX: dx)
+                } else if let cgEvent = CGEvent(
+                    scrollWheelEvent2Source: nil,
+                    units: unit == "pixel" ? .pixel : .line,
+                    wheelCount: 2,
+                    wheel1: dy,
+                    wheel2: dx,
+                    wheel3: 0
+                ), let event = NSEvent(cgEvent: cgEvent) {
+                    if index == 0 {
+                        seen.append("scrollingDeltaY=\(event.scrollingDeltaY) deltaY=\(event.deltaY) precise=\(event.hasPreciseScrollingDeltas)")
+                    }
+                    view.clientView.scrollWheel(with: event)
+                }
+                drainRunLoop((step.intervalMs ?? 50) / 1000)
+            }
+            result.steps.append("scroll:\(unit)x\(max(deltas.count, deltasX.count)) \(seen.joined())")
         case "shutdown":
             result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {

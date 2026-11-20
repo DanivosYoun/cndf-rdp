@@ -2181,6 +2181,16 @@ RDPBridgeStatus rdp_bridge_send_pointer_button(
     return RDPBridgeStatusOK;
 }
 
+#if defined(RDP_FREERDP_REAL)
+/* Wheel rotation field of a pointer event: 9-bit two's complement (MS-RDPBCGR 2.2.8.1.1.3.1.1.3),
+ * whose sign bit is PTR_FLAGS_WHEEL_NEGATIVE, clamped to its range like IronRDP's encoder. The
+ * earlier |delta| | NEGATIVE encoding turned -1 into -255 on the server and +1 into +1. */
+static UINT16 bridge_wheel_rotation(int32_t delta) {
+    const int32_t clamped = delta < -256 ? -256 : (delta > 255 ? 255 : delta);
+    return (UINT16)((uint32_t)clamped & 0x01FF);
+}
+#endif
+
 RDPBridgeStatus rdp_bridge_send_scroll_at(
     RDPBridgeSession *session,
     uint32_t x,
@@ -2202,19 +2212,13 @@ RDPBridgeStatus rdp_bridge_send_scroll_at(
         if (status != RDPBridgeStatusOK) return status;
     }
     if (delta_y != 0) {
-        UINT16 flags = PTR_FLAGS_WHEEL | ((uint32_t)(delta_y < 0 ? -(int64_t)delta_y : (int64_t)delta_y) & WheelRotationMask);
-        if (delta_y < 0) {
-            flags |= PTR_FLAGS_WHEEL_NEGATIVE;
-        }
+        UINT16 flags = PTR_FLAGS_WHEEL | bridge_wheel_rotation(delta_y);
         if (!freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y)) {
             return RDPBridgeStatusInternalError;
         }
     }
     if (delta_x != 0) {
-        UINT16 flags = PTR_FLAGS_HWHEEL | ((uint32_t)(delta_x < 0 ? -(int64_t)delta_x : (int64_t)delta_x) & WheelRotationMask);
-        if (delta_x < 0) {
-            flags |= PTR_FLAGS_WHEEL_NEGATIVE;
-        }
+        UINT16 flags = PTR_FLAGS_HWHEEL | bridge_wheel_rotation(delta_x);
         if (!freerdp_input_send_mouse_event(session->instance->context->input, flags, (UINT16)x, (UINT16)y)) {
             return RDPBridgeStatusInternalError;
         }
