@@ -1,0 +1,6 @@
+language = "C"
+include_guard = "CNDF_IRONRDP_H"
+cpp_compat = true
+usize_is_size_t = true
+style = "both"
+documentation = true

@@ -6,3 +6,5 @@ DerivedData/
 Vendor/FreeRDP/src/
 Vendor/FreeRDP/build/
 Vendor/FreeRDP/install/
+
+/Vendor/IronRDP/
