@@ -1,0 +1,261 @@
+{
+  "engine" : "freerdp",
+  "finishedAt" : "2026-11-21T02:39:00+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 760.2,
+        "min" : 760.2,
+        "p50" : 760.2,
+        "p95" : 760.2
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 16894,
+        "min" : 16894,
+        "p50" : 16894,
+        "p95" : 16894
+      },
+      "host" : "127.0.0.1",
+      "id" : "b4-tls10-freerdp",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 760.2,
+          "connected" : true,
+          "cpuSystemMs" : 476.26399999999995,
+          "cpuUserMs" : 228.09999999999997,
+          "durationMs" : 17902.6,
+          "firstFrameMs" : 16894,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 12288000,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 3,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 52580517,
+          "physFootprintMaxBytes" : 66749232,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 4,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 7.4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 4096000,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5",
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5"
+            ]
+          ],
+          "trustStringDigests" : [
+            "7c2d5699246b2d82f39bc42b45fc56591a694351d015c0715fe4313746e2322b"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33895,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 7.4,
+        "min" : 7.4,
+        "p50" : 7.4,
+        "p95" : 7.4
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 799.4,
+        "min" : 799.4,
+        "p50" : 799.4,
+        "p95" : 799.4
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 16929.5,
+        "min" : 16929.5,
+        "p50" : 16929.5,
+        "p95" : 16929.5
+      },
+      "host" : "127.0.0.1",
+      "id" : "b4-tls11-freerdp",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 799.4,
+          "connected" : true,
+          "cpuSystemMs" : 469.476,
+          "cpuUserMs" : 196.43099999999998,
+          "durationMs" : 17940.9,
+          "firstFrameMs" : 16929.5,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 12288000,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 3,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 69714756,
+          "physFootprintMaxBytes" : 72106800,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 3,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 4.9,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 4096000,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5",
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5"
+            ]
+          ],
+          "trustStringDigests" : [
+            "7c2d5699246b2d82f39bc42b45fc56591a694351d015c0715fe4313746e2322b"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33896,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 4.9,
+        "min" : 4.9,
+        "p50" : 4.9,
+        "p95" : 4.9
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 443.1,
+        "min" : 443.1,
+        "p50" : 443.1,
+        "p95" : 443.1
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 16574.7,
+        "min" : 16574.7,
+        "p50" : 16574.7,
+        "p95" : 16574.7
+      },
+      "host" : "127.0.0.1",
+      "id" : "b4-tls12-freerdp",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 443.1,
+          "connected" : true,
+          "cpuSystemMs" : 438.874,
+          "cpuUserMs" : 145.32300000000004,
+          "durationMs" : 17586.4,
+          "firstFrameMs" : 16574.7,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 8192000,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 2,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 72043873,
+          "physFootprintMaxBytes" : 72287048,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 3,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 6.3,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 4096000,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5",
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5"
+            ]
+          ],
+          "trustStringDigests" : [
+            "7c2d5699246b2d82f39bc42b45fc56591a694351d015c0715fe4313746e2322b"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33897,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 6.3,
+        "min" : 6.3,
+        "p50" : 6.3,
+        "p95" : 6.3
+      }
+    }
+  ],
+  "scenario" : "legacy-tls-freerdp",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-21T02:38:05+09:00"
+}

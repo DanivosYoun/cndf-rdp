@@ -4,11 +4,14 @@
 #   Scripts/run-engine-harness.sh all        # build images, start B1-B3, build + run the
 #                                             # harness on the Mac, collect JSON, clean up
 #   Scripts/run-engine-harness.sh images|up|mac-build|scenarios|down
+#   Scripts/run-engine-harness.sh legacy-tls # B4 only: legacy-tls-{freerdp,ironrdp}, clean up
 #
 # Servers (Linux Docker, published on the LAN IP only):
 #   B1  IronRDP examples/server, --sec hybrid      :33891 (cert A, later B)  :33892 (chain)
 #   B2  FreeRDP 3.33.1 shadow + Xvfb + Tk probe    :33893
 #   B3  xrdp (danielguerra/ubuntu-xrdp, pinned)    :33894
+#   B4  xrdp 0.9.17, one TLS window per container  :33895 (TLS 1.0)  :33896 (TLS 1.1)
+#                                                   :33897 (TLS 1.2+1.3)
 # The Mac cannot open connections to the Linux host, so the ports reach the Mac through one
 # reverse ssh tunnel (Linux -> Mac, -R 127.0.0.1:<port>:<lan-ip>:<port>); its PID is
 # recorded and only that PID is killed.
@@ -36,7 +39,9 @@ LABEL="roster.batch=${HARNESS_BATCH}"
 B1_IMAGE="cndf-harness-b1-ironrdp:${HARNESS_BATCH}"
 B2_IMAGE="cndf-harness-b2-freerdp-shadow:${HARNESS_BATCH}"
 B3_IMAGE="danielguerra/ubuntu-xrdp@sha256:1a00da32f4e486f2f5fd8f656fc23bb235987c219153a587894469cad300b12d"
+B4_IMAGE="cndf-harness-b4-legacy-tls:${HARNESS_BATCH}"
 PORT_B1=33891 PORT_B1_CHAIN=33892 PORT_B2=33893 PORT_B3=33894
+PORT_B4_TLS10=33895 PORT_B4_TLS11=33896 PORT_B4_TLS12=33897
 MAC_PATH='PATH=$HOME/.cargo/bin:/opt/homebrew/bin:$PATH'
 
 mac() { ssh -o BatchMode=yes "${MAC}" "$@"; }
@@ -138,10 +143,12 @@ wait_port() {
   return 1
 }
 
+# Forwards the given ports (default B1-B3).
 tunnel_up() {
   [[ -f "${WORK}/tunnel.pid" ]] && kill -0 "$(cat "${WORK}/tunnel.pid")" 2>/dev/null && return
-  local forwards=() port
-  for port in "${PORT_B1}" "${PORT_B1_CHAIN}" "${PORT_B2}" "${PORT_B3}"; do
+  local forwards=() port ports=("$@")
+  (( ${#ports[@]} )) || ports=("${PORT_B1}" "${PORT_B1_CHAIN}" "${PORT_B2}" "${PORT_B3}")
+  for port in "${ports[@]}"; do
     forwards+=(-R "127.0.0.1:${port}:${BIND_IP}:${port}")
   done
   ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 "${forwards[@]}" "${MAC}" \
@@ -219,9 +226,59 @@ scenarios() {
   log "results in ${WORK}/results"
 }
 
+# B4 (legacy TLS design C5): three xrdp containers, one TLS protocol window each, with the
+# same one-time self-signed certificate. Only the B4 ports are tunnelled.
+legacy_tls_up() {
+  local avail profile port
+  avail="$(free -g | awk '/^Mem:/ {print $7}')"
+  log "host available memory ${avail}G"
+  if (( avail < 20 )); then
+    log "less than 20G available; not starting servers"
+    exit 1
+  fi
+  docker build --label "${LABEL}" -t "${B4_IMAGE}" "${ROOT_DIR}/Harness/docker/b4-legacy-tls"
+  secrets
+  if [[ ! -f "${WORK}/certs/b4.pem" ]]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj "/CN=harness-b4" \
+      -keyout "${WORK}/certs/b4-key.pem" -out "${WORK}/certs/b4.pem" 2>/dev/null
+    chmod 644 "${WORK}/certs/b4.pem" "${WORK}/certs/b4-key.pem"
+  fi
+  for profile in tls10:"${PORT_B4_TLS10}" tls11:"${PORT_B4_TLS11}" tls12:"${PORT_B4_TLS12}"; do
+    port="${profile#*:}" profile="${profile%%:*}"
+    docker rm -fv "$(name "b4${profile}")" >/dev/null 2>&1 || true
+    docker run -d --label "${LABEL}" --name "$(name "b4${profile}")" -p "${BIND_IP}:${port}:3389" \
+      -e TLS_PROFILE="${profile}" -v "${WORK}/certs:/certs:ro" "${B4_IMAGE}" >/dev/null
+    wait_port "${port}"
+  done
+  tunnel_up "${PORT_B4_TLS10}" "${PORT_B4_TLS11}" "${PORT_B4_TLS12}"
+}
+
+# Each B4 server reached through FreeRDP (expected: connects on every profile) and through
+# IronRDP (expected: TLS 1.0/1.1 fail with tlsHandshakeFailed, TLS 1.2 connects). xrdp has no
+# sesman here, so the session ends at xrdp's login screen; the password is never checked.
+# The session logs come back too: FreeRDP's TLS ladder stage is only visible there.
+legacy_tls_scenarios() {
+  local s="${ROOT_DIR}/Harness/docker/b4-legacy-tls/scenarios" engine log stage
+  mkdir -p "${WORK}/results"
+  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
+  mac "chmod 600 \$HOME/${MAC_DIR}/secrets.env; rm -rf \$HOME/${MAC_DIR}/home"
+  run_scenario "${s}/legacy-tls-freerdp.json" --reset-trust 1
+  mac "rm -rf \$HOME/${MAC_DIR}/home"
+  run_scenario "${s}/legacy-tls-ironrdp.json" --reset-trust 1 --drop-trust 1
+  rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${MAC_DIR}/work/b4-*.session.log" "${WORK}/results/" 2>/dev/null || true
+  for log in "${WORK}/results"/b4-*-freerdp-*.session.log; do
+    [[ -f "${log}" ]] || continue
+    stage=default
+    grep -q 'previous-default TLS' "${log}" && stage=previous
+    grep -q 'legacy-compatible TLS' "${log}" && stage=legacy
+    log "$(basename "${log}" .session.log): FreeRDP TLS stage reached ${stage}"
+  done
+  log "results in ${WORK}/results"
+}
+
 down() {
   local n
-  for n in b1 b1chain b2 b3; do
+  for n in b1 b1chain b2 b3 b4tls10 b4tls11 b4tls12; do
     docker rm -fv "$(name "${n}")" >/dev/null 2>&1 || true
   done
   if [[ -f "${WORK}/tunnel.pid" ]]; then
@@ -240,6 +297,12 @@ case "${1:-}" in
   mac-build) mac_build ;;
   scenarios) scenarios ;;
   down) down ;;
+  legacy-tls)
+    trap down EXIT
+    legacy_tls_up
+    mac_build
+    legacy_tls_scenarios
+    ;;
   all)
     trap down EXIT
     images
@@ -248,7 +311,7 @@ case "${1:-}" in
     scenarios
     ;;
   *)
-    echo "usage: $0 all|images|up|mac-build|scenarios|down" >&2
+    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls" >&2
     exit 2
     ;;
 esac
