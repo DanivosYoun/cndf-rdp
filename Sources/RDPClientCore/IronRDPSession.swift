@@ -298,20 +298,20 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     /// A forced update (`sendForcedDesktopSize`) re-delivers the current framebuffer without a
-    /// server round trip; a resize is only requested when the size actually changed.
+    /// server round trip and requests the size again. Otherwise a resize is requested when the
+    /// size differs from the last one the engine accepted, so a rejected size is retried.
+    /// The view already debounces non-forced updates, so the coordinator's commit-on-ask
+    /// `sizeToSend` is not used: it would remember a size the engine rejected.
     public func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool = false) throws {
-        guard let size = resizeCoordinator.sizeToSend(
-            pointWidth: pointWidth,
-            pointHeight: pointHeight,
-            scale: scale,
-            force: force,
-            preferDeviceNativeResolution: lastConnectionOptions?.preferDeviceNativeResolution ?? true,
-            forcedDesktopSize: lastConnectionOptions?.forcedDesktopSize
-        ) else {
-            return
-        }
-
         try withSessionLock {
+            let size = resizeCoordinator.candidateSize(
+                pointWidth: pointWidth,
+                pointHeight: pointHeight,
+                scale: scale,
+                preferDeviceNativeResolution: lastConnectionOptions?.preferDeviceNativeResolution ?? true,
+                forcedDesktopSize: lastConnectionOptions?.forcedDesktopSize
+            )
+            guard force || size != currentDesktopSize else { return }
             guard let nativeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
             }
@@ -319,10 +319,12 @@ public final class IronRDPSession: RDPEngineSession {
                 // Best effort: before the first frame there is nothing to re-deliver.
                 _ = cndf_iron_redeliver_frame(nativeSession, nativeGeneration)
             }
-            guard size != currentDesktopSize else { return }
-            try throwIfNeeded(
-                cndf_iron_resize(nativeSession, nativeGeneration, size.pixelWidth, size.pixelHeight, scalePercent(size.scale))
-            )
+            let status = cndf_iron_resize(nativeSession, nativeGeneration, size.pixelWidth, size.pixelHeight, scalePercent(size.scale))
+            guard status == CNDF_IRON_OK else {
+                emitLog("IronRDP resize to \(size.pixelWidth)x\(size.pixelHeight) rejected [\(status.rawValue)].")
+                try throwIfNeeded(status)
+                return
+            }
             currentDesktopSize = size
         }
     }

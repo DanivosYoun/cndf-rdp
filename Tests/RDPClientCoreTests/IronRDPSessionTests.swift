@@ -264,6 +264,47 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(ironConnecting.lifecycle, freeRDPConnecting.lifecycle)
     }
 
+    // MARK: resize (finding ironrdp-resize-state-desync-on-rejected-send)
+
+    // stub
+    func testRejectedResizeIsLoggedAndRetriedWithTheSameSize() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: nil)
+        session.delegate = recorder
+        try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil { recorder.trustRequests.count == 1 })
+
+        // Not connected yet: the engine rejects the resize with NOT_CONNECTED.
+        XCTAssertThrowsError(try session.updateDesktopSize(pointWidth: 800, pointHeight: 600, scale: 1))
+        XCTAssertTrue(recorder.logs.contains {
+            $0 == "IronRDP resize to 800x600 rejected [\(CNDF_IRON_NOT_CONNECTED.rawValue)]."
+        })
+
+        recorder.answerTrust(true)
+        XCTAssertTrue(waitUntil { session.isConnected && recorder.frameCount == 1 })
+        XCTAssertEqual(recorder.lastFrameSize, CGSize(width: 640, height: 480))
+        try session.updateDesktopSize(pointWidth: 800, pointHeight: 600, scale: 1)
+        XCTAssertTrue(waitUntil { recorder.lastFrameSize == CGSize(width: 800, height: 600) })
+        try session.disconnect()
+    }
+
+    // stub
+    func testForcedResizeIsSentEvenWhenTheSizeIsUnchanged() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected && recorder.frameCount == 1 })
+
+        // The stub answers a redelivery with one frame and a resize with another.
+        try session.updateDesktopSize(pointWidth: 640, pointHeight: 480, scale: 1, force: true)
+        XCTAssertTrue(waitUntil { recorder.frameCount == 3 })
+        XCTAssertEqual(recorder.lastFrameSize, CGSize(width: 640, height: 480))
+        try session.disconnect()
+    }
+
     private func options(logFileURL: URL? = nil) -> RDPConnectionOptions {
         RDPConnectionOptions(
             host: "localhost",
@@ -348,7 +389,7 @@ private final class SilentListener {
 /// Thread-safe delegate. `trust == nil` never answers a certificate prompt.
 private final class Recorder: RDPSessionDelegate {
     private let lock = NSLock()
-    private let trust: Bool?
+    private var trust: Bool?
     private var storedLogs: [String] = []
     private var storedTrustRequests: [String] = []
     private var storedErrors: [RDPSessionError] = []
@@ -369,6 +410,10 @@ private final class Recorder: RDPSessionDelegate {
     /// `failure` and `disconnect:<reason>` in delivery order.
     var lifecycle: [String] { locked { storedLifecycle } }
 
+    func answerTrust(_ trusted: Bool) {
+        locked { trust = trusted }
+    }
+
     func rdpSession(_ session: RDPEngineSession, didLog message: String) {
         locked { storedLogs.append(message); storedEvents += 1 }
     }
@@ -380,11 +425,12 @@ private final class Recorder: RDPSessionDelegate {
         port: UInt16
     ) async -> Bool {
         locked { storedTrustRequests.append(fingerprint); storedEvents += 1 }
-        guard let trust else {
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
-            return true
+        // Unanswered prompts poll for `answerTrust` and give up (accept) after 30 s.
+        for _ in 0..<3000 {
+            if let answer = locked({ self.trust }) { return answer }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        return trust
+        return true
     }
 
     func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError) {
