@@ -154,7 +154,8 @@ fn run(
     let desktop_scale = options.scale.clamp(100, 500);
     let mut builder = ConfigBuilder::new()
         .with_destination(Destination::from_parts(&options.host, options.port))
-        .with_client_build(1)
+        // xrdp suppresses resize reactivation for client builds at or below 419.
+        .with_client_build(420)
         .with_client_dir("")
         .with_platform(ironrdp_pdu::rdp::capability_sets::MajorPlatformType::OSX)
         .with_client_name("CNDF Terminal")

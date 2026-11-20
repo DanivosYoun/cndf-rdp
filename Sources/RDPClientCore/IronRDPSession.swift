@@ -298,8 +298,8 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     /// A forced update (`sendForcedDesktopSize`) re-delivers the current framebuffer without a
-    /// server round trip and requests the size again. Otherwise a resize is requested when the
-    /// size differs from the last one the engine accepted, so a rejected size is retried.
+    /// server round trip. Resize only when the requested size has changed. A same-size layout
+    /// may never trigger a server reactivation, blocking a real resize queued behind it.
     /// The view already debounces non-forced updates, so the coordinator's commit-on-ask
     /// `sizeToSend` is not used: it would remember a size the engine rejected.
     public func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool = false) throws {
@@ -319,6 +319,7 @@ public final class IronRDPSession: RDPEngineSession {
                 // Best effort: before the first frame there is nothing to re-deliver.
                 _ = cndf_iron_redeliver_frame(nativeSession, nativeGeneration)
             }
+            guard size != currentDesktopSize else { return }
             let status = cndf_iron_resize(nativeSession, nativeGeneration, size.pixelWidth, size.pixelHeight, scalePercent(size.scale))
             guard status == CNDF_IRON_OK else {
                 emitLog("IronRDP resize to \(size.pixelWidth)x\(size.pixelHeight) rejected [\(status.rawValue)].")

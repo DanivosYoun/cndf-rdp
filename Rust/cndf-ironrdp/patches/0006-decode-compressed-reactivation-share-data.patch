@@ -1,0 +1,190 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 6526864..4c4fcbc 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -21,6 +21,7 @@ pub use ironrdp_cliprdr::backend::CliprdrBackendFactory;
+ use ironrdp_connector::connection_activation::ConnectionActivationState;
+ use ironrdp_connector::{ConnectionOutcome, ConnectionResult, ConnectorResult};
+ use ironrdp_core::WriteBuf;
++use ironrdp_connector::Sequence as _;
+ use ironrdp_displaycontrol::client::DisplayControlClient;
+ use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, MonitorLayoutEntry};
+ #[cfg(all(windows, feature = "dvc-com-plugin"))]
+@@ -66,7 +67,7 @@ use ironrdp_session::{
+ };
+ use ironrdp_svc::SvcMessage;
+ use ironrdp_tokio::reqwest::ReqwestNetworkClient;
+-use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
++use ironrdp_tokio::{FramedWrite, split_tokio_framed};
+ #[cfg(feature = "w365")]
+ use ironrdp_w365::battery::{BatteryStatusClient, BatteryStatusHandler};
+ #[cfg(feature = "w365")]
+@@ -5823,7 +5824,26 @@ async fn active_session(
+                     let mut connection_activation = activation_factory.create();
+                     let mut buf = WriteBuf::new();
+                     'activation_seq: loop {
+-                        let step = single_sequence_step_read(&mut reader, &mut connection_activation, &mut buf);
++                        let step = async {
++                            buf.clear();
++                            if let Some(hint) = connection_activation.next_pdu_hint() {
++                                let pdu = reader.read_by_hint(hint).await.map_err(|e| {
++                                    ironrdp_connector::custom_err!("read reactivation PDU", e)
++                                })?;
++                                // xrdp can compress its Font Map after resizing. Decode it with
++                                // the same history as the rest of the connection.
++                                connection_activation.step_with_share_data_decoder(
++                                    &pdu, reader.last_read_at(), &mut buf,
++                                    |ctx| {
++                                        active_stage.decode_reactivation_share_data(ctx).map_err(|e| {
++                                            ironrdp_connector::custom_err!("decode reactivation share data", e)
++                                        })
++                                    },
++                                )
++                            } else {
++                                connection_activation.step_no_input(&mut buf)
++                            }
++                        };
+                         let written = if let Some(in_flight) = resize_queue.in_flight.as_ref() {
+                             match cancelable_operation(
+                                 tokio::time::timeout_at(in_flight.deadline, step),
+diff --git a/crates/ironrdp-connector/src/connection_activation.rs b/crates/ironrdp-connector/src/connection_activation.rs
+index 1344864..9583631 100644
+--- a/crates/ironrdp-connector/src/connection_activation.rs
++++ b/crates/ironrdp-connector/src/connection_activation.rs
+@@ -151,6 +151,18 @@ impl Sequence for ConnectionActivationSequence {
+         input: &[u8],
+         received_at: Option<MonotonicInstant>,
+         output: &mut ironrdp_core::WriteBuf,
++    ) -> ConnectorResult<Written> {
++        self.step_with_share_data_decoder(input, received_at, output, |ctx| Ok(ctx.pdu))
++    }
++}
++
++impl ConnectionActivationSequence {
++    pub fn step_with_share_data_decoder(
++        &mut self,
++        input: &[u8],
++        received_at: Option<MonotonicInstant>,
++        output: &mut ironrdp_core::WriteBuf,
++        decode_share_data: impl FnOnce(rdp::headers::ShareDataCtx) -> ConnectorResult<rdp::headers::ShareDataPdu>,
+     ) -> ConnectorResult<Written> {
+         // The server may redirect the client instead of, or in the middle of, activating it
+         // ([MS-RDPBCGR] 3.2.5.13.1).
+@@ -381,7 +393,9 @@ impl Sequence for ConnectionActivationSequence {
+             } => {
+                 debug!("Connection Finalization");
+ 
+-                let written = connection_finalization.step(input, received_at, output)?;
++                let written = connection_finalization.step_with_share_data_decoder(
++                    input, received_at, output, decode_share_data,
++                )?;
+ 
+                 let next_state = if !connection_finalization.state.is_terminal() {
+                     ConnectionActivationState::ConnectionFinalization {
+diff --git a/crates/ironrdp-connector/src/connection_finalization.rs b/crates/ironrdp-connector/src/connection_finalization.rs
+index 672a149..01b6238 100644
+--- a/crates/ironrdp-connector/src/connection_finalization.rs
++++ b/crates/ironrdp-connector/src/connection_finalization.rs
+@@ -3,7 +3,7 @@ use core::mem;
+ use ironrdp_core::WriteBuf;
+ use ironrdp_pdu::PduHint;
+ use ironrdp_pdu::rdp::capability_sets::SERVER_CHANNEL_ID;
+-use ironrdp_pdu::rdp::headers::ShareDataPdu;
++use ironrdp_pdu::rdp::headers::{ShareDataCtx, ShareDataPdu};
+ use ironrdp_pdu::rdp::{finalization_messages, server_error_info};
+ use tracing::{debug, warn};
+ 
+@@ -93,6 +93,18 @@ impl Sequence for ConnectionFinalizationSequence {
+         input: &[u8],
+         _received_at: Option<MonotonicInstant>,
+         output: &mut WriteBuf,
++    ) -> ConnectorResult<Written> {
++        self.step_with_share_data_decoder(input, _received_at, output, |ctx| Ok(ctx.pdu))
++    }
++}
++
++impl ConnectionFinalizationSequence {
++    pub(crate) fn step_with_share_data_decoder(
++        &mut self,
++        input: &[u8],
++        _received_at: Option<MonotonicInstant>,
++        output: &mut WriteBuf,
++        decode_share_data: impl FnOnce(ShareDataCtx) -> ConnectorResult<ShareDataPdu>,
+     ) -> ConnectorResult<Written> {
+         let (written, next_state) = match mem::take(&mut self.state) {
+             ConnectionFinalizationState::Consumed => {
+@@ -192,9 +204,10 @@ impl Sequence for ConnectionFinalizationSequence {
+                 let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+                 let ctx = ironrdp_pdu::rdp::headers::decode_share_data(ctx).map_err(ConnectorError::decode)?;
+ 
+-                debug!(message = ?ctx.pdu, "Received");
++                let pdu = decode_share_data(ctx)?;
++                debug!(message = ?pdu, "Received");
+ 
+-                let next_state = match ctx.pdu {
++                let next_state = match pdu {
+                     ShareDataPdu::Synchronize(_) => {
+                         debug!("Server Synchronize");
+                         ConnectionFinalizationState::WaitForResponse
+diff --git a/crates/ironrdp-session/src/active_stage.rs b/crates/ironrdp-session/src/active_stage.rs
+index 21d9376..ded77a6 100644
+--- a/crates/ironrdp-session/src/active_stage.rs
++++ b/crates/ironrdp-session/src/active_stage.rs
+@@ -150,6 +150,15 @@ impl ActiveStage {
+         self.fast_path_processor.take_bitmap_recovery_request()
+     }
+ 
++    /// Decodes a Share Data PDU during reactivation using the active connection's
++    /// bulk history, which also covers subsequent graphics and channel traffic.
++    pub fn decode_reactivation_share_data(
++        &mut self,
++        ctx: ironrdp_pdu::rdp::headers::ShareDataCtx,
++    ) -> SessionResult<ShareDataPdu> {
++        x224::Processor::decode_share_data(ctx, &mut self.bulk_decompressor).map(|(pdu, _)| pdu)
++    }
++
+     /// Takes the exact framebuffer regions changed by the most recent processing call.
+     pub fn take_damage_regions(&mut self) -> Vec<InclusiveRectangle> {
+         core::mem::take(&mut self.damage_regions)
+diff --git a/crates/ironrdp-session/src/x224/mod.rs b/crates/ironrdp-session/src/x224/mod.rs
+index 4b50501..83b6b54 100644
+--- a/crates/ironrdp-session/src/x224/mod.rs
++++ b/crates/ironrdp-session/src/x224/mod.rs
+@@ -397,17 +397,17 @@ impl Processor {
+         }
+     }
+ 
+-    fn process_share_data(
++    pub(crate) fn decode_share_data(
+         ctx: ShareDataCtx,
+         bulk_decompressor: &mut Option<BulkCompressor>,
+-    ) -> SessionResult<Vec<ProcessorOutput>> {
++    ) -> SessionResult<(ShareDataPdu, CompressionFlags)> {
+         let ShareDataCtx {
+             compression_flags,
+             compression_type,
+             pdu,
+             ..
+         } = ctx;
+-        let (pdu, compression_flags) = match pdu {
++        Ok(match pdu {
+             ShareDataPdu::Compressed { pdu_type, data } => {
+                 let data = Self::decompress_share_data(data, compression_flags, compression_type, bulk_decompressor)?;
+                 (
+@@ -416,8 +416,15 @@ impl Processor {
+                 )
+             }
+             pdu => (pdu, compression_flags),
+-        };
++        })
++    }
+ 
++    fn process_share_data(
++        ctx: ShareDataCtx,
++        bulk_decompressor: &mut Option<BulkCompressor>,
++    ) -> SessionResult<Vec<ProcessorOutput>> {
++        let compression_type = ctx.compression_type;
++        let (pdu, compression_flags) = Self::decode_share_data(ctx, bulk_decompressor)?;
+         match pdu {
+             ShareDataPdu::SaveSessionInfo(session_info) => {
+                 debug!("Got Session Save Info PDU: {session_info:?}");
