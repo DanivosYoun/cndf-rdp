@@ -15,6 +15,29 @@ final class RDPClientViewLayerTests: XCTestCase {
         XCTAssertTrue(actions?["position"] is NSNull)
     }
 
+    func testFrameLayerUsesNearestOnlyForIntegerMagnification() {
+        let view = RDPClientView(frame: .zero)
+        view.display(testFrame())
+        let scale = view.layer?.contentsScale ?? 1
+
+        // The aspect-fit image is 4×4 backing pixels inside a wider view.
+        view.setFrameSize(CGSize(width: 8 / scale, height: 4 / scale))
+        XCTAssertEqual(view.layer?.magnificationFilter, .nearest)
+        XCTAssertEqual(view.layer?.minificationFilter, .linear)
+
+        view.setFrameSize(CGSize(width: 3 / scale, height: 3 / scale))
+        XCTAssertEqual(view.layer?.magnificationFilter, .linear)
+
+        view.setFrameSize(CGSize(width: 2 / scale, height: 2 / scale))
+        XCTAssertEqual(view.layer?.magnificationFilter, .linear)
+
+        view.setFrameSize(CGSize(width: 4 / scale, height: 4 / scale))
+        view.display(RDPFrame(bgra: Data(repeating: 0xFF, count: 64), width: 4, height: 4, stride: 16))
+        XCTAssertEqual(view.layer?.magnificationFilter, .linear)
+        view.display(testFrame())
+        XCTAssertEqual(view.layer?.magnificationFilter, .nearest)
+    }
+
     func testFrameTapReceivesBGRAPixelBufferOnMainThread() throws {
         let view = RDPClientView(frame: CGRect(x: 0, y: 0, width: 320, height: 200))
         let frame = testFrame()

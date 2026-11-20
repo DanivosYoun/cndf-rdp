@@ -26,6 +26,7 @@ public final class RDPClientView: NSView {
         "contents": NSNull(),
         "contentsGravity": NSNull(),
         "contentsScale": NSNull(),
+        "magnificationFilter": NSNull(),
         "onOrderIn": NSNull(),
         "onOrderOut": NSNull(),
         "position": NSNull(),
@@ -67,6 +68,7 @@ public final class RDPClientView: NSView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        updateFrameLayerScale()
         guard let window else {
             return
         }
@@ -76,6 +78,7 @@ public final class RDPClientView: NSView {
 
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        updateFrameLayerScale()
         scheduleDesktopSize()
         refreshRemoteCursor()
     }
@@ -89,6 +92,7 @@ public final class RDPClientView: NSView {
 
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        updateFrameLayerScale()
         sendForcedDesktopSize()
     }
 
@@ -248,7 +252,9 @@ public final class RDPClientView: NSView {
         remoteFrameSize = frameSize
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer?.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        if frameSizeChanged {
+            updateFrameLayerScale()
+        }
         layer?.contents = image
         CATransaction.commit()
         if let onRenderedFrame, let pixelBuffer = makePixelBuffer(from: frame) {
@@ -364,6 +370,18 @@ public final class RDPClientView: NSView {
         if window.isKeyWindow, visibleRect.contains(mouse) {
             remoteCursor?.set()
         }
+    }
+
+    private func updateFrameLayerScale() {
+        guard let layer else { return }
+        let backingScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        layer.contentsScale = backingScale
+        layer.magnificationFilter = Self.magnificationFilter(for: pointsPerRemotePixel * backingScale)
+    }
+
+    private static func magnificationFilter(for scale: CGFloat) -> CALayerContentsFilter {
+        let integralScale = scale.rounded()
+        return integralScale > 1 && abs(scale - integralScale) <= 0.000_001 ? .nearest : .linear
     }
 
     // Remote view points per remote desktop pixel, as the frame is currently displayed.
