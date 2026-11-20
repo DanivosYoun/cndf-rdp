@@ -1,0 +1,232 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 417052c..6526864 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -29,7 +29,6 @@ use ironrdp_dvc::DvcMessageBatch;
+ use ironrdp_dvc::pdu::SoftSyncTunnelType;
+ use ironrdp_echo::client::EchoClient;
+ use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+-use ironrdp_graphics::image_processing::PixelFormat;
+ use ironrdp_graphics::pointer::DecodedPointer;
+ use ironrdp_pdu::gcc::{ChannelName, ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
+ use ironrdp_pdu::geometry::InclusiveRectangle;
+@@ -1640,6 +1639,22 @@ impl RdpClient {
+                 }
+             };
+ 
++            let size = connection_result.desktop_size;
++            let image = match DecodedImage::try_new_desktop(size.width, size.height) {
++                Ok(image) => image,
++                Err(error) => {
++                    let error = ironrdp_connector::ConnectorError::new(
++                        "prepare desktop framebuffer",
++                        ironrdp_connector::ConnectorErrorKind::General,
++                    )
++                    .with_source(error);
++                    if !self.send_output_event(RdpOutputEvent::ConnectionFailure(error)).await {
++                        self.emit_user_initiated_termination();
++                    }
++                    break;
++                }
++            };
++
+             if !send_connect_time_network_characteristics(
+                 &self.output_event_sender,
+                 connection_result.network_characteristics,
+@@ -1681,6 +1696,7 @@ impl RdpClient {
+             let outcome = active_session(
+                 framed,
+                 connection_result,
++                image,
+                 udp_tunnel,
+                 self.config.rail_initial_execute.clone(),
+                 &self.output_event_sender,
+@@ -4602,7 +4618,12 @@ fn pack_desktop_update(
+     let mut buffer = Vec::new();
+     buffer
+         .try_reserve_exact(pixel_count)
+-        .map_err(|_| ironrdp_session::general_err!("allocate desktop update buffer"))?;
++        .map_err(|_| {
++            ironrdp_session::custom_err!(
++                "allocate desktop update buffer",
++                ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError::Allocation
++            )
++        })?;
+ 
+     let source_width = NonZeroUsize::from(width).get();
+     let left = usize::from(region.left);
+@@ -4644,6 +4665,7 @@ fn pack_desktop_update(
+ async fn active_session(
+     framed: UpgradedFramed,
+     connection_result: ConnectionResult,
++    mut image: DecodedImage,
+     #[cfg(feature = "udp")] mut udp_tunnel: UdpTunnel,
+     #[cfg(not(feature = "udp"))] _udp_tunnel: UdpTunnel,
+     initial_rail_execute: Option<ExecutePdu>,
+@@ -4667,7 +4689,6 @@ async fn active_session(
+     let mut refresh_rect_support = connection_result.refresh_rect_support;
+     let mut suppress_output_support = connection_result.suppress_output_support;
+     let window_support_level = connection_result.window_support_level;
+-    let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+     let mut desktop_update_extent = None;
+ 
+     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
+@@ -5889,7 +5910,7 @@ async fn active_session(
+                         } = connection_activation.connection_activation_state()
+                         {
+                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
+-                            image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
++                            image = DecodedImage::try_new_desktop(desktop_size.width, desktop_size.height)?;
+                             desktop_update_extent = None;
+                             resize_queue.completed();
+                             if !active_stage.reactivate(
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index 173596a..f5d510f 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -958,7 +958,8 @@ impl GraphicsPipelineClient {
+     }
+ 
+     fn handle_reset_graphics(&mut self, width: u32, height: u32) -> PduResult<()> {
+-        let output_size = Compositor::materializable_output_size(width, height);
++        let dimensions = ironrdp_pdu::desktop_framebuffer::desktop_pixel_count(width, height);
++        let output_size = dimensions.ok().and_then(|_| Compositor::materializable_output_size(width, height));
+ 
+         // Per spec, ResetGraphics implicitly destroys all surfaces
+         self.surfaces.clear();
+@@ -993,6 +994,9 @@ impl GraphicsPipelineClient {
+             Ok(())
+         } else {
+             self.handler.on_reset_graphics_rejected(width, height);
++            if let Err(error) = dimensions {
++                return Err(pdu_other_err!("reset graphics desktop dimensions", source: error));
++            }
+             Err(pdu_other_err!(
+                 "reset graphics output dimensions exceed compositor limits"
+             ))
+@@ -2788,12 +2792,12 @@ mod tests {
+         let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+         client
+             .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+-                width: 19_200,
++                width: 8192,
+                 height: 1080,
+                 monitors: vec![],
+             }))
+             .expect("wide multimon output fits compositor limits");
+-        assert_eq!(client.take_output_reset(), Some((19_200, 1080)));
++        assert_eq!(client.take_output_reset(), Some((8192, 1080)));
+         assert_eq!(client.take_output_reset(), None);
+         client
+             .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+diff --git a/crates/ironrdp-pdu/src/desktop_framebuffer.rs b/crates/ironrdp-pdu/src/desktop_framebuffer.rs
+new file mode 100644
+index 0000000..3f7851d
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/desktop_framebuffer.rs
+@@ -0,0 +1,32 @@
++use core::fmt;
++
++pub const MAX_DESKTOP_EDGE: u32 = 8192;
++pub const MAX_DESKTOP_PIXELS: u32 = 67_108_864;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum DesktopFramebufferError {
++    Dimensions,
++    Allocation,
++}
++
++impl fmt::Display for DesktopFramebufferError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Dimensions => f.write_str("desktop dimensions exceed framebuffer limits"),
++            Self::Allocation => f.write_str("desktop framebuffer allocation failed"),
++        }
++    }
++}
++
++impl core::error::Error for DesktopFramebufferError {}
++
++pub fn desktop_pixel_count(width: u32, height: u32) -> Result<u32, DesktopFramebufferError> {
++    if !(1..=MAX_DESKTOP_EDGE).contains(&width) || !(1..=MAX_DESKTOP_EDGE).contains(&height) {
++        return Err(DesktopFramebufferError::Dimensions);
++    }
++    let pixels = width * height;
++    if pixels > MAX_DESKTOP_PIXELS {
++        return Err(DesktopFramebufferError::Dimensions);
++    }
++    Ok(pixels)
++}
+diff --git a/crates/ironrdp-pdu/src/lib.rs b/crates/ironrdp-pdu/src/lib.rs
+index b8a50c3..e2d1e6e 100644
+--- a/crates/ironrdp-pdu/src/lib.rs
++++ b/crates/ironrdp-pdu/src/lib.rs
+@@ -11,6 +11,7 @@ use ironrdp_error::Source;
+ mod macros;
+ 
+ pub mod codecs;
++pub mod desktop_framebuffer;
+ pub mod gcc;
+ pub mod geometry;
+ pub mod input;
+diff --git a/crates/ironrdp-session/src/image.rs b/crates/ironrdp-session/src/image.rs
+index 5e7b66f..e9b9a7b 100644
+--- a/crates/ironrdp-session/src/image.rs
++++ b/crates/ironrdp-session/src/image.rs
+@@ -5,6 +5,7 @@ use ironrdp_graphics::color_conversion::{rdp_15bit_to_rgb, rdp_16bit_to_rgb};
+ use ironrdp_graphics::image_processing::{ImageRegion, ImageRegionMut, PixelFormat};
+ use ironrdp_graphics::pointer::DecodedPointer;
+ use ironrdp_graphics::rectangle_processing::Region;
++use ironrdp_pdu::desktop_framebuffer::{DesktopFramebufferError, desktop_pixel_count};
+ use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
+ use tracing::{debug, trace};
+ 
+@@ -146,9 +147,26 @@ impl DecodedImage {
+     pub fn new(pixel_format: PixelFormat, width: u16, height: u16) -> Self {
+         let len = usize::from(width) * usize::from(height) * usize::from(pixel_format.bytes_per_pixel());
+ 
++        Self::from_data(pixel_format, width, height, vec![0; len])
++    }
++
++    /// Allocate the RDP client desktop only after checking the negotiated dimensions.
++    pub fn try_new_desktop(width: u16, height: u16) -> SessionResult<Self> {
++        let pixel_format = PixelFormat::RgbA32;
++        let pixels = desktop_pixel_count(width.into(), height.into())
++            .map_err(|error| SessionError::custom("validate desktop framebuffer", error))?;
++        let len = usize::try_from(pixels).expect("bounded desktop pixel count") * 4;
++        let mut data = Vec::new();
++        data.try_reserve_exact(len)
++            .map_err(|_| SessionError::custom("allocate desktop framebuffer", DesktopFramebufferError::Allocation))?;
++        data.resize(len, 0);
++        Ok(Self::from_data(pixel_format, width, height, data))
++    }
++
++    fn from_data(pixel_format: PixelFormat, width: u16, height: u16, data: Vec<u8>) -> Self {
+         Self {
+             pixel_format,
+-            data: vec![0; len],
++            data,
+             width,
+             height,
+ 
+@@ -202,14 +220,15 @@ impl DecodedImage {
+ 
+     #[cfg_attr(feature = "__test", visibility::make(pub))]
+     pub(crate) fn reset_preserving_pointer(&mut self, width: u16, height: u16) -> SessionResult<()> {
+-        let len = usize::from(width)
+-            .checked_mul(usize::from(height))
+-            .and_then(|pixels| pixels.checked_mul(usize::from(self.pixel_format.bytes_per_pixel())))
+-            .ok_or_else(|| SessionError::general("reset graphics framebuffer dimensions overflow"))?;
++        let pixels = desktop_pixel_count(width.into(), height.into())
++            .map_err(|error| SessionError::custom("validate reset graphics framebuffer", error))?;
++        let len = usize::try_from(pixels).expect("bounded desktop pixel count") * self.bytes_per_pixel();
+         let additional = len.saturating_sub(self.data.len());
+         self.data
+             .try_reserve_exact(additional)
+-            .map_err(|error| SessionError::custom("allocate reset graphics framebuffer", error))?;
++            .map_err(|_| {
++                SessionError::custom("allocate reset graphics framebuffer", DesktopFramebufferError::Allocation)
++            })?;
+         // `clear` drops the length (keeping capacity) so the following `resize` zero-fills the
+         // whole buffer in one pass, instead of zero-filling the grown tail and then the entire
+         // buffer again.

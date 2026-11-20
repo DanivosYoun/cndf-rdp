@@ -1,6 +1,7 @@
 use crate::CNDFIronFailureKind::{self, *};
 use crate::CNDFIronStage::{self, *};
 use ironrdp_connector::{sspi::ErrorKind, ConnectorError, ConnectorErrorKind};
+use ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError;
 use std::error::Error;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,6 +25,30 @@ pub(super) const CONFIGURATION: Failure = Failure(
     "Invalid IronRDP connection configuration",
 );
 
+pub(super) fn framebuffer_failure(error: DesktopFramebufferError, stage: CNDFIronStage) -> Failure {
+    let (code, message) = match error {
+        DesktopFramebufferError::Dimensions => (
+            0x49520008,
+            "Server desktop exceeds IronRDP framebuffer limits (8192 per edge, 67108864 pixels)",
+        ),
+        DesktopFramebufferError::Allocation => {
+            (0x49520009, "IronRDP framebuffer allocation failed")
+        }
+    };
+    Failure(CNDF_IRON_FAILURE_ENGINE, code, stage, message)
+}
+
+pub(super) fn framebuffer_cause(
+    mut error: &(dyn Error + 'static),
+) -> Option<DesktopFramebufferError> {
+    loop {
+        if let Some(error) = error.downcast_ref::<DesktopFramebufferError>() {
+            return Some(*error);
+        }
+        error = error.source()?;
+    }
+}
+
 fn logon_denied(status: Option<u32>, kind: ErrorKind) -> bool {
     match status {
         Some(status) => matches!(
@@ -45,6 +70,9 @@ pub(super) fn classify(error: &ConnectorError, rejected: bool) -> Failure {
             CNDF_IRON_STAGE_NEGOTIATION,
             "Certificate rejected",
         );
+    }
+    if let Some(error) = framebuffer_cause(error) {
+        return framebuffer_failure(error, CNDF_IRON_STAGE_CAPABILITIES);
     }
     let auth = match error.kind() {
         ConnectorErrorKind::AccessDenied => true,

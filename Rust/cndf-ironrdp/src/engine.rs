@@ -299,18 +299,22 @@ fn deliver(connection: &Connection, mut updates: async_channel::Receiver<Output>
                     frame.publish(connection, false);
                     batch = Instant::now();
                 }
-                let bytes = frame.compose(&update);
+                let bytes = match frame.compose(&update) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        connection.stop.store(true, Ordering::Release);
+                        report_active_framebuffer_failure(connection, error);
+                        return;
+                    }
+                };
                 let mut statistics = lock(&connection.statistics);
                 statistics.updates_received += 1;
                 statistics.dirty_bytes_composed += bytes;
             }
             other => match other {
-                Output::Failure(Failure(kind, code, stage, message)) => {
+                Output::Failure(failure) => {
                     frame.publish(connection, false);
-                    connection.connected.store(false, Ordering::Release);
-                    connection
-                        .callbacks
-                        .failure(connection.generation, kind, code, stage, message);
+                    report_failure(connection, failure);
                 }
                 Output::Rdp(event) => {
                     if matches!(event, RdpOutputEvent::Terminated(_)) {
@@ -330,6 +334,36 @@ fn deliver(connection: &Connection, mut updates: async_channel::Receiver<Output>
     connection.connected.store(false, Ordering::Release);
 }
 
+fn report_failure(connection: &Connection, Failure(kind, code, stage, message): Failure) {
+    connection.connected.store(false, Ordering::Release);
+    connection
+        .callbacks
+        .failure(connection.generation, kind, code, stage, message);
+}
+
+fn report_disconnect(connection: &Connection, kind: CNDFIronDisconnectKind, code: u32) {
+    connection.connected.store(false, Ordering::Release);
+    connection.callbacks.invoke(|table| {
+        if let Some(callback) = table.disconnect {
+            callback(connection.generation, kind, code, table.context);
+        }
+    });
+}
+
+fn report_active_framebuffer_failure(
+    connection: &Connection,
+    error: ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError,
+) {
+    let failure = errors::framebuffer_failure(error, CNDFIronStage::CNDF_IRON_STAGE_ACTIVE);
+    let code = failure.1;
+    report_failure(connection, failure);
+    report_disconnect(
+        connection,
+        CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_ERROR,
+        code,
+    );
+}
+
 fn deliver_event(connection: &Connection, event: RdpOutputEvent) {
     use CNDFIronDisconnectKind::*;
     use CNDFIronPointerKind::*;
@@ -344,7 +378,12 @@ fn deliver_event(connection: &Connection, event: RdpOutputEvent) {
             });
         }
         RdpOutputEvent::Terminated(result) => {
-            connection.connected.store(false, Ordering::Release);
+            if let Err(error) = &result {
+                if let Some(error) = errors::framebuffer_cause(error) {
+                    report_active_framebuffer_failure(connection, error);
+                    return;
+                }
+            }
             let kind = if connection.stop.load(Ordering::Acquire) {
                 CNDF_IRON_DISCONNECT_LOCAL_REQUEST
             } else if result.is_ok() {
@@ -352,11 +391,7 @@ fn deliver_event(connection: &Connection, event: RdpOutputEvent) {
             } else {
                 CNDF_IRON_DISCONNECT_ERROR
             };
-            connection.callbacks.invoke(|table| {
-                if let Some(callback) = table.disconnect {
-                    callback(generation, kind, 0, table.context);
-                }
-            });
+            report_disconnect(connection, kind, 0);
         }
         RdpOutputEvent::PointerDefault | RdpOutputEvent::PointerHidden => {
             let kind = if matches!(event, RdpOutputEvent::PointerHidden) {
