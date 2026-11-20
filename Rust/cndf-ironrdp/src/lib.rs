@@ -277,7 +277,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=3\0"
+            " ironrdp=15b4a03ff552 patches=4\0"
         );
         version.as_ptr().cast()
     })
@@ -309,7 +309,14 @@ unsafe fn text(pointer: *const c_char) -> Option<String> {
         .flatten()
 }
 
+#[cfg(feature = "engine")]
 fn dimensions(width: u32, height: u32) -> bool {
+    ironrdp_pdu::desktop_framebuffer::desktop_pixel_count(width, height).is_ok()
+}
+
+#[cfg(not(feature = "engine"))]
+fn dimensions(width: u32, height: u32) -> bool {
+    // Stub-only builds have no IronRDP dependency and mirror the engine limits.
     (1..=8192).contains(&width) && (1..=8192).contains(&height)
 }
 
