@@ -1,6 +1,19 @@
 #![allow(non_camel_case_types)]
 
 mod abi;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
+mod engine;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
+mod errors;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
+mod frame;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
+mod input;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
+use engine::start_workers;
+
+#[cfg(not(any(feature = "engine", feature = "stub")))]
+compile_error!("Enable engine or stub");
 #[cfg(feature = "stub")]
 mod stub;
 
@@ -10,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -20,8 +33,33 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+thread_local! {
+    static CNDF_PANIC_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn catch_worker<T>(operation: impl FnOnce() -> T) -> std::thread::Result<T> {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !CNDF_PANIC_SCOPE
+                .try_with(std::cell::Cell::get)
+                .unwrap_or(false)
+            {
+                previous(info);
+            }
+        }));
+    });
+    CNDF_PANIC_SCOPE.with(|scope| {
+        let old = scope.replace(true);
+        let result = catch_unwind(AssertUnwindSafe(operation));
+        scope.set(old);
+        result
+    })
+}
+
 fn ffi<T>(fallback: T, operation: impl FnOnce() -> T) -> T {
-    catch_unwind(AssertUnwindSafe(operation)).unwrap_or(fallback)
+    catch_worker(operation).unwrap_or(fallback)
 }
 
 struct Callbacks {
@@ -71,13 +109,15 @@ struct Connection {
     generation: u64,
     connected: AtomicBool,
     stop: AtomicBool,
+    #[cfg(not(feature = "stub"))]
+    input: Mutex<Option<ironrdp_client::rdp::RdpInputSender>>,
     callbacks: Arc<Callbacks>,
     statistics: Arc<Mutex<CNDFIronStatistics>>,
 }
 
 impl Connection {
     fn worker(&self, operation: impl FnOnce()) {
-        if catch_unwind(AssertUnwindSafe(operation)).is_err() {
+        if catch_worker(operation).is_err() {
             self.connected.store(false, Ordering::Release);
             self.stop.store(true, Ordering::Release);
             self.callbacks.failure(
@@ -108,8 +148,10 @@ struct Options {
 
 #[cfg_attr(feature = "stub", allow(dead_code))]
 enum Command {
-    Input(Vec<CNDFIronInputEvent>, Instant),
-    Resize(u32, u32, u32),
+    #[cfg(feature = "stub")]
+    Input(Vec<CNDFIronInputEvent>),
+    #[cfg(feature = "stub")]
+    Resize(u32, u32),
     Redeliver,
 }
 
@@ -132,6 +174,54 @@ pub struct CNDFIronSession {
 }
 
 impl CNDFIronSession {
+    #[cfg(not(feature = "stub"))]
+    fn send_input(
+        &self,
+        generation: u64,
+        events: &[CNDFIronInputEvent],
+        timeout: Duration,
+    ) -> CNDFIronStatus {
+        use tokio::sync::mpsc::error::TrySendError;
+        let deadline = Instant::now() + timeout;
+        let connection = {
+            let state = lock(&self.state);
+            let Some(run) = state.run.as_ref() else {
+                return CNDF_IRON_NOT_CONNECTED;
+            };
+            Arc::clone(&run.connection)
+        };
+        let Some(mut input_event) = input::convert(events) else {
+            return CNDF_IRON_INVALID_ARGUMENT;
+        };
+        loop {
+            if self.callbacks.closed.load(Ordering::Acquire) {
+                return CNDF_IRON_CLOSED;
+            }
+            if connection.generation != generation
+                || connection.stop.load(Ordering::Acquire)
+                || !connection.connected.load(Ordering::Acquire)
+            {
+                return CNDF_IRON_NOT_CONNECTED;
+            }
+            let Some(input) = lock(&connection.input).clone() else {
+                return CNDF_IRON_NOT_CONNECTED;
+            };
+            match input.try_send(input_event) {
+                Ok(()) => {
+                    lock(&self.statistics).input_events_sent += events.len() as u64;
+                    return CNDF_IRON_OK;
+                }
+                Err(TrySendError::Closed(_)) => return CNDF_IRON_NOT_CONNECTED,
+                Err(TrySendError::Full(pending)) => input_event = pending,
+            }
+            if Instant::now() >= deadline {
+                lock(&self.statistics).input_busy += 1;
+                return CNDF_IRON_BUSY;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn send(&self, generation: u64, mut command: Command, timeout: Duration) -> CNDFIronStatus {
         let deadline = Instant::now() + timeout;
         let (connection, commands) = {
@@ -157,6 +247,7 @@ impl CNDFIronSession {
                 Err(TrySendError::Full(pending)) => command = pending,
             }
             if Instant::now() >= deadline {
+                #[cfg(feature = "stub")]
                 if matches!(command, Command::Input(..)) {
                     lock(&self.statistics).input_busy += 1;
                 }
@@ -172,16 +263,23 @@ pub extern "C" fn cndf_iron_abi_version() -> u32 {
     ffi(0, || CNDF_IRON_ABI_VERSION)
 }
 
+/// Returns a static string with the crate version, upstream SHA and patch count.
 #[no_mangle]
 pub extern "C" fn cndf_iron_version() -> *const c_char {
     ffi(ptr::null(), || {
-        concat!(
+        #[cfg(feature = "stub")]
+        let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
             " ironrdp=15b4a03ff552 patches=0\0"
-        )
-        .as_ptr()
-        .cast()
+        );
+        #[cfg(not(feature = "stub"))]
+        let version = concat!(
+            "cndf-ironrdp ",
+            env!("CARGO_PKG_VERSION"),
+            " ironrdp=15b4a03ff552 patches=1\0"
+        );
+        version.as_ptr().cast()
     })
 }
 
@@ -215,6 +313,7 @@ fn dimensions(width: u32, height: u32) -> bool {
     (1..=8192).contains(&width) && (1..=8192).contains(&height)
 }
 
+/// Starts an asynchronous connection. The password is read during this call and the bridge copy is zeroized.
 #[no_mangle]
 pub unsafe extern "C" fn cndf_iron_connect(
     session: *mut CNDFIronSession,
@@ -233,6 +332,9 @@ pub unsafe extern "C" fn cndf_iron_connect(
             || (password_utf8.is_null() && password_length != 0)
             || password_length > isize::MAX as usize
         {
+            return CNDF_IRON_INVALID_ARGUMENT;
+        }
+        if ptr::addr_of!((*options).log_level).cast::<u32>().read() > 6 {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
         let options = &*options;
@@ -291,6 +393,8 @@ pub unsafe extern "C" fn cndf_iron_connect(
             generation,
             connected: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            #[cfg(not(feature = "stub"))]
+            input: Mutex::default(),
             callbacks: Arc::clone(&session.callbacks),
             statistics: Arc::clone(&session.statistics),
         });
@@ -328,17 +432,24 @@ pub unsafe extern "C" fn cndf_iron_send_input(
         {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
+        for index in 0..count {
+            let event = events.add(index);
+            if ptr::addr_of!((*event).kind).cast::<u32>().read() > 4
+                || ptr::addr_of!((*event).button).cast::<u32>().read() > 2
+            {
+                return CNDF_IRON_INVALID_ARGUMENT;
+            }
+        }
         let events = if count == 0 {
-            Vec::new()
+            &[]
         } else {
-            std::slice::from_raw_parts(events, count).to_vec()
+            std::slice::from_raw_parts(events, count)
         };
         let timeout = Duration::from_millis(timeout_ms.into());
-        session.send(
-            generation,
-            Command::Input(events, Instant::now() + timeout),
-            timeout,
-        )
+        #[cfg(feature = "stub")]
+        return session.send(generation, Command::Input(events.to_vec()), timeout);
+        #[cfg(not(feature = "stub"))]
+        return session.send_input(generation, events, timeout);
     })
 }
 
@@ -357,14 +468,21 @@ pub unsafe extern "C" fn cndf_iron_resize(
         if !dimensions(width, height) || scale_percent == 0 {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
-        session.send(
-            generation,
-            Command::Resize(width, height, scale_percent),
-            Duration::ZERO,
-        )
+        #[cfg(feature = "stub")]
+        return session.send(generation, Command::Resize(width, height), Duration::ZERO);
+        #[cfg(not(feature = "stub"))]
+        {
+            // This upstream revision reconnects on Display Control failure.
+            if cndf_iron_is_connected(session, generation) {
+                CNDF_IRON_INTERNAL
+            } else {
+                CNDF_IRON_NOT_CONNECTED
+            }
+        }
     })
 }
 
+/// Re-delivers the current framebuffer with a full dirty rectangle and no server round trip.
 #[no_mangle]
 pub unsafe extern "C" fn cndf_iron_redeliver_frame(
     session: *mut CNDFIronSession,
@@ -409,6 +527,7 @@ pub unsafe extern "C" fn cndf_iron_get_statistics(
     })
 }
 
+/// Requests orderly shutdown and returns immediately.
 #[no_mangle]
 pub unsafe extern "C" fn cndf_iron_disconnect(session: *mut CNDFIronSession) -> CNDFIronStatus {
     ffi(CNDF_IRON_INTERNAL, || {
@@ -422,6 +541,9 @@ pub unsafe extern "C" fn cndf_iron_disconnect(session: *mut CNDFIronSession) -> 
     })
 }
 
+/// Closes the callback gate and waits up to the join deadline for worker exit.
+/// If a worker outlives that deadline the closed session is retained. Finish pending
+/// certificate callbacks before calling destroy, and keep the context alive until it returns.
 #[no_mangle]
 pub unsafe extern "C" fn cndf_iron_session_destroy(
     session: *mut CNDFIronSession,
@@ -457,3 +579,85 @@ pub unsafe extern "C" fn cndf_iron_session_destroy(
 
 #[cfg(feature = "stub")]
 use stub::start_workers;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct Probe {
+        failures: AtomicUsize,
+    }
+
+    extern "C" fn failure(
+        generation: u64,
+        kind: CNDFIronFailureKind,
+        code: u32,
+        _: CNDFIronStage,
+        _: *const u8,
+        _: usize,
+        context: *mut c_void,
+    ) {
+        if generation == 1
+            && kind == CNDFIronFailureKind::CNDF_IRON_FAILURE_ENGINE
+            && code == 0x49520001
+        {
+            let probe = unsafe { &*context.cast::<Probe>() };
+            probe.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn isolates_worker_panic_and_closes_callback_gate_at_destroy() {
+        let mut probe = Probe::default();
+        let table = CNDFIronCallbacks {
+            log: None,
+            certificate_trust: None,
+            connected: None,
+            failure: Some(failure),
+            disconnect: None,
+            frame: None,
+            pointer: None,
+            context: (&mut probe as *mut Probe).cast(),
+        };
+        let session = unsafe { cndf_iron_session_create(&table) };
+        let owner = unsafe { &*session };
+        let release = Arc::new(AtomicBool::new(false));
+        let connection = Arc::new(Connection {
+            generation: 1,
+            connected: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            #[cfg(not(feature = "stub"))]
+            input: Mutex::default(),
+            callbacks: Arc::clone(&owner.callbacks),
+            statistics: Arc::clone(&owner.statistics),
+        });
+        let worker = Arc::clone(&connection);
+        let wait = Arc::clone(&release);
+        let (done, observed) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            worker.worker(|| panic!("synthetic private panic payload"));
+            done.send(()).unwrap();
+            while !wait.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            worker.worker(|| panic!("synthetic private panic payload after destroy"));
+        });
+        let (commands, _) = mpsc::sync_channel(128);
+        lock(&owner.state).run = Some(Run {
+            connection,
+            commands,
+            threads: vec![thread],
+        });
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(probe.failures.load(Ordering::Relaxed), 1);
+        assert!(!unsafe { cndf_iron_is_connected(session, 1) });
+        unsafe { cndf_iron_session_destroy(session, 0) };
+        release.store(true, Ordering::Release);
+        // The first destroy intentionally retained this test handle because the worker was alive.
+        unsafe { cndf_iron_session_destroy(session, 2000) };
+        assert_eq!(probe.failures.load(Ordering::Relaxed), 1);
+    }
+}

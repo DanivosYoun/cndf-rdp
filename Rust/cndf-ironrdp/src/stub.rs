@@ -97,14 +97,14 @@ fn run(
     let _ = output.send(Output::Frame(width, height, marker, true));
     while !connection.stop.load(Ordering::Acquire) {
         match commands.recv_timeout(Duration::from_millis(5)) {
-            Ok(Command::Input(events, _)) => {
+            Ok(Command::Input(events)) => {
                 lock(&connection.statistics).input_events_sent += events.len() as u64;
                 for event in events {
                     marker = marker.wrapping_add(1).wrapping_add(event.code as u8);
                 }
                 let _ = output.send(Output::Frame(width, height, marker, true));
             }
-            Ok(Command::Resize(w, h, _)) => {
+            Ok(Command::Resize(w, h)) => {
                 (width, height) = (w, h);
                 let _ = output.send(Output::Frame(width, height, marker, true));
             }

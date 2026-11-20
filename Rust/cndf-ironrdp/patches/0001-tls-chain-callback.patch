@@ -1,0 +1,252 @@
+diff --git a/crates/ironrdp-client/src/config.rs b/crates/ironrdp-client/src/config.rs
+index 353053e..370e762 100644
+--- a/crates/ironrdp-client/src/config.rs
++++ b/crates/ironrdp-client/src/config.rs
+@@ -104,6 +104,8 @@ pub struct Config {
+     pub(crate) udp_offer_version: UdpVersion,
+     pub(crate) certificate_validation: ironrdp_tls::CertificateValidation,
+     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
++    #[cfg(feature = "rustls")]
++    pub(crate) certificate_chain_validation_callback: Option<ironrdp_tls::CertificateChainValidationCallback>,
+     #[cfg(feature = "entra-auth")]
+     pub(crate) entra_auth: Option<Arc<crate::entra::EntraAuthSession>>,
+     #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+@@ -981,6 +983,8 @@ pub struct ConfigBuilder {
+     enable_credssp: Option<bool>,
+     certificate_validation: Option<ironrdp_tls::CertificateValidation>,
+     certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
++    #[cfg(feature = "rustls")]
++    certificate_chain_validation_callback: Option<ironrdp_tls::CertificateChainValidationCallback>,
+     keyboard_type: Option<ironrdp_pdu::gcc::KeyboardType>,
+     keyboard_subtype: Option<u32>,
+     keyboard_functional_keys_count: Option<u32>,
+@@ -1500,6 +1504,17 @@ impl ConfigBuilder {
+         self
+     }
+ 
++    /// Uses a complete peer chain when strict certificate validation declines it.
++    #[cfg(feature = "rustls")]
++    pub fn with_certificate_chain_validation_callback(
++        mut self,
++        callback: ironrdp_tls::CertificateChainValidationCallback,
++    ) -> Self {
++        self.certificate_chain_validation_callback = Some(callback);
++        self
++    }
++
++
+     #[must_use]
+     pub fn with_server_pointer(mut self, enabled: bool) -> Self {
+         self.enable_server_pointer = Some(enabled);
+@@ -2338,6 +2353,14 @@ impl ConfigBuilder {
+     // `mut` is only required when the vmconnect default-port path mutates destination/properties.
+     #[cfg_attr(not(any(feature = "vmconnect", feature = "gateway")), expect(unused_mut))]
+     pub fn build(mut self) -> anyhow::Result<Config> {
++        #[cfg(feature = "rustls")]
++        if self.certificate_chain_validation_callback.is_some() {
++            anyhow::ensure!(
++                self.certificate_validation == Some(ironrdp_tls::CertificateValidation::Strict)
++                    && self.certificate_validation_callback.is_none(),
++                "certificate chain validation requires strict policy and a single callback",
++            );
++        }
+         use ironrdp_pdu::rdp::capability_sets::client_codecs_capabilities;
+         use ironrdp_pdu::rdp::client_info::TimezoneInfo;
+ 
+@@ -2797,6 +2820,8 @@ impl ConfigBuilder {
+             udp_offer_version: self.udp_offer_version.unwrap_or(UdpVersion::V3),
+             certificate_validation,
+             certificate_validation_callback: self.certificate_validation_callback,
++            #[cfg(feature = "rustls")]
++            certificate_chain_validation_callback: self.certificate_chain_validation_callback,
+             #[cfg(feature = "entra-auth")]
+             entra_auth: self.entra_auth,
+             #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 0f0be06..f8cba0b 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -3776,7 +3776,27 @@ where
+     // The UDP transport presents the same server certificate, so it is validated the same way.
+     let callback =
+         redirection_certificate_callback(config).or_else(|| config.certificate_validation_callback().cloned());
+-    let tls_upgrade = if let Some(callback) = callback.clone() {
++    #[cfg(feature = "rustls")]
++    let chain_callback = config.certificate_chain_validation_callback.clone();
++    #[cfg(not(feature = "rustls"))]
++    let chain_callback: Option<ironrdp_tls::CertificateChainValidationCallback> = None;
++    let tls_upgrade = if let Some(chain_callback) = chain_callback {
++        #[cfg(feature = "rustls")]
++        {
++            ironrdp_tls::upgrade_with_certificate_chain_validation_callback(
++                initial_stream,
++                config.destination.name(),
++                &config.destination.to_string(),
++                chain_callback,
++            )
++            .await
++        }
++        #[cfg(not(feature = "rustls"))]
++        {
++            let _ = chain_callback;
++            unreachable!()
++        }
++    } else if let Some(callback) = callback.clone() {
+         ironrdp_tls::upgrade_with_certificate_validation_callback_for_endpoint(
+             initial_stream,
+             config.destination.name(),
+diff --git a/crates/ironrdp-tls/src/lib.rs b/crates/ironrdp-tls/src/lib.rs
+index f0dfba4..ec8bc95 100644
+--- a/crates/ironrdp-tls/src/lib.rs
++++ b/crates/ironrdp-tls/src/lib.rs
+@@ -46,6 +46,12 @@ pub use impl_::{
+ #[cfg(feature = "rustls-verifier")]
+ pub use rustls_verifier::rustls_client_config;
+ 
++#[cfg(feature = "rustls-no-provider")]
++pub use impl_::upgrade_with_certificate_chain_validation_callback;
++
++/// Receives the peer's DER chain (leaf first), endpoint and a validation error category.
++pub type CertificateChainValidationCallback = Arc<dyn Fn(&[&[u8]], &str, &str) -> bool + Send + Sync>;
++
+ /// Called when the Rustls backend cannot validate a server certificate.
+ ///
+ /// The callback receives the leaf certificate's DER encoding, the configured endpoint,
+diff --git a/crates/ironrdp-tls/src/rustls.rs b/crates/ironrdp-tls/src/rustls.rs
+index cd62648..3bea63a 100644
+--- a/crates/ironrdp-tls/src/rustls.rs
++++ b/crates/ironrdp-tls/src/rustls.rs
+@@ -4,7 +4,7 @@ use std::sync::Arc;
+ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+ use tokio_rustls::rustls::pki_types::ServerName;
+ 
+-use crate::{CertificateValidation, CertificateValidationCallback};
++use crate::{CertificateChainValidationCallback, CertificateValidation, CertificateValidationCallback};
+ 
+ pub type TlsStream<S> = tokio_rustls::client::TlsStream<S>;
+ 
+@@ -82,6 +82,31 @@ where
+     S: Unpin + AsyncRead + AsyncWrite,
+ {
+     let config = crate::rustls_client_config(CertificateValidation::Strict, endpoint, Some(callback))?;
++    upgrade_with_config(stream, server_name, config).await
++}
++
++/// Strict rustls upgrade with a complete certificate-chain callback.
++pub async fn upgrade_with_certificate_chain_validation_callback<S>(
++    stream: S,
++    server_name: &str,
++    endpoint: &str,
++    callback: CertificateChainValidationCallback,
++) -> io::Result<(TlsStream<S>, x509_cert::Certificate)>
++where
++    S: Unpin + AsyncRead + AsyncWrite,
++{
++    let config = crate::rustls_verifier::rustls_chain_client_config(endpoint, callback)?;
++    upgrade_with_config(stream, server_name, config).await
++}
++
++async fn upgrade_with_config<S>(
++    stream: S,
++    server_name: &str,
++    config: tokio_rustls::rustls::ClientConfig,
++) -> io::Result<(TlsStream<S>, x509_cert::Certificate)>
++where
++    S: Unpin + AsyncRead + AsyncWrite,
++{
+     let domain = ServerName::try_from(server_name.to_owned()).map_err(io::Error::other)?;
+     let mut tls_stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+         .connect(domain, stream)
+diff --git a/crates/ironrdp-tls/src/rustls_verifier.rs b/crates/ironrdp-tls/src/rustls_verifier.rs
+index 3bbec97..eaa2c96 100644
+--- a/crates/ironrdp-tls/src/rustls_verifier.rs
++++ b/crates/ironrdp-tls/src/rustls_verifier.rs
+@@ -5,7 +5,7 @@ use tokio_rustls::rustls;
+ use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+ use tokio_rustls::rustls::pki_types::ServerName;
+ 
+-use crate::{CertificateValidation, CertificateValidationCallback};
++use crate::{CertificateChainValidationCallback, CertificateValidation, CertificateValidationCallback};
+ 
+ /// Builds the rustls client configuration used by an RDP transport.
+ ///
+@@ -20,7 +20,7 @@ pub fn rustls_client_config(
+     endpoint: &str,
+     callback: Option<CertificateValidationCallback>,
+ ) -> io::Result<rustls::ClientConfig> {
+-    let verifier = server_cert_verifier(certificate_validation, endpoint, callback)?;
++    let verifier = server_cert_verifier(certificate_validation, endpoint, callback.map(Callback::Leaf))?;
+     let mut config = rustls::ClientConfig::builder()
+         .dangerous()
+         .with_custom_certificate_verifier(verifier)
+@@ -30,10 +30,28 @@ pub fn rustls_client_config(
+     Ok(config)
+ }
+ 
++pub(crate) fn rustls_chain_client_config(
++    endpoint: &str,
++    callback: CertificateChainValidationCallback,
++) -> io::Result<rustls::ClientConfig> {
++    let verifier = server_cert_verifier(CertificateValidation::Strict, endpoint, Some(Callback::Chain(callback)))?;
++    let mut config = rustls::ClientConfig::builder()
++        .dangerous()
++        .with_custom_certificate_verifier(verifier)
++        .with_no_client_auth();
++    config.resumption = rustls::client::Resumption::disabled();
++    Ok(config)
++}
++
++enum Callback {
++    Leaf(CertificateValidationCallback),
++    Chain(CertificateChainValidationCallback),
++}
++
+ fn server_cert_verifier(
+     certificate_validation: CertificateValidation,
+     endpoint: &str,
+-    callback: Option<CertificateValidationCallback>,
++    callback: Option<Callback>,
+ ) -> io::Result<Arc<dyn ServerCertVerifier>> {
+     if callback.is_some() && certificate_validation != CertificateValidation::Strict {
+         return Err(io::Error::new(
+@@ -77,7 +95,7 @@ fn platform_root_certificates() -> io::Result<rustls::RootCertStore> {
+ struct CallbackVerifier {
+     verifier: Arc<dyn ServerCertVerifier>,
+     endpoint: String,
+-    callback: CertificateValidationCallback,
++    callback: Callback,
+ }
+ 
+ impl core::fmt::Debug for CallbackVerifier {
+@@ -100,10 +118,28 @@ impl ServerCertVerifier for CallbackVerifier {
+             .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+         {
+             Ok(verified) => Ok(verified),
+-            Err(error) if (self.callback)(end_entity.as_ref(), &self.endpoint, &error.to_string()) => {
+-                Ok(ServerCertVerified::assertion())
++            Err(error) => {
++                let accepted = match &self.callback {
++                    Callback::Leaf(callback) => callback(end_entity.as_ref(), &self.endpoint, &error.to_string()),
++                    Callback::Chain(callback) => {
++                        use rustls::CertificateError;
++                        let reason = match &error {
++                            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer) => "untrusted",
++                            rustls::Error::InvalidCertificate(
++                                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
++                            ) => "name",
++                            rustls::Error::InvalidCertificate(
++                                CertificateError::Expired | CertificateError::ExpiredContext { .. }
++                                | CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. }
++                            ) => "validity",
++                            _ => "other",
++                        };
++                        let chain: Vec<_> = std::iter::once(end_entity).chain(intermediates).map(AsRef::as_ref).collect();
++                        callback(&chain, &self.endpoint, reason)
++                    }
++                };
++                if accepted { Ok(ServerCertVerified::assertion()) } else { Err(error) }
+             }
+-            Err(error) => Err(error),
+         }
+     }
+ 

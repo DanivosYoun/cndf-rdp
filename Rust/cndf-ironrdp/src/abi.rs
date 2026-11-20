@@ -81,6 +81,7 @@ pub struct CNDFIronRect {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CNDFIronCertificateChain {
+    /// Leaf first, followed by the intermediates in server order.
     pub der: *const *const u8,
     pub der_length: *const usize,
     pub count: usize,
@@ -161,6 +162,7 @@ pub struct CNDFIronStatistics {
     pub input_busy: u64,
 }
 
+/// Pointers supplied to callbacks are valid for the duration of the callback.
 pub type CNDFIronLogCallback = Option<
     extern "C" fn(
         generation: u64,
@@ -170,6 +172,7 @@ pub type CNDFIronLogCallback = Option<
         context: *mut c_void,
     ),
 >;
+/// Runs synchronously on the session thread. Returning true accepts this handshake.
 pub type CNDFIronCertificateTrustCallback = Option<
     extern "C" fn(
         generation: u64,
@@ -192,6 +195,7 @@ pub type CNDFIronFailureCallback = Option<
 pub type CNDFIronDisconnectCallback = Option<
     extern "C" fn(generation: u64, kind: CNDFIronDisconnectKind, code: u32, context: *mut c_void),
 >;
+/// Borrows the full BGRA framebuffer (alpha 255). Dirty is the union for the batch.
 pub type CNDFIronFrameCallback = Option<
     extern "C" fn(
         generation: u64,
@@ -204,6 +208,7 @@ pub type CNDFIronFrameCallback = Option<
         context: *mut c_void,
     ),
 >;
+/// IMAGE supplies top-down straight-alpha BGRA with width * 4 stride.
 pub type CNDFIronPointerCallback = Option<
     extern "C" fn(
         generation: u64,

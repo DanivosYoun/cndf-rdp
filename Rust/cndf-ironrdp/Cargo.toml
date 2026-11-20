@@ -7,14 +7,27 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [features]
-default = ["stub"]
+default = ["engine"]
+engine = ["dep:ironrdp-client", "dep:ironrdp-connector", "dep:ironrdp-pdu", "dep:ironrdp-tls", "dep:tokio", "dep:tracing", "dep:rustls", "dep:smallvec", "dep:tracing-subscriber"]
 stub = []
 
 [dependencies]
 zeroize = "1.8"
+ironrdp-client = { path = "../../Vendor/IronRDP/src/crates/ironrdp-client", default-features = false, features = ["rustls"], optional = true }
+ironrdp-connector = { path = "../../Vendor/IronRDP/src/crates/ironrdp-connector", optional = true }
+ironrdp-pdu = { path = "../../Vendor/IronRDP/src/crates/ironrdp-pdu", optional = true }
+ironrdp-tls = { path = "../../Vendor/IronRDP/src/crates/ironrdp-tls", optional = true }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"], optional = true }
+tracing = { version = "0.1", optional = true }
+rustls = { version = "0.23", default-features = false, optional = true }
+smallvec = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"], optional = true }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
 panic = "unwind"
+# Rust 1.94.1 stripping misaligns proc-macro dylibs rejected by macOS 27 dyld.
+# Revisit when the pinned toolchain includes the fix for rust-lang/rust#157750.
+strip = "none"

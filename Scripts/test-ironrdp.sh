@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+"$root/Scripts/build-ironrdp.sh" --prepare-only
 export CARGO_TARGET_DIR="$root/Vendor/IronRDP/target"
 export MACOSX_DEPLOYMENT_TARGET=13.0
 cd "$root/Rust/cndf-ironrdp"

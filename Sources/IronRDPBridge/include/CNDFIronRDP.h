@@ -86,6 +86,9 @@ typedef enum CNDFIronPointerButton {
 
 typedef struct CNDFIronSession CNDFIronSession;
 
+/**
+ * Pointers supplied to callbacks are valid for the duration of the callback.
+ */
 typedef void (*CNDFIronLogCallback)(uint64_t generation,
                                     enum CNDFIronLogLevel level,
                                     const uint8_t *utf8,
@@ -93,6 +96,9 @@ typedef void (*CNDFIronLogCallback)(uint64_t generation,
                                     void *context);
 
 typedef struct CNDFIronCertificateChain {
+  /**
+   * Leaf first, followed by the intermediates in server order.
+   */
   const uint8_t *const *der;
   const size_t *der_length;
   size_t count;
@@ -101,6 +107,9 @@ typedef struct CNDFIronCertificateChain {
   uint32_t problems;
 } CNDFIronCertificateChain;
 
+/**
+ * Runs synchronously on the session thread. Returning true accepts this handshake.
+ */
 typedef bool (*CNDFIronCertificateTrustCallback)(uint64_t generation,
                                                  const struct CNDFIronCertificateChain *chain,
                                                  void *context);
@@ -127,6 +136,9 @@ typedef struct CNDFIronRect {
   uint32_t height;
 } CNDFIronRect;
 
+/**
+ * Borrows the full BGRA framebuffer (alpha 255). Dirty is the union for the batch.
+ */
 typedef void (*CNDFIronFrameCallback)(uint64_t generation,
                                       const uint8_t *bgra,
                                       uint32_t width,
@@ -136,6 +148,9 @@ typedef void (*CNDFIronFrameCallback)(uint64_t generation,
                                       uint64_t sequence,
                                       void *context);
 
+/**
+ * IMAGE supplies top-down straight-alpha BGRA with width * 4 stride.
+ */
 typedef void (*CNDFIronPointerCallback)(uint64_t generation,
                                         enum CNDFIronPointerKind kind,
                                         const uint8_t *bgra,
@@ -198,10 +213,16 @@ extern "C" {
 
 uint32_t cndf_iron_abi_version(void);
 
+/**
+ * Returns a static string with the crate version, upstream SHA and patch count.
+ */
 const char *cndf_iron_version(void);
 
 struct CNDFIronSession *cndf_iron_session_create(const struct CNDFIronCallbacks *callbacks);
 
+/**
+ * Starts an asynchronous connection. The password is read during this call and the bridge copy is zeroized.
+ */
 enum CNDFIronStatus cndf_iron_connect(struct CNDFIronSession *session,
                                       const struct CNDFIronConnectOptions *options,
                                       const uint8_t *password_utf8,
@@ -220,6 +241,9 @@ enum CNDFIronStatus cndf_iron_resize(struct CNDFIronSession *session,
                                      uint32_t height,
                                      uint32_t scale_percent);
 
+/**
+ * Re-delivers the current framebuffer with a full dirty rectangle and no server round trip.
+ */
 enum CNDFIronStatus cndf_iron_redeliver_frame(struct CNDFIronSession *session, uint64_t generation);
 
 bool cndf_iron_is_connected(const struct CNDFIronSession *session, uint64_t generation);
@@ -227,8 +251,16 @@ bool cndf_iron_is_connected(const struct CNDFIronSession *session, uint64_t gene
 bool cndf_iron_get_statistics(const struct CNDFIronSession *session,
                               struct CNDFIronStatistics *out);
 
+/**
+ * Requests orderly shutdown and returns immediately.
+ */
 enum CNDFIronStatus cndf_iron_disconnect(struct CNDFIronSession *session);
 
+/**
+ * Closes the callback gate and waits up to the join deadline for worker exit.
+ * If a worker outlives that deadline the closed session is retained. Finish pending
+ * certificate callbacks before calling destroy, and keep the context alive until it returns.
+ */
 void cndf_iron_session_destroy(struct CNDFIronSession *session, uint32_t join_timeout_ms);
 
 #ifdef __cplusplus
