@@ -25,6 +25,16 @@ pub(super) const CONFIGURATION: Failure = Failure(
     "Invalid IronRDP connection configuration",
 );
 
+pub(super) const TLS_PROTOCOL_VERSION: u32 = 0x4952000B;
+
+#[cfg(not(feature = "legacy-tls"))]
+pub(super) const LEGACY_TLS_UNAVAILABLE: Failure = Failure(
+    CNDF_IRON_FAILURE_TLS,
+    0x4952000C,
+    CNDF_IRON_STAGE_NEGOTIATION,
+    "TLS protocol negotiation failed and legacy TLS is not available in this build",
+);
+
 pub(super) fn framebuffer_failure(error: DesktopFramebufferError, stage: CNDFIronStage) -> Failure {
     let (code, message) = match error {
         DesktopFramebufferError::Dimensions => (
@@ -103,15 +113,29 @@ pub(super) fn classify(error: &ConnectorError, rejected: bool) -> Failure {
         );
     }
     if context.starts_with("[TLS upgrade]") {
-        let tls = error
+        let source = error
             .source()
             .and_then(|source| source.downcast_ref::<std::io::Error>())
-            .and_then(|io| io.get_ref())
-            .and_then(|source| source.downcast_ref::<rustls::Error>());
+            .and_then(|io| io.get_ref());
+        #[cfg(feature = "legacy-tls")]
+        if source.is_some_and(|source| {
+            source.is::<openssl::ssl::Error>() || source.is::<openssl::error::ErrorStack>()
+        }) {
+            return Failure(
+                CNDF_IRON_FAILURE_TLS,
+                0x4952000D,
+                CNDF_IRON_STAGE_NEGOTIATION,
+                "Legacy OpenSSL TLS handshake failed",
+            );
+        }
+
+        let tls = source.and_then(|source| source.downcast_ref::<rustls::Error>());
         let (code, message) = match tls {
             Some(rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion))
-            | Some(rustls::Error::PeerIncompatible(_)) => (
-                0x4952000B,
+            | Some(rustls::Error::PeerIncompatible(
+                rustls::PeerIncompatible::ServerDoesNotSupportTls12Or13,
+            )) => (
+                TLS_PROTOCOL_VERSION,
                 "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
             ),
             _ => (0x49520006, "TLS handshake failed"),
@@ -163,6 +187,24 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-tls")]
+    #[test]
+    fn classifies_openssl_tls_failure_separately() {
+        let source = openssl::x509::X509::from_pem(b"invalid certificate").unwrap_err();
+        assert!(!source.errors().is_empty());
+        let error = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
+            .with_source(std::io::Error::other(source));
+        assert_eq!(
+            classify(&error, false),
+            Failure(
+                CNDF_IRON_FAILURE_TLS,
+                0x4952000D,
+                CNDF_IRON_STAGE_NEGOTIATION,
+                "Legacy OpenSSL TLS handshake failed",
+            ),
+        );
+    }
+
     #[test]
     fn distinguishes_tls_protocol_failures_from_other_handshake_failures() {
         let cases = [
@@ -177,6 +219,13 @@ mod tests {
                 ),
                 0x4952000B,
                 "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
+            ),
+            (
+                rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::NoCertificateRequestSignatureSchemesInCommon,
+                ),
+                0x49520006,
+                "TLS handshake failed",
             ),
             (
                 rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),

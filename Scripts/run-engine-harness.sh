@@ -166,7 +166,7 @@ mac_build() {
   mac "set -euo pipefail; export ${MAC_PATH}; M=\$HOME/${MAC_DIR}
     cd \$M/cndf-rdp
     [[ -f Vendor/FreeRDP/install/lib/libfreerdp3.dylib ]] || bash Scripts/build-freerdp.sh > \$M/freerdp-build.log 2>&1
-    [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh > \$M/ironrdp-build.log 2>&1
+    [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh --features legacy-tls > \$M/ironrdp-build.log 2>&1
     swift build -c release --product rdp-engine-harness 2>&1 | tail -3"
 }
 
@@ -254,7 +254,7 @@ legacy_tls_up() {
 }
 
 # Each B4 server reached through FreeRDP (expected: connects on every profile) and through
-# IronRDP (expected: TLS 1.0/1.1 fail with tlsHandshakeFailed, TLS 1.2 connects). xrdp has no
+# IronRDP (expected: TLS 1.0/1.1 connect via legacy TLS, TLS 1.2+ uses modern TLS). xrdp has no
 # sesman here, so the session ends at xrdp's login screen; the password is never checked.
 # The session logs come back too: FreeRDP's TLS ladder stage is only visible there.
 legacy_tls_scenarios() {

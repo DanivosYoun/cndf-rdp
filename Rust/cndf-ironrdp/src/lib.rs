@@ -9,6 +9,8 @@ mod errors;
 mod frame;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 mod input;
+#[cfg(all(feature = "legacy-tls", not(feature = "stub")))]
+mod legacy_tls;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 use engine::start_workers;
 
