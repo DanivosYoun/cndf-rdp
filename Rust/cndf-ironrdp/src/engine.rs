@@ -1,7 +1,7 @@
 use super::*;
 use crate::errors::{self, Failure};
 use crate::frame::Frame;
-use ironrdp_client::config::{ConfigBuilder, Destination};
+use ironrdp_client::config::{Config, ConfigBuilder, Destination};
 use ironrdp_client::output_channel::{output_channel, OutputEventReceiver};
 use ironrdp_client::rdp::{AutoReconnectDecision, RdpClient, RdpOutputEvent};
 use std::ffi::CString;
@@ -52,12 +52,13 @@ pub(super) fn start_workers(
 }
 
 const DISPLAY_LOG_TARGET: &str = "cndf_rdp_display";
+pub(super) const TLS_LOG_TARGET: &str = "cndf_rdp_tls";
 const DEVICE_SCALE_PERCENT: u32 = 100;
 
 #[derive(Default)]
-struct DisplayLogMessage(String);
+struct SafeLogMessage(String);
 
-impl tracing::field::Visit for DisplayLogMessage {
+impl tracing::field::Visit for SafeLogMessage {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.0 = format!("{value:?}");
@@ -73,7 +74,8 @@ struct Logs {
 impl<S: tracing::Subscriber> Layer<S> for Logs {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
-        if metadata.target() != DISPLAY_LOG_TARGET && !metadata.target().starts_with("ironrdp") {
+        let own = matches!(metadata.target(), DISPLAY_LOG_TARGET | TLS_LOG_TARGET);
+        if !own && !metadata.target().starts_with("ironrdp") {
             return;
         }
         let level = match *metadata.level() {
@@ -83,9 +85,9 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
             tracing::Level::WARN => CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
             tracing::Level::ERROR => CNDFIronLogLevel::CNDF_IRON_LOG_ERROR,
         };
-        if metadata.target() == DISPLAY_LOG_TARGET {
-            // This target records only outgoing display geometry and scale factors.
-            let mut message = DisplayLogMessage::default();
+        if own {
+            // These targets contain only display geometry, scale factors and TLS parameters.
+            let mut message = SafeLogMessage::default();
             event.record(&mut message);
             log(&self.connection, self.minimum, level, &message.0);
         } else {
@@ -152,6 +154,8 @@ fn run(
         accepted
     });
 
+    #[cfg(feature = "legacy-tls")]
+    let legacy_trust = Arc::clone(&trust);
     let desktop_scale = options.scale.clamp(100, 500);
     let mut builder = ConfigBuilder::new()
         .with_destination(Destination::from_parts(&options.host, options.port))
@@ -191,13 +195,6 @@ fn run(
         let _ = output.blocking_send(Output::Failure(errors::CONFIGURATION));
         return;
     };
-    let (sender, receiver) = output_channel(128);
-    let client = RdpClient::new(config, sender)
-        .with_desktop_updates()
-        .with_display_resize_fallback_reconnect(false);
-    let input = client.input_sender();
-    *lock(&connection.input) = Some(input.clone());
-
     let minimum = options.log_level;
     let filter = match minimum {
         CNDFIronLogLevel::CNDF_IRON_LOG_TRACE => LevelFilter::TRACE,
@@ -233,16 +230,33 @@ fn run(
             ),
         );
         runtime.block_on(async {
-            let bridge = forward(
-                connection, &input, commands, receiver, output, &rejected, minimum,
-            );
-            tokio::pin!(bridge);
-            let client = client.run();
-            tokio::pin!(client);
-            tokio::select! {
-                () = &mut client => bridge.await,
-                () = &mut bridge => {}
+            let retry_config = cfg!(feature = "legacy-tls").then(|| config.clone());
+            let retry = run_attempt(
+                connection,
+                config,
+                &commands,
+                output,
+                &rejected,
+                minimum,
+                retry_config,
+                false,
+            )
+            .await;
+            #[cfg(feature = "legacy-tls")]
+            if let Some(config) = retry {
+                let config =
+                    config.with_tls_upgrader(Arc::new(crate::legacy_tls::LegacyTlsUpgrader {
+                        callback: legacy_trust,
+                    }));
+                // run_attempt has dropped the original client and its transport.
+                // The next client checks the same generation's stop flag before polling.
+                run_attempt(
+                    connection, config, &commands, output, &rejected, minimum, None, true,
+                )
+                .await;
             }
+            #[cfg(not(feature = "legacy-tls"))]
+            debug_assert!(retry.is_none());
         });
     });
     connection.connected.store(false, Ordering::Release);
@@ -252,15 +266,60 @@ fn run(
     runtime.shutdown_background();
 }
 
+async fn run_attempt(
+    connection: &Connection,
+    config: Config,
+    commands: &Receiver<Command>,
+    output: &async_channel::Sender<Output>,
+    rejected: &AtomicBool,
+    minimum: CNDFIronLogLevel,
+    retry_config: Option<Config>,
+    legacy: bool,
+) -> Option<Config> {
+    let (sender, receiver) = output_channel(128);
+    let client = RdpClient::new(config, sender)
+        .with_desktop_updates()
+        .with_display_resize_fallback_reconnect(false);
+    let input = client.input_sender();
+    *lock(&connection.input) = Some(input.clone());
+    if connection.stop.load(Ordering::Acquire) {
+        input.request_close();
+    }
+
+    let retry = {
+        let bridge = forward(
+            connection,
+            &input,
+            commands,
+            receiver,
+            output,
+            rejected,
+            minimum,
+            retry_config,
+            legacy,
+        );
+        let client = client.run();
+        tokio::pin!(bridge, client);
+        tokio::select! {
+            () = &mut client => bridge.await,
+            retry = &mut bridge => retry,
+        }
+    };
+    *lock(&connection.input) = None;
+    retry
+}
+
 async fn forward(
     connection: &Connection,
     input: &ironrdp_client::rdp::RdpInputSender,
-    commands: Receiver<Command>,
+    commands: &Receiver<Command>,
     mut receiver: OutputEventReceiver,
     output: &async_channel::Sender<Output>,
     rejected: &AtomicBool,
     minimum: CNDFIronLogLevel,
-) {
+    mut retry_config: Option<Config>,
+    legacy: bool,
+) -> Option<Config> {
     let mut timer = tokio::time::interval(Duration::from_millis(4));
     let mut stopping = None;
     loop {
@@ -270,7 +329,26 @@ async fn forward(
                 let event = match event {
                     RdpOutputEvent::ConnectionFailure(error) => {
                         if connection.stop.load(Ordering::Acquire) { continue; }
-                        Output::Failure(errors::classify(&error, rejected.load(Ordering::Acquire)))
+                        let failure = errors::classify(&error, rejected.load(Ordering::Acquire));
+                        if failure.1 == errors::TLS_PROTOCOL_VERSION && retry_config.is_some() {
+                            return retry_config;
+                        }
+                        #[cfg(not(feature = "legacy-tls"))]
+                        let failure = if failure.1 == errors::TLS_PROTOCOL_VERSION {
+                            errors::LEGACY_TLS_UNAVAILABLE
+                        } else {
+                            failure
+                        };
+                        if legacy {
+                            log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+                                "IronRDP legacy TLS connection failed.");
+                        }
+                        Output::Failure(failure)
+                    }
+                    RdpOutputEvent::Connected => {
+                        // The modern handshake succeeded. Release its unused retry configuration.
+                        retry_config = None;
+                        Output::Rdp(RdpOutputEvent::Connected)
                     }
                     RdpOutputEvent::AutoReconnecting { response, .. } => {
                         let _ = response.send(AutoReconnectDecision::Stop);
@@ -306,20 +384,21 @@ async fn forward(
                 for _ in 0..128 {
                     match commands.try_recv() {
                         Ok(Command::Redeliver) => {
-                            if output.send(Output::Redeliver).await.is_err() { return; }
+                            if output.send(Output::Redeliver).await.is_err() { return None; }
                         }
                         #[cfg(feature = "stub")]
                         Ok(_) => unreachable!("stub command in real engine"),
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => {
                             input.request_close();
-                            return;
+                            return None;
                         }
                     }
                 }
             }
         }
     }
+    None
 }
 
 fn deliver(

@@ -1,0 +1,47 @@
+diff --git a/crates/ironrdp-tls/src/lib.rs b/crates/ironrdp-tls/src/lib.rs
+index ec8bc95..e311642 100644
+--- a/crates/ironrdp-tls/src/lib.rs
++++ b/crates/ironrdp-tls/src/lib.rs
+@@ -44,7 +44,7 @@ pub use impl_::{
+     upgrade_with_certificate_validation_callback_for_endpoint,
+ };
+ #[cfg(feature = "rustls-verifier")]
+-pub use rustls_verifier::rustls_client_config;
++pub use rustls_verifier::{rustls_client_config, verify_certificate_chain};
+ 
+ #[cfg(feature = "rustls-no-provider")]
+ pub use impl_::upgrade_with_certificate_chain_validation_callback;
+diff --git a/crates/ironrdp-tls/src/rustls_verifier.rs b/crates/ironrdp-tls/src/rustls_verifier.rs
+index eaa2c96..8d05f04 100644
+--- a/crates/ironrdp-tls/src/rustls_verifier.rs
++++ b/crates/ironrdp-tls/src/rustls_verifier.rs
+@@ -43,6 +43,29 @@ pub(crate) fn rustls_chain_client_config(
+     Ok(config)
+ }
+ 
++/// Validates a peer chain obtained outside rustls (DER, leaf first, as sent by the server) with
++/// the same verifier, roots, reason categories and chain callback as
++/// `upgrade_with_certificate_chain_validation_callback`.
++pub fn verify_certificate_chain(
++    chain: &[&[u8]],
++    server_name: &str,
++    endpoint: &str,
++    callback: CertificateChainValidationCallback,
++) -> io::Result<()> {
++    use tokio_rustls::rustls::pki_types::{CertificateDer, UnixTime};
++
++    let (leaf, intermediates) = chain
++        .split_first()
++        .ok_or_else(|| io::Error::other("the peer sent no certificate"))?;
++    let verifier = server_cert_verifier(CertificateValidation::Strict, endpoint, Some(Callback::Chain(callback)))?;
++    let server_name = ServerName::try_from(server_name.to_owned()).map_err(io::Error::other)?;
++    let intermediates: Vec<_> = intermediates.iter().map(|der| CertificateDer::from(*der)).collect();
++    verifier
++        .verify_server_cert(&CertificateDer::from(*leaf), &intermediates, &server_name, &[], UnixTime::now())
++        .map(|_| ())
++        .map_err(io::Error::other)
++}
++
+ enum Callback {
+     Leaf(CertificateValidationCallback),
+     Chain(CertificateChainValidationCallback),

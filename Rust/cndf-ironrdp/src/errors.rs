@@ -25,6 +25,16 @@ pub(super) const CONFIGURATION: Failure = Failure(
     "Invalid IronRDP connection configuration",
 );
 
+pub(super) const TLS_PROTOCOL_VERSION: u32 = 0x4952000B;
+
+#[cfg(not(feature = "legacy-tls"))]
+pub(super) const LEGACY_TLS_UNAVAILABLE: Failure = Failure(
+    CNDF_IRON_FAILURE_TLS,
+    0x4952000C,
+    CNDF_IRON_STAGE_NEGOTIATION,
+    "TLS protocol negotiation failed and legacy TLS is not available in this build",
+);
+
 pub(super) fn framebuffer_failure(error: DesktopFramebufferError, stage: CNDFIronStage) -> Failure {
     let (code, message) = match error {
         DesktopFramebufferError::Dimensions => (
@@ -111,7 +121,7 @@ pub(super) fn classify(error: &ConnectorError, rejected: bool) -> Failure {
         let (code, message) = match tls {
             Some(rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion))
             | Some(rustls::Error::PeerIncompatible(_)) => (
-                0x4952000B,
+                TLS_PROTOCOL_VERSION,
                 "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
             ),
             _ => (0x49520006, "TLS handshake failed"),
