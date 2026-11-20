@@ -47,7 +47,8 @@
       "expect": {
         "connected": true,
         "firstFrame": true,
-        "maxShutdownMs": 1000
+        "maxShutdownMs": 1000,
+        "resizeKeepsSession": true
       },
       "networkAutoDetect": true
     }

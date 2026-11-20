@@ -78,6 +78,16 @@ public enum RDPGraphicsMode: String, Codable, Sendable {
 public enum RDPEngineKind: String, Codable, Sendable {
     case freeRDP = "freerdp"
     case ironRDP = "ironrdp"
+
+    /// Whether this engine has a clipboard channel (`RDPEngineSession.supportsClipboard`).
+    /// Known before connecting, so callers can compute the effective clipboard setting
+    /// (design I11) before the session exists.
+    public var supportsClipboard: Bool {
+        switch self {
+        case .freeRDP: return true
+        case .ironRDP: return false
+        }
+    }
 }
 
 public enum RDPAudioPlaybackMode: UInt32, Equatable, Sendable {

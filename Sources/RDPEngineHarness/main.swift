@@ -103,6 +103,10 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
     private var pendingTrust: (key: String, value: String)?
 
     private(set) var connected = false
+    /// Not-connected -> connected rises. The view repeats `didChangeConnected(true)` while
+    /// connected, so only a rise counts; more than one means the session reconnected.
+    private(set) var connectRises = 0
+    private var lastReportedConnected = false
     private(set) var connectedAt: CFTimeInterval?
     private(set) var trustCallbacks: [String] = []
     /// Per trust callback: SHA-256 of each certificate in the trust string, in order. Shows
@@ -140,6 +144,8 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {
         guard noteCallback() else { return }
         lock.lock()
+        if connected && !lastReportedConnected { connectRises += 1 }
+        lastReportedConnected = connected
         if connected && !self.connected {
             connectedAt = CACurrentMediaTime()
             if let pendingTrust {
@@ -434,9 +440,19 @@ private func runIteration(
         case "resize":
             let width = step.width ?? 1024
             let height = step.height ?? 700
+            // Only records the remote frame size; the tap metrics stay with the tap step.
+            var lastFrameSize: [Int]?
+            let previousTap = view.onRenderedFrame
+            view.onRenderedFrame = { buffer, time in
+                lastFrameSize = [CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer)]
+                previousTap?(buffer, time)
+            }
             window.setContentSize(NSSize(width: width, height: height))
             view.frame = NSRect(x: 0, y: 0, width: width, height: height)
             drainRunLoop(step.seconds ?? 2)
+            view.onRenderedFrame = previousTap
+            result.resizeFrameSize = lastFrameSize
+            result.connectedAfterResize = view.isConnected && delegate.disconnectReason == nil
             result.steps.append("resize:\(Int(width))x\(Int(height))")
         case "shutdown":
             if let statistics = view.statistics {
@@ -497,6 +513,7 @@ private func runIteration(
         result.failureDetail = String(describing: failure)
     }
     result.disconnectReason = delegate.disconnectReason.map(disconnectName)
+    result.connectRises = delegate.connectRises
     result.callbacksAfterShutdown = delegate.callbacksAfterShutdown + probe.afterShutdown
     if let password, !password.isEmpty, let log = try? String(contentsOf: logURL, encoding: .utf8) {
         result.passwordFoundInSessionLog = log.contains(password)
@@ -528,6 +545,10 @@ private func evaluate(_ iteration: IterationResult, against expect: HarnessExpec
     }
     if expect.failure != iteration.failure {
         failures.append("\(prefix) failure=\(iteration.failure ?? "nil"), expected \(expect.failure ?? "nil")")
+    }
+    if expect.resizeKeepsSession == true,
+       iteration.connectedAfterResize != true || iteration.connectRises > 1 {
+        failures.append("\(prefix) resize: connectedAfterResize=\(iteration.connectedAfterResize.map(String.init) ?? "nil"), connectRises=\(iteration.connectRises)")
     }
     if let maxShutdownMs = expect.maxShutdownMs, let shutdownMs = iteration.shutdownMs,
        shutdownMs > Double(maxShutdownMs) {

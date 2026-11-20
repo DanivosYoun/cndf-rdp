@@ -86,6 +86,12 @@ struct IterationResult: Encodable {
     var failure: String?
     var failureDetail: String?
     var disconnectReason: String?
+    /// Not-connected -> connected rises in this iteration; more than one = reconnected.
+    var connectRises = 0
+    /// After the resize step: still connected with no disconnect, and the last remote frame
+    /// size seen during the step (nil = no frame arrived).
+    var connectedAfterResize: Bool?
+    var resizeFrameSize: [Int]?
     var shutdownMs: Double?
     var shutdownDiagnostics: [String: Int]?
     /// Delegate callbacks delivered after `shutdown()` returned (must be 0).

@@ -153,7 +153,7 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     public var engine: RDPEngineKind { .ironRDP }
-    public var supportsClipboard: Bool { false }
+    public var supportsClipboard: Bool { engine.supportsClipboard }
     public var supportsOutputSuppression: Bool { false }
 
     public var isConnected: Bool {

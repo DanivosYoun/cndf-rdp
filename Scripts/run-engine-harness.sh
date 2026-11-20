@@ -228,7 +228,7 @@ down() {
     kill "$(cat "${WORK}/tunnel.pid")" 2>/dev/null || true
     rm -f "${WORK}/tunnel.pid"
   fi
-  mac "defaults delete cndf.rdp-engine-harness.${HARNESS_BATCH} >/dev/null 2>&1; rm -rf \$HOME/${MAC_DIR}" || true
+  mac "defaults delete cndf.rdp-engine-harness.${HARNESS_BATCH} >/dev/null 2>&1; rm -f \"\$HOME/Library/Preferences/cndf.rdp-engine-harness.${HARNESS_BATCH}.plist\"; rm -rf \$HOME/${MAC_DIR}" || true
   rm -f "${WORK}/secrets.env" "${WORK}/users.list"
   rm -rf "${WORK}/certs"
   log "down: containers, tunnel, Mac work dir and secrets removed (results kept in ${WORK}/results)"

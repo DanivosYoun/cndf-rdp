@@ -75,4 +75,6 @@ struct HarnessExpectation: Decodable {
     var failure: String?
     /// Upper bound for view.shutdown() wall time.
     var maxShutdownMs: Int?
+    /// The resize step leaves the session connected, without a disconnect or reconnect.
+    var resizeKeepsSession: Bool?
 }

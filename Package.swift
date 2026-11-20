@@ -81,8 +81,6 @@ let package = Package(
                     "-L\(ironRDPInstall)/lib",
                     "-lcndf_ironrdp"
                 ]),
-                // sspi's smart-card dependency needs the system zlib (found by C1).
-                .linkedLibrary("z"),
                 .linkedFramework("Security"),
                 .linkedFramework("CoreFoundation"),
                 .linkedFramework("SystemConfiguration")

@@ -330,6 +330,8 @@ public final class RDPSession {
             }
 
             resetStatistics()
+            // Same first line as IronRDPSession, so a session log names its engine (design D4).
+            emitLog("RDP engine=freerdp version=\(RDPMacInfo.freerdpVersion)")
             let bridgeDesktopSize = initialDesktopSize ?? fixedDesktopSize(from: options.forcedDesktopSize)
 
             let status = options.host.withCString { hostPointer in
@@ -659,7 +661,7 @@ public final class RDPSession {
 
 extension RDPSession: RDPEngineSession {
     public var engine: RDPEngineKind { .freeRDP }
-    public var supportsClipboard: Bool { true }
+    public var supportsClipboard: Bool { engine.supportsClipboard }
 }
 
 private extension RDPPointerButton {

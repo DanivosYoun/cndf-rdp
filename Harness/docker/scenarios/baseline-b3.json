@@ -6,6 +6,6 @@
      "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 30},
                {"op": "idle", "seconds": 10}, {"op": "tap", "seconds": 5},
                {"op": "resize", "width": 1024, "height": 700, "seconds": 2}, {"op": "shutdown"}],
-     "expect": {"connected": true, "firstFrame": true, "maxShutdownMs": 1000}}
+     "expect": {"connected": true, "firstFrame": true, "maxShutdownMs": 1000, "resizeKeepsSession": true}}
   ]
 }
