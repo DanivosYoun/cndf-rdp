@@ -161,6 +161,109 @@ final class IronRDPSessionTests: XCTestCase {
         try session.disconnect()
     }
 
+    // MARK: didDisconnectWith contract (finding ironrdp-missing-disconnect-leaves-zombie-session)
+    //
+    // FreeRDP reference (FreeRDPBridge.c rdp_event_loop / bridge_disconnect):
+    // - async connect failure: failure, then exactly one disconnect(.error), from the worker.
+    // - local disconnect while the worker runs (connecting or connected): exactly one
+    //   disconnect(.localRequest) and no failure, delivered before `disconnect()` returns.
+    // - `disconnect()` after the worker already ended: no further callback.
+
+    // stub
+    func testAsyncConnectFailureReportsFailureThenOneErrorDisconnect() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: false)
+        session.delegate = recorder
+        try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+
+        XCTAssertTrue(waitUntil { recorder.lifecycle.count == 2 })
+        XCTAssertEqual(recorder.lifecycle, ["failure", "disconnect:error"])
+        XCTAssertEqual(recorder.errors, [.certificateRejected])
+
+        try session.disconnect()
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(recorder.lifecycle, ["failure", "disconnect:error"])
+    }
+
+    // stub
+    func testLocalDisconnectOfAConnectedSessionReportsOneLocalRequestBeforeReturning() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected && recorder.frameCount == 1 })
+
+        try session.disconnect()
+        XCTAssertEqual(recorder.lifecycle, ["disconnect:localRequest"])
+        try session.disconnect()
+        deliverSyntheticDisconnect(to: session, generation: 1)
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(recorder.lifecycle, ["disconnect:localRequest"])
+    }
+
+    // stub
+    func testEngineDisconnectCallbackAndLocalDisconnectAreReportedOnce() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected })
+
+        // The engine reported the end of this generation (server disconnect) first.
+        deliverSyntheticDisconnect(to: session, generation: 1, kind: CNDF_IRON_DISCONNECT_SERVER)
+        try session.disconnect()
+        XCTAssertEqual(recorder.lifecycle, ["disconnect:server"])
+    }
+
+    // stub + real FreeRDP. Both engines, same observable lifecycle.
+    func testLifecycleMatchesFreeRDPForFailureAndForDisconnectWhileConnecting() throws {
+        try skipUnlessStub()
+
+        // Async connect failure. FreeRDP: refused TCP port. IronRDP stub: rejected certificate.
+        let freeRDPFailure = Recorder(trust: false)
+        let freeRDP = try RDPSession()
+        freeRDP.delegate = freeRDPFailure
+        try freeRDP.connect(RDPConnectionOptions(host: "127.0.0.1", port: 1, username: "u", password: "p"), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil(timeout: 20) { freeRDPFailure.lifecycle.count == 2 })
+        let ironFailure = Recorder(trust: false)
+        let iron = try IronRDPSession()
+        iron.delegate = ironFailure
+        try iron.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil { ironFailure.lifecycle.count == 2 })
+        XCTAssertEqual(freeRDPFailure.lifecycle, ["failure", "disconnect:error"])
+        XCTAssertEqual(ironFailure.lifecycle, freeRDPFailure.lifecycle)
+        try freeRDP.disconnect()
+        try iron.disconnect()
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(freeRDPFailure.lifecycle, ["failure", "disconnect:error"])
+        XCTAssertEqual(ironFailure.lifecycle, freeRDPFailure.lifecycle)
+
+        // Local disconnect while still connecting. FreeRDP: a local listener that accepts the
+        // TCP handshake and never answers X.224. IronRDP stub: an unanswered certificate prompt.
+        let silent = try SilentListener()
+        defer { silent.close() }
+        let freeRDPConnecting = Recorder(trust: false)
+        let freeRDP2 = try RDPSession()
+        freeRDP2.delegate = freeRDPConnecting
+        try freeRDP2.connect(RDPConnectionOptions(host: "127.0.0.1", port: silent.port, username: "u", password: "p"), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        Thread.sleep(forTimeInterval: 0.5)
+        XCTAssertEqual(freeRDPConnecting.lifecycle, [])
+        try freeRDP2.disconnect()
+        let ironConnecting = Recorder(trust: nil)
+        let iron2 = try IronRDPSession()
+        iron2.delegate = ironConnecting
+        try iron2.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
+        XCTAssertTrue(waitUntil { ironConnecting.trustRequests.count == 1 })
+        try iron2.disconnect()
+        XCTAssertEqual(freeRDPConnecting.lifecycle, ["disconnect:localRequest"])
+        XCTAssertEqual(ironConnecting.lifecycle, freeRDPConnecting.lifecycle)
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(ironConnecting.lifecycle, freeRDPConnecting.lifecycle)
+    }
+
     private func options(logFileURL: URL? = nil) -> RDPConnectionOptions {
         RDPConnectionOptions(
             host: "localhost",
@@ -168,6 +271,14 @@ final class IronRDPSessionTests: XCTestCase {
             securePassword: RDPSecureString(secret),
             logFileURL: logFileURL
         )
+    }
+
+    private func deliverSyntheticDisconnect(
+        to session: IronRDPSession,
+        generation: UInt64,
+        kind: CNDFIronDisconnectKind = CNDF_IRON_DISCONNECT_LOCAL_REQUEST
+    ) {
+        session.callbacks.disconnect?(generation, kind, 0, session.callbacks.context)
     }
 
     private func deliverSyntheticFrame(to session: IronRDPSession, generation: UInt64) {
@@ -197,6 +308,43 @@ func waitUntil(timeout: TimeInterval = 3, _ condition: () -> Bool) -> Bool {
     return true
 }
 
+/// A loopback TCP listener that never accepts: the kernel completes the handshake from the
+/// backlog, so a client stays in its connect sequence until it gives up or is stopped.
+private final class SilentListener {
+    private var descriptor: Int32
+    let port: UInt16
+
+    init() throws {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        descriptor = fd
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        address.sin_port = 0
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer -> Bool in
+                bind(fd, pointer, length) == 0
+                    && listen(fd, 4) == 0
+                    && getsockname(fd, pointer, &length) == 0
+            }
+        }
+        guard fd >= 0, bound else {
+            if fd >= 0 { Darwin.close(fd) }
+            throw RDPSessionError.configurationInvalid(reason: "listener")
+        }
+        port = UInt16(bigEndian: address.sin_port)
+    }
+
+    func close() {
+        if descriptor >= 0 {
+            Darwin.close(descriptor)
+            descriptor = -1
+        }
+    }
+}
+
 /// Thread-safe delegate. `trust == nil` never answers a certificate prompt.
 private final class Recorder: RDPSessionDelegate {
     private let lock = NSLock()
@@ -206,6 +354,7 @@ private final class Recorder: RDPSessionDelegate {
     private var storedErrors: [RDPSessionError] = []
     private var storedFrames: [CGSize] = []
     private var storedEvents = 0
+    private var storedLifecycle: [String] = []
 
     init(trust: Bool? = false) {
         self.trust = trust
@@ -217,6 +366,8 @@ private final class Recorder: RDPSessionDelegate {
     var frameCount: Int { locked { storedFrames.count } }
     var lastFrameSize: CGSize? { locked { storedFrames.last } }
     var eventCount: Int { locked { storedEvents } }
+    /// `failure` and `disconnect:<reason>` in delivery order.
+    var lifecycle: [String] { locked { storedLifecycle } }
 
     func rdpSession(_ session: RDPEngineSession, didLog message: String) {
         locked { storedLogs.append(message); storedEvents += 1 }
@@ -237,11 +388,18 @@ private final class Recorder: RDPSessionDelegate {
     }
 
     func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError) {
-        locked { storedErrors.append(error); storedEvents += 1 }
+        locked { storedErrors.append(error); storedLifecycle.append("failure"); storedEvents += 1 }
     }
 
     func rdpSession(_ session: RDPEngineSession, didDisconnectWith reason: RDPDisconnectReason) {
-        locked { storedEvents += 1 }
+        let name: String
+        switch reason {
+        case .localRequest: name = "localRequest"
+        case .serverDisconnect: name = "server"
+        case .timeout: name = "timeout"
+        case .error: name = "error"
+        }
+        locked { storedLifecycle.append("disconnect:\(name)"); storedEvents += 1 }
     }
 
     func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String) {}
