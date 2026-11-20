@@ -1,0 +1,173 @@
+diff --git a/crates/ironrdp-async/Cargo.toml b/crates/ironrdp-async/Cargo.toml
+index f42a53d..cbbed4b 100644
+--- a/crates/ironrdp-async/Cargo.toml
++++ b/crates/ironrdp-async/Cargo.toml
+@@ -17,7 +17,7 @@ doctest = false
+ test = false
+ 
+ [dependencies]
+-ironrdp-connector = { path = "../ironrdp-connector", version = "0.12" } # public
++ironrdp-connector = { path = "../ironrdp-connector", version = "0.12", default-features = false } # public
+ ironrdp-core = { path = "../ironrdp-core", version = "0.3", features = ["alloc"] } # public
+ ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11" } # public
+ tracing = { version = "0.1", features = ["log"] }
+@@ -25,6 +25,8 @@ bytes = "1" # public
+ web-time = "1.1"
+ 
+ [features]
++default = ["smartcard"]
++smartcard = ["ironrdp-connector/smartcard"]
+ remote-guard = ["ironrdp-connector/remote-guard"]
+ 
+ [lints]
+diff --git a/crates/ironrdp-client/Cargo.toml b/crates/ironrdp-client/Cargo.toml
+index d24c237..032bc7b 100644
+--- a/crates/ironrdp-client/Cargo.toml
++++ b/crates/ironrdp-client/Cargo.toml
+@@ -16,7 +16,8 @@ doctest = false
+ test = false
+ 
+ [features]
+-default = []
++default = ["smartcard-auth"]
++smartcard-auth = ["ironrdp-connector/smartcard", "ironrdp-tokio/smartcard"]
+ 
+ # Internal (PRIVATE!) feature used to expose helpers to the shared integration tests.
+ # Don't rely on this whatsoever. It may disappear at any time.
+@@ -44,7 +45,7 @@ sound = [
+ ]
+ clipboard = ["dep:ironrdp-cliprdr", "dep:ironrdp-cliprdr-native"]
+ rdpdr = ["dep:ironrdp-rdpdr", "dep:ironrdp-rdpsnd"]
+-smartcard = ["rdpdr"]
++smartcard = ["rdpdr", "smartcard-auth"]
+ gateway = ["dep:ironrdp-mstsgu"]
+ remote-guard = ["ironrdp-connector/remote-guard", "ironrdp-tokio/remote-guard"]
+ qoi = ["ironrdp-connector/qoi", "ironrdp-session/qoi"]
+@@ -132,7 +133,7 @@ ironrdp-core = { path = "../ironrdp-core", version = "0.3", features = ["alloc"]
+ ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11" } # public
+ ironrdp-svc = { path = "../ironrdp-svc", version = "0.10" } # public
+ ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.10" } # public
+-ironrdp-connector = { path = "../ironrdp-connector", version = "0.12" } # public
++ironrdp-connector = { path = "../ironrdp-connector", version = "0.12", default-features = false } # public
+ ironrdp-session = { path = "../ironrdp-session", version = "0.13" } # public
+ ironrdp-graphics = { path = "../ironrdp-graphics", version = "0.11" } # public
+ ironrdp-displaycontrol = { path = "../ironrdp-displaycontrol", version = "0.10" }
+@@ -142,7 +143,7 @@ ironrdp-rdpei = { path = "../ironrdp-rdpei", version = "0.3" } # public
+ ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", version = "0.1", optional = true }
+ ironrdp-rdpeudp-tokio = { path = "../ironrdp-rdpeudp-tokio", version = "0.2", optional = true }
+ ironrdp-tls = { path = "../ironrdp-tls", version = "0.3" } # public
+-ironrdp-tokio = { path = "../ironrdp-tokio", version = "0.12", features = ["reqwest"] }
++ironrdp-tokio = { path = "../ironrdp-tokio", version = "0.12", default-features = false, features = ["reqwest"] }
+ ironrdp-rdcleanpath = { path = "../ironrdp-rdcleanpath", version = "0.3" }
+ ironrdp-vmconnect = { path = "../ironrdp-vmconnect", version = "0.2", optional = true }
+ ironrdp-cfg = { path = "../ironrdp-cfg", version = "0.3" } # public
+diff --git a/crates/ironrdp-connector/Cargo.toml b/crates/ironrdp-connector/Cargo.toml
+index 1987e5c..f8da48c 100644
+--- a/crates/ironrdp-connector/Cargo.toml
++++ b/crates/ironrdp-connector/Cargo.toml
+@@ -17,7 +17,8 @@ doctest = false
+ test = false
+ 
+ [features]
+-default = []
++default = ["smartcard"]
++smartcard = ["sspi/scard", "dep:picky", "dep:picky-asn1-der", "dep:picky-asn1-x509"]
+ __test = []
+ qoi = ["ironrdp-pdu/qoi"]
+ qoiz = ["ironrdp-pdu/qoiz"]
+@@ -28,15 +29,15 @@ ironrdp-svc = { path = "../ironrdp-svc", version = "0.10" } # public
+ ironrdp-core = { path = "../ironrdp-core", version = "0.3" } # public
+ ironrdp-error = { path = "../ironrdp-error", version = "0.2" } # public
+ ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11", features = ["std"] } # public
+-sspi = { version = "0.23.1", features = ["scard"] } # public
++sspi = "0.23.1" # public
+ ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.10", optional = true } # public
+ ironrdp-rdpear = { path = "../ironrdp-rdpear", version = "0.1", optional = true }
+ url = "2.5" # public
+ rand = { version = "0.9", features = ["std"] }
+ tracing = { version = "0.1", features = ["log"] }
+-picky-asn1-der = "0.5"
+-picky-asn1-x509 = "0.15"
+-picky = "=7.0.0-rc.27" # FIXME: We are pinning with = because the candidate version number counts as the minor number by Cargo, and will be automatically bumped in the Cargo.lock.
++picky-asn1-der = { version = "0.5", optional = true }
++picky-asn1-x509 = { version = "0.15", optional = true }
++picky = { version = "=7.0.0-rc.27", optional = true } # FIXME: We are pinning with = because the candidate version number counts as the minor number by Cargo, and will be automatically bumped in the Cargo.lock.
+ serde_json = "1"
+ 
+ [lints]
+diff --git a/crates/ironrdp-connector/src/credssp.rs b/crates/ironrdp-connector/src/credssp.rs
+index 03d48e0..de096d0 100644
+--- a/crates/ironrdp-connector/src/credssp.rs
++++ b/crates/ironrdp-connector/src/credssp.rs
+@@ -1,10 +1,14 @@
+ use ironrdp_core::{WriteBuf, other_err};
+ use ironrdp_pdu::{PduHint, nego};
++#[cfg(feature = "smartcard")]
+ use picky::key::PrivateKey;
++#[cfg(feature = "smartcard")]
+ use picky_asn1_x509::{Certificate, ExtensionView, GeneralName, oids};
+ use sspi::credssp::{self, ClientState, CredSspClient};
+ use sspi::generator::{Generator, NetworkRequest};
+-use sspi::{Secret, Username};
++#[cfg(feature = "smartcard")]
++use sspi::Secret;
++use sspi::Username;
+ use tracing::debug;
+ 
+ use crate::{
+@@ -245,6 +249,7 @@ impl CredsspSequence {
+                 }
+                 .into()
+             }
++            #[cfg(feature = "smartcard")]
+             Credentials::SmartCard { pin, config } => match config {
+                 Some(config) => {
+                     let cert: Certificate = picky_asn1_der::from_bytes(&config.certificate)
+@@ -272,6 +277,10 @@ impl CredsspSequence {
+                     return Err(general_err!("smart card configuration missing"));
+                 }
+             },
++            #[cfg(not(feature = "smartcard"))]
++            Credentials::SmartCard { .. } => {
++                return Err(general_err!("smart card support is disabled"));
++            }
+         };
+ 
+         let server_name = server_name.into_inner();
+@@ -391,10 +400,12 @@ impl CredsspSequence {
+     }
+ }
+ 
++#[cfg(feature = "smartcard")]
+ fn extract_user_name(cert: &Certificate) -> Option<String> {
+     cert.tbs_certificate.subject.find_common_name().map(ToString::to_string)
+ }
+ 
++#[cfg(feature = "smartcard")]
+ fn extract_user_principal_name(cert: &Certificate) -> Option<String> {
+     cert.extensions()
+         .iter()
+diff --git a/crates/ironrdp-tokio/Cargo.toml b/crates/ironrdp-tokio/Cargo.toml
+index 43594b1..5b5932c 100644
+--- a/crates/ironrdp-tokio/Cargo.toml
++++ b/crates/ironrdp-tokio/Cargo.toml
+@@ -17,15 +17,16 @@ doctest = false
+ test = false
+ 
+ [features]
+-default = []
++default = ["smartcard"]
++smartcard = ["ironrdp-async/smartcard", "ironrdp-connector?/smartcard"]
+ remote-guard = ["ironrdp-async/remote-guard"]
+ reqwest = ["dep:reqwest", "dep:url", "dep:ironrdp-connector"]
+ reqwest-rustls-ring = ["reqwest", "reqwest?/rustls-tls-webpki-roots"]
+ reqwest-native-tls = ["reqwest", "reqwest?/native-tls"]
+ 
+ [dependencies]
+-ironrdp-async = { path = "../ironrdp-async", version = "0.12" } # public
+-ironrdp-connector = { path = "../ironrdp-connector", version = "0.12", optional = true }
++ironrdp-async = { path = "../ironrdp-async", version = "0.12", default-features = false } # public
++ironrdp-connector = { path = "../ironrdp-connector", version = "0.12", default-features = false, optional = true }
+ tokio = { version = "1", features = ["io-util"] }
+ reqwest = { version = "0.12", default-features = false, features = ["http2", "system-proxy"], optional = true }
+ url = { version = "2.5", optional = true }

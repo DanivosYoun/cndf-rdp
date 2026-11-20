@@ -14,7 +14,7 @@ stub = []
 [dependencies]
 zeroize = "1.8"
 ironrdp-client = { path = "../../Vendor/IronRDP/src/crates/ironrdp-client", default-features = false, features = ["rustls"], optional = true }
-ironrdp-connector = { path = "../../Vendor/IronRDP/src/crates/ironrdp-connector", optional = true }
+ironrdp-connector = { path = "../../Vendor/IronRDP/src/crates/ironrdp-connector", default-features = false, optional = true }
 ironrdp-pdu = { path = "../../Vendor/IronRDP/src/crates/ironrdp-pdu", optional = true }
 ironrdp-tls = { path = "../../Vendor/IronRDP/src/crates/ironrdp-tls", optional = true }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"], optional = true }
