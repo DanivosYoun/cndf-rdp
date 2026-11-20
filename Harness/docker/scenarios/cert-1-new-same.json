@@ -1,0 +1,17 @@
+{
+  "name": "cert-1-new-same",
+  "runs": [
+    {"id": "b1-cert-new", "host": "127.0.0.1", "port": 33891, "username": "harness", "passwordEnv": "HARNESS_B1_PASS",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 20}, {"op": "waitFirstFrame", "timeout": 15}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true, "trustCallbacks": ["new"], "prompts": 0, "maxShutdownMs": 1000}},
+    {"id": "b1-cert-same", "host": "127.0.0.1", "port": 33891, "username": "harness", "passwordEnv": "HARNESS_B1_PASS",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 20}, {"op": "waitFirstFrame", "timeout": 15}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true, "trustCallbacks": [], "prompts": 0, "maxShutdownMs": 1000}},
+    {"id": "b1-chain-new", "host": "127.0.0.1", "port": 33892, "username": "harness", "passwordEnv": "HARNESS_B1_PASS",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 20}, {"op": "waitFirstFrame", "timeout": 15}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true, "trustCallbacks": ["new"], "prompts": 0, "maxShutdownMs": 1000}},
+    {"id": "b1-chain-same", "host": "127.0.0.1", "port": 33892, "username": "harness", "passwordEnv": "HARNESS_B1_PASS",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 20}, {"op": "waitFirstFrame", "timeout": 15}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true, "trustCallbacks": [], "prompts": 0, "maxShutdownMs": 1000}}
+  ]
+}
