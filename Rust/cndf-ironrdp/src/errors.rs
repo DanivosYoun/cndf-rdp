@@ -108,16 +108,17 @@ pub(super) fn classify(error: &ConnectorError, rejected: bool) -> Failure {
             .and_then(|source| source.downcast_ref::<std::io::Error>())
             .and_then(|io| io.get_ref())
             .and_then(|source| source.downcast_ref::<rustls::Error>());
-        let message = match tls {
+        let (code, message) = match tls {
             Some(rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion))
-            | Some(rustls::Error::PeerIncompatible(_)) => {
-                "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)"
-            }
-            _ => "TLS handshake failed",
+            | Some(rustls::Error::PeerIncompatible(_)) => (
+                0x4952000A,
+                "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
+            ),
+            _ => (0x49520006, "TLS handshake failed"),
         };
         return Failure(
             CNDF_IRON_FAILURE_TLS,
-            0x49520006,
+            code,
             CNDF_IRON_STAGE_NEGOTIATION,
             message,
         );
@@ -154,23 +155,47 @@ mod tests {
                 false,
                 CNDF_IRON_FAILURE_NETWORK,
             ),
-            (
-                ConnectorError::new("TLS upgrade", ConnectorErrorKind::General).with_source(
-                    std::io::Error::other(rustls::Error::AlertReceived(
-                        rustls::AlertDescription::ProtocolVersion,
-                    )),
-                ),
-                false,
-                CNDF_IRON_FAILURE_TLS,
-            ),
         ];
         for (error, rejected, expected) in cases {
             let Failure(kind, _, _, description) = classify(&error, rejected);
             assert_eq!(kind, expected);
             assert!(!description.contains("secret sentinel"));
-            if kind == CNDF_IRON_FAILURE_TLS {
-                assert!(description.contains("below TLS 1.2"));
-            }
+        }
+    }
+
+    #[test]
+    fn distinguishes_tls_protocol_failures_from_other_handshake_failures() {
+        let cases = [
+            (
+                rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion),
+                0x4952000A,
+                "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
+            ),
+            (
+                rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::ServerDoesNotSupportTls12Or13,
+                ),
+                0x4952000A,
+                "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
+            ),
+            (
+                rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+                0x49520006,
+                "TLS handshake failed",
+            ),
+        ];
+        for (source, code, message) in cases {
+            let error = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
+                .with_source(std::io::Error::other(source));
+            assert_eq!(
+                classify(&error, false),
+                Failure(
+                    CNDF_IRON_FAILURE_TLS,
+                    code,
+                    CNDF_IRON_STAGE_NEGOTIATION,
+                    message,
+                ),
+            );
         }
     }
 }
