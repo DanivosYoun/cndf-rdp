@@ -20,6 +20,7 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertEqual(options.colorDepth, .depth32)
         XCTAssertNil(options.forcedDesktopSize)
         XCTAssertFalse(options.networkAutoDetect)
+        XCTAssertEqual(options.graphicsMode, .automatic)
     }
 
     func testStoresConnectionOptions() {
@@ -37,7 +38,8 @@ final class RDPConnectionOptionsTests: XCTestCase {
             preferDeviceNativeResolution: false,
             colorDepth: .depth24,
             forcedDesktopSize: CGSize(width: 1920, height: 1080),
-            networkAutoDetect: true
+            networkAutoDetect: true,
+            graphicsMode: .compatibility
         )
 
         XCTAssertEqual(options.securePassword, securePassword)
@@ -51,6 +53,7 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertEqual(options.colorDepth, .depth24)
         XCTAssertEqual(options.forcedDesktopSize, CGSize(width: 1920, height: 1080))
         XCTAssertTrue(options.networkAutoDetect)
+        XCTAssertEqual(options.graphicsMode, .compatibility)
     }
 
     func testSecureStringCanBeZeroized() {

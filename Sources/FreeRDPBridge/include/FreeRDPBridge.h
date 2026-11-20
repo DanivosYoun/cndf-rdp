@@ -165,6 +165,7 @@ typedef struct RDPBridgeConnectionOptions {
     // Advertise RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT so the server can measure RTT and
     // bandwidth. Leaves ConnectionType, perf flags, Heartbeat and Multitransport alone.
     bool networkAutoDetect;
+    bool compatibilityGraphics;
 } RDPBridgeConnectionOptions;
 
 typedef struct RDPBridgeLocalFile {
@@ -195,6 +196,19 @@ typedef struct RDPBridgeTLSSettings {
 // Reports the TLS settings a fresh client instance ends up with at `stage`.
 // Exposed so the ladder can be pinned by unit tests.
 bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSettings *out);
+
+typedef struct RDPBridgeGraphicsSettings {
+    bool graphicsPipeline;
+    bool h264;
+    bool avc444;
+    bool avc444v2;
+    bool progressive;
+    bool bitmapCache;
+    bool compression;
+} RDPBridgeGraphicsSettings;
+
+// Inspect the effective FreeRDP settings without opening a connection.
+bool rdp_bridge_graphics_settings_for_mode(bool compatibility, RDPBridgeGraphicsSettings *out);
 
 // Converts RDP pointer XOR/AND masks to what the pointer callback delivers (top-down,
 // straight-alpha BGRA, stride width * 4). `bgra` must hold width * height * 4 bytes.

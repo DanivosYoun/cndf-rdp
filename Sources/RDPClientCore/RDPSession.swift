@@ -355,7 +355,8 @@ public final class RDPSession {
                                                 desktopWidth: bridgeDesktopSize?.pixelWidth ?? 0,
                                                 desktopHeight: bridgeDesktopSize?.pixelHeight ?? 0,
                                                 desktopScale: bridgeDesktopSize?.scale ?? 1.0,
-                                                networkAutoDetect: options.networkAutoDetect
+                                                networkAutoDetect: options.networkAutoDetect,
+                                                compatibilityGraphics: options.graphicsMode == .compatibility
                                             )
                                             return rdp_bridge_connect(bridgeSession, &bridgeOptions)
                                         }

@@ -693,8 +693,9 @@ static void bridge_log_graphics_summary(RDPBridgeSession *session) {
     }
     bridge_logf(
         session,
-        "Graphics: summary rdpgfx=%s AVC420=%llu AVC444=%llu AVC444v2=%llu surfaceCommands:%s.",
+        "Graphics: summary rdpgfx=%s mode=%s AVC420=%llu AVC444=%llu AVC444v2=%llu surfaceCommands:%s.",
         session->gfx_caps_confirmed ? "yes" : "no",
+        session->retry_options.compatibilityGraphics ? "compat" : "auto",
         (unsigned long long)session->codec_counts[RDPGFX_CODECID_AVC420],
         (unsigned long long)session->codec_counts[RDPGFX_CODECID_AVC444],
         (unsigned long long)session->codec_counts[RDPGFX_CODECID_AVC444v2],
@@ -1147,6 +1148,17 @@ static BOOL bridge_add_redirected_folder(
     return TRUE;
 }
 
+static BOOL bridge_apply_graphics_mode(rdpSettings *settings, bool compatibility) {
+    const BOOL gfx = compatibility ? FALSE : TRUE;
+    // Keep FreeRDP's legacy compression and cache defaults. Enabling the bitmap
+    // cache would also advertise additional MEMBLT and MEM3BLT orders.
+    return freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, gfx) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxH264, gfx) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, gfx) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, gfx) &&
+           freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, gfx);
+}
+
 static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
@@ -1211,7 +1223,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_RedirectSerialPorts, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_RedirectParallelPorts, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE) &&
+           bridge_apply_graphics_mode(settings, options->compatibilityGraphics) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_DesktopResize, TRUE) &&
@@ -1221,10 +1233,6 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_AsyncUpdate, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_FastPathInput, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, TRUE) &&
-           freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, options->networkAutoDetect);
@@ -1626,6 +1634,34 @@ bool rdp_bridge_tls_settings_for_stage(RDPBridgeTLSStage stage, RDPBridgeTLSSett
     return ok;
 #else
     (void)stage;
+    return false;
+#endif
+}
+
+bool rdp_bridge_graphics_settings_for_mode(bool compatibility, RDPBridgeGraphicsSettings *out) {
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+#if defined(RDP_FREERDP_REAL)
+    rdpSettings *settings = freerdp_settings_new(0);
+    if (settings == NULL) {
+        return false;
+    }
+    const BOOL ok = bridge_apply_graphics_mode(settings, compatibility);
+    if (ok) {
+        out->graphicsPipeline = freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline);
+        out->h264 = freerdp_settings_get_bool(settings, FreeRDP_GfxH264);
+        out->avc444 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444);
+        out->avc444v2 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444v2);
+        out->progressive = freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive);
+        out->bitmapCache = freerdp_settings_get_bool(settings, FreeRDP_BitmapCacheEnabled);
+        out->compression = freerdp_settings_get_bool(settings, FreeRDP_CompressionEnabled);
+    }
+    freerdp_settings_free(settings);
+    return ok;
+#else
+    (void)compatibility;
     return false;
 #endif
 }

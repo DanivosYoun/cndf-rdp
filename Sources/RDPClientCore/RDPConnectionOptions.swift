@@ -21,6 +21,7 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let forcedDesktopSize: CGSize?
     /// Lets the server run RDP network auto-detection (RTT/bandwidth). Off by default.
     public let networkAutoDetect: Bool
+    public let graphicsMode: RDPGraphicsMode
 
     public init(
         host: String,
@@ -40,7 +41,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         preferDeviceNativeResolution: Bool = true,
         colorDepth: RDPColorDepth = .depth32,
         forcedDesktopSize: CGSize? = nil,
-        networkAutoDetect: Bool = false
+        networkAutoDetect: Bool = false,
+        graphicsMode: RDPGraphicsMode = .automatic
     ) {
         self.host = host
         self.port = port
@@ -60,7 +62,13 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.colorDepth = colorDepth
         self.forcedDesktopSize = forcedDesktopSize
         self.networkAutoDetect = networkAutoDetect
+        self.graphicsMode = graphicsMode
     }
+}
+
+public enum RDPGraphicsMode: String, Codable, Sendable {
+    case automatic = "auto"
+    case compatibility = "compat"
 }
 
 public enum RDPAudioPlaybackMode: UInt32, Equatable, Sendable {
