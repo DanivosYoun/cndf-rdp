@@ -92,21 +92,22 @@ public final class IronRDPSession: RDPEngineSession {
         callbacks.failure = { generation, kind, code, stage, bytes, length, context in
             guard let context else { return }
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
-            guard session.isCallbackCurrent(generation) else { return }
+            // A failure ends the generation; the engine sends no disconnect after it. Report
+            // the disconnect here, as FreeRDP does after its failure callback.
+            guard session.endCallbackGeneration(generation) else { return }
             let description = utf8String(bytes, length)
             session.emitLog("IronRDP connect failed: \(description) [\(String(format: "0x%08x", code))].")
             session.delegate?.rdpSession(
                 session,
                 didFailWith: RDPSessionError(ironKind: kind, code: code, stage: RDPConnectStage(stage), description: description)
             )
+            session.deliverDisconnect(.error)
         }
         callbacks.disconnect = { generation, kind, code, context in
             guard let context else { return }
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
-            guard session.isCallbackCurrent(generation) else { return }
-            session.lastRemotePointer = nil
-            session.emitLog("IronRDP disconnected.")
-            session.delegate?.rdpSession(session, didDisconnectWith: RDPDisconnectReason(ironKind: kind, code: code))
+            guard session.endCallbackGeneration(generation) else { return }
+            session.deliverDisconnect(RDPDisconnectReason(ironKind: kind, code: code))
         }
         callbacks.frame = { generation, bytes, width, height, stride, _, _, context in
             guard let bytes, let context else { return }
@@ -149,7 +150,8 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     deinit {
-        tearDownNativeSession()
+        // No delegate call from deinit: `self` must not escape it.
+        tearDownNativeSession(reportingDisconnect: false)
     }
 
     public var engine: RDPEngineKind { .ironRDP }
@@ -279,8 +281,10 @@ public final class IronRDPSession: RDPEngineSession {
 
     /// Rejects a pending certificate decision, requests shutdown and destroys the native
     /// session. When this returns no further callback starts (ABI `cndf_iron_session_destroy`).
+    /// If the connection had not ended yet, `didDisconnectWith(.localRequest)` is delivered
+    /// once before returning, as FreeRDP's worker does while `disconnect()` waits for it.
     public func disconnect() throws {
-        tearDownNativeSession()
+        tearDownNativeSession(reportingDisconnect: true)
     }
 
     public func pollLocalClipboard() throws {}
@@ -294,20 +298,20 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     /// A forced update (`sendForcedDesktopSize`) re-delivers the current framebuffer without a
-    /// server round trip; a resize is only requested when the size actually changed.
+    /// server round trip and requests the size again. Otherwise a resize is requested when the
+    /// size differs from the last one the engine accepted, so a rejected size is retried.
+    /// The view already debounces non-forced updates, so the coordinator's commit-on-ask
+    /// `sizeToSend` is not used: it would remember a size the engine rejected.
     public func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool = false) throws {
-        guard let size = resizeCoordinator.sizeToSend(
-            pointWidth: pointWidth,
-            pointHeight: pointHeight,
-            scale: scale,
-            force: force,
-            preferDeviceNativeResolution: lastConnectionOptions?.preferDeviceNativeResolution ?? true,
-            forcedDesktopSize: lastConnectionOptions?.forcedDesktopSize
-        ) else {
-            return
-        }
-
         try withSessionLock {
+            let size = resizeCoordinator.candidateSize(
+                pointWidth: pointWidth,
+                pointHeight: pointHeight,
+                scale: scale,
+                preferDeviceNativeResolution: lastConnectionOptions?.preferDeviceNativeResolution ?? true,
+                forcedDesktopSize: lastConnectionOptions?.forcedDesktopSize
+            )
+            guard force || size != currentDesktopSize else { return }
             guard let nativeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
             }
@@ -315,10 +319,12 @@ public final class IronRDPSession: RDPEngineSession {
                 // Best effort: before the first frame there is nothing to re-deliver.
                 _ = cndf_iron_redeliver_frame(nativeSession, nativeGeneration)
             }
-            guard size != currentDesktopSize else { return }
-            try throwIfNeeded(
-                cndf_iron_resize(nativeSession, nativeGeneration, size.pixelWidth, size.pixelHeight, scalePercent(size.scale))
-            )
+            let status = cndf_iron_resize(nativeSession, nativeGeneration, size.pixelWidth, size.pixelHeight, scalePercent(size.scale))
+            guard status == CNDF_IRON_OK else {
+                emitLog("IronRDP resize to \(size.pixelWidth)x\(size.pixelHeight) rejected [\(status.rawValue)].")
+                try throwIfNeeded(status)
+                return
+            }
             currentDesktopSize = size
         }
     }
@@ -363,7 +369,14 @@ public final class IronRDPSession: RDPEngineSession {
         try send(event)
     }
 
-    // Pointer and disconnect callbacks are serialized on the delivery thread.
+    // Pointer and disconnect callbacks are serialized on the delivery thread; the local
+    // disconnect report runs only after destroy, when no callback can start.
+    private func deliverDisconnect(_ reason: RDPDisconnectReason) {
+        lastRemotePointer = nil
+        emitLog("IronRDP disconnected.")
+        delegate?.rdpSession(self, didDisconnectWith: reason)
+    }
+
     func deliverRemotePointer(_ pointer: RDPRemotePointer) {
         guard lastRemotePointer != pointer else { return }
         lastRemotePointer = pointer
@@ -376,6 +389,17 @@ public final class IronRDPSession: RDPEngineSession {
         return callbackGeneration == generation
     }
 
+    /// Ends `generation` if it is current. Exactly one caller wins per generation — the
+    /// engine's failure or disconnect callback, or the local teardown — and that caller
+    /// reports the disconnect. Later callbacks of the generation are dropped as stale.
+    private func endCallbackGeneration(_ generation: UInt64?) -> Bool {
+        callbackLock.lock()
+        defer { callbackLock.unlock() }
+        guard let generation, callbackGeneration == generation else { return false }
+        callbackGeneration = nil
+        return true
+    }
+
     private func send(_ event: CNDFIronInputEvent) throws {
         try withSessionLock {
             guard let nativeSession else {
@@ -386,7 +410,7 @@ public final class IronRDPSession: RDPEngineSession {
         }
     }
 
-    private func tearDownNativeSession() {
+    private func tearDownNativeSession(reportingDisconnect: Bool) {
         // A certificate callback holds the native callback gate while it waits; destroy would
         // wait for it, so the decision is rejected first (design I6).
         callbackLock.lock()
@@ -403,9 +427,14 @@ public final class IronRDPSession: RDPEngineSession {
         guard let handle else { return }
         _ = cndf_iron_disconnect(handle)
         cndf_iron_session_destroy(handle, Self.destroyJoinTimeoutMs)
+        // destroy closed the callback gate, so the engine's own disconnect report for a live
+        // generation was dropped; report it here instead.
         callbackLock.lock()
-        callbackGeneration = nil
+        let generation = callbackGeneration
         callbackLock.unlock()
+        if endCallbackGeneration(generation), reportingDisconnect {
+            deliverDisconnect(.localRequest)
+        }
     }
 
     private func evaluateCertificateTrust(fingerprint: String, hostname: String, port: UInt16) -> Bool {
