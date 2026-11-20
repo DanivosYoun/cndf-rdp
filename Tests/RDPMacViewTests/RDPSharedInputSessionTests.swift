@@ -173,7 +173,16 @@ final class RDPSharedInputSessionTests: XCTestCase {
 
     @MainActor
     func testTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock() async throws {
-        let native = try RDPSession()
+        try await checkTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock(try RDPSession())
+    }
+
+    @MainActor
+    func testTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlockIronRDP() async throws {
+        try await checkTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock(try IronRDPSession())
+    }
+
+    @MainActor
+    private func checkTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock(_ native: RDPEngineSession) async throws {
         let queue = ManualQueue()
         let sender = FakeSender()
         let executor = RDPInputExecutorRegistry.executor(for: native, schedule: queue.schedule, makeSender: { _, _ in sender })
@@ -216,7 +225,19 @@ final class RDPSharedInputSessionTests: XCTestCase {
 
     @MainActor
     func testDetachedViewHandleRetainsItsNativeSessionThroughClose() async throws {
-        var native: RDPSession? = try RDPSession()
+        try await checkDetachedViewHandleRetainsItsNativeSessionThroughClose { try RDPSession() }
+    }
+
+    @MainActor
+    func testDetachedViewHandleRetainsItsNativeSessionThroughCloseIronRDP() async throws {
+        try await checkDetachedViewHandleRetainsItsNativeSessionThroughClose { try IronRDPSession() }
+    }
+
+    @MainActor
+    private func checkDetachedViewHandleRetainsItsNativeSessionThroughClose(
+        _ makeNative: () throws -> RDPEngineSession
+    ) async throws {
+        var native: RDPEngineSession? = try makeNative()
         weak var reference = native
         let view = RDPClientView(frame: .zero)
         view.session = native
@@ -230,7 +251,14 @@ final class RDPSharedInputSessionTests: XCTestCase {
     }
 
     func testDelayedOldGenerationCannotReplaceNewConnectionRegistry() throws {
-        let native = try RDPSession()
+        try checkDelayedOldGenerationCannotReplaceNewConnectionRegistry(try RDPSession())
+    }
+
+    func testDelayedOldGenerationCannotReplaceNewConnectionRegistryIronRDP() throws {
+        try checkDelayedOldGenerationCannotReplaceNewConnectionRegistry(try IronRDPSession())
+    }
+
+    private func checkDelayedOldGenerationCannotReplaceNewConnectionRegistry(_ native: RDPEngineSession) throws {
         let queue = ManualQueue()
         let newSender = FakeSender()
         let newest = RDPInputExecutorRegistry.executor(for: native, generation: 2, schedule: queue.schedule, makeSender: { _, _ in newSender })

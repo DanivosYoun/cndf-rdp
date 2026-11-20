@@ -4,7 +4,7 @@ import QuartzCore
 import RDPClientCore
 
 public final class RDPClientView: NSView {
-    public weak var session: RDPSession?
+    public weak var session: RDPEngineSession?
     public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)? {
         didSet { frameTapDidChange?() }
     }

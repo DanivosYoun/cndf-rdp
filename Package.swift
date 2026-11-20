@@ -5,6 +5,8 @@ import PackageDescription
 
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let freeRDPInstall = "\(packageRoot)/Vendor/FreeRDP/install"
+// Built by Scripts/build-ironrdp.sh (aarch64-apple-darwin static library, design D1).
+let ironRDPInstall = "\(packageRoot)/Vendor/IronRDP/install"
 
 let package = Package(
     name: "RDPMac",
@@ -14,11 +16,13 @@ let package = Package(
     products: [
         .executable(name: "rdp-mac", targets: ["RDPMacApp"]),
         .executable(name: "window-close-stress-test", targets: ["WindowCloseStressTest"]),
+        .executable(name: "rdp-engine-harness", targets: ["RDPEngineHarness"]),
         .library(name: "RDPClientCore", targets: ["RDPClientCore"]),
         .library(name: "RDPMacView", targets: ["RDPMacView"]),
         .library(name: "ClipboardBridge", targets: ["ClipboardBridge"]),
         .library(name: "FileTransferStaging", targets: ["FileTransferStaging"]),
-        .library(name: "FreeRDPBridge", targets: ["FreeRDPBridge"])
+        .library(name: "FreeRDPBridge", targets: ["FreeRDPBridge"]),
+        .library(name: "IronRDPBridge", targets: ["IronRDPBridge"])
     ],
     targets: [
         .executableTarget(
@@ -29,13 +33,17 @@ let package = Package(
             name: "WindowCloseStressTest",
             dependencies: ["RDPClientCore", "RDPMacView"]
         ),
+        .executableTarget(
+            name: "RDPEngineHarness",
+            dependencies: ["RDPClientCore", "RDPMacView"]
+        ),
         .target(
             name: "RDPMacView",
             dependencies: ["RDPClientCore"]
         ),
         .target(
             name: "RDPClientCore",
-            dependencies: ["FreeRDPBridge", "ClipboardBridge", "FileTransferStaging"]
+            dependencies: ["FreeRDPBridge", "IronRDPBridge", "ClipboardBridge", "FileTransferStaging"]
         ),
         .target(
             name: "ClipboardBridge",
@@ -65,6 +73,21 @@ let package = Package(
                 ])
             ]
         ),
+        .target(
+            name: "IronRDPBridge",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .unsafeFlags([
+                    "-L\(ironRDPInstall)/lib",
+                    "-lcndf_ironrdp"
+                ]),
+                // sspi's smart-card dependency needs the system zlib (found by C1).
+                .linkedLibrary("z"),
+                .linkedFramework("Security"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("SystemConfiguration")
+            ]
+        ),
         .testTarget(
             name: "ClipboardBridgeTests",
             dependencies: ["ClipboardBridge"]
@@ -79,7 +102,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RDPClientCoreTests",
-            dependencies: ["RDPClientCore"]
+            dependencies: ["RDPClientCore", "IronRDPBridge"]
         ),
         .testTarget(
             name: "RDPMacViewTests",

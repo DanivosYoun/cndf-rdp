@@ -21,14 +21,14 @@ import RDPMacView
 
 private enum HarnessError: Error, CustomStringConvertible {
     case usage(String)
-    case engineUnavailable(String)
+    case unknownEngine(String)
 
     var description: String {
         switch self {
         case .usage(let message):
             "usage error: \(message)"
-        case .engineUnavailable(let engine):
-            "engine '\(engine)' is not available in this build (RDPConnectionOptions.engine lands with C2)"
+        case .unknownEngine(let engine):
+            "unknown engine '\(engine)' (expected freerdp or ironrdp)"
         }
     }
 }
@@ -108,6 +108,9 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
     /// Per trust callback: SHA-256 of each certificate in the trust string, in order. Shows
     /// what the engine puts in the string (leaf only, leaf + chain, ...) for design I3.
     private(set) var trustStringCertificates: [[String]] = []
+    /// Per trust callback: SHA-256 of the exact trust string bytes before lowercasing, so two
+    /// engines can be compared byte for byte (design I3).
+    private(set) var trustStringDigests: [String] = []
     private(set) var prompts = 0
     private(set) var failure: RDPSessionError?
     private(set) var disconnectReason: RDPDisconnectReason?
@@ -155,6 +158,8 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
         port: UInt16
     ) async -> Bool {
         guard noteCallback() else { return false }
+        let digest = SHA256.hash(data: Data(fingerprint.utf8)).map { String(format: "%02x", $0) }.joined()
+        lock.withLock { trustStringDigests.append(digest) }
         return classifyTrust(
             key: "\(hostname):\(port)",
             value: fingerprint.lowercased(),
@@ -297,6 +302,7 @@ private func failureName(_ error: RDPSessionError) -> String {
     case .certificateRejected: "certificateRejected"
     case .freerdp: "freerdp"
     case .configurationInvalid: "configurationInvalid"
+    case .ironrdp: "ironrdp"
     }
 }
 
@@ -311,6 +317,7 @@ private func disconnectName(_ reason: RDPDisconnectReason) -> String {
 
 private func runIteration(
     _ run: HarnessRun,
+    engine: RDPEngineKind,
     iteration: Int,
     trustStore: TrustStore,
     workDirectory: URL
@@ -329,7 +336,8 @@ private func runIteration(
         logFileURL: logURL,
         logLevel: .info,
         networkAutoDetect: run.networkAutoDetect ?? false,
-        graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic
+        graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic,
+        engine: engine
     )
 
     let size = run.window ?? HarnessSize(width: 1280, height: 800)
@@ -482,6 +490,7 @@ private func runIteration(
     result.tapPixelBufferBytes = probe.pixelBufferBytes
     result.trustCallbacks = delegate.trustCallbacks
     result.trustStringCertificates = delegate.trustStringCertificates
+    result.trustStringDigests = delegate.trustStringDigests
     result.prompts = delegate.prompts
     if let failure = delegate.failure {
         result.failure = failureName(failure)
@@ -535,10 +544,14 @@ private func iso8601Now() -> String {
 
 private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
     let scenario = try JSONDecoder().decode(HarnessScenario.self, from: Data(contentsOf: arguments.scenarioURL))
-    let engine = arguments.engine ?? scenario.engine ?? "freerdp"
-    // Engine selection is a placeholder until C2: only the FreeRDP session exists.
-    guard engine == "freerdp" else {
-        throw HarnessError.engineUnavailable(engine)
+    // A run's own engine wins (mixed-engine scenarios such as I3); otherwise --engine, then
+    // the scenario default, then FreeRDP.
+    let engine = arguments.engine ?? scenario.engine ?? RDPEngineKind.freeRDP.rawValue
+    guard RDPEngineKind(rawValue: engine) != nil else { throw HarnessError.unknownEngine(engine) }
+    for run in scenario.runs {
+        if let runEngine = run.engine, RDPEngineKind(rawValue: runEngine) == nil {
+            throw HarnessError.unknownEngine(runEngine)
+        }
     }
     try FileManager.default.createDirectory(at: arguments.workDirectory, withIntermediateDirectories: true)
     let trustStore = TrustStore(suiteName: arguments.trustSuite)
@@ -548,19 +561,22 @@ private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
     let startedAt = iso8601Now()
     var runs: [RunResult] = []
     for run in scenario.runs {
-        fputs("== run \(run.id) (\(run.host):\(run.port))\n", stderr)
+        let runEngine = RDPEngineKind(rawValue: run.engine ?? engine) ?? .freeRDP
+        let expect = run.expectByEngine?[runEngine.rawValue] ?? run.expect
+        fputs("== run \(run.id) (\(run.host):\(run.port), engine \(runEngine.rawValue))\n", stderr)
         var iterations: [IterationResult] = []
         var failures: [String] = []
         for iteration in 1...max(1, run.repeatCount ?? 1) {
             let result = autoreleasepool {
-                runIteration(run, iteration: iteration, trustStore: trustStore, workDirectory: arguments.workDirectory)
+                runIteration(run, engine: runEngine, iteration: iteration, trustStore: trustStore, workDirectory: arguments.workDirectory)
             }
-            failures += evaluate(result, against: run.expect)
+            failures += evaluate(result, against: expect)
             iterations.append(result)
             drainRunLoop(0.5)
         }
         runs.append(RunResult(
             id: run.id,
+            engine: runEngine.rawValue,
             host: run.host,
             port: run.port,
             iterations: iterations,

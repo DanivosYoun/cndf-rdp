@@ -15,7 +15,7 @@
 #
 # Environment:
 #   HARNESS_BATCH   label value for roster.batch (required; containers carry it)
-#   HARNESS_ENGINE  freerdp (default) | ironrdp (needs C2; the harness refuses it today)
+#   HARNESS_ENGINE  freerdp (default) | ironrdp; i3-freerdp-then-ironrdp always mixes both
 #   HARNESS_WORK    Linux state dir   (default ~/.cache/rdp-engine-harness-$HARNESS_BATCH)
 #   HARNESS_MAC     ssh target        (default danivosy@192.168.3.105)
 #   HARNESS_MAC_DIR dir under Mac ~   (default xcode-work/rdp-engine-harness-$HARNESS_BATCH)
@@ -152,36 +152,15 @@ tunnel_up() {
   log "tunnel pid $(cat "${WORK}/tunnel.pid")"
 }
 
-# Builds the harness on the Mac as a throwaway wrapper package that depends on this checkout
-# by path. Once C2 adds the RDPEngineHarness target to Package.swift this becomes
-# `swift build --product rdp-engine-harness` in the checkout itself.
+# Builds FreeRDP and IronRDP (if not built yet) and the rdp-engine-harness product on the Mac.
 mac_build() {
   rsync -a --delete --mkpath --exclude .git --exclude .build --exclude Vendor \
     --rsync-path=/opt/homebrew/bin/rsync "${ROOT_DIR}/" "${MAC}:${MAC_DIR}/cndf-rdp/"
   mac "set -euo pipefail; export ${MAC_PATH}; M=\$HOME/${MAC_DIR}
     cd \$M/cndf-rdp
     [[ -f Vendor/FreeRDP/install/lib/libfreerdp3.dylib ]] || bash Scripts/build-freerdp.sh > \$M/freerdp-build.log 2>&1
-    mkdir -p \$M/harness-pkg/Sources
-    ln -sfn \$M/cndf-rdp/Sources/RDPEngineHarness \$M/harness-pkg/Sources/RDPEngineHarness
-    cat > \$M/harness-pkg/Package.swift <<EOF
-// swift-tools-version: 5.10
-import PackageDescription
-let package = Package(
-    name: \"RDPEngineHarnessBuild\",
-    platforms: [.macOS(.v13)],
-    dependencies: [.package(name: \"RDPMac\", path: \"\$M/cndf-rdp\")],
-    targets: [
-        .executableTarget(
-            name: \"RDPEngineHarness\",
-            dependencies: [
-                .product(name: \"RDPClientCore\", package: \"RDPMac\"),
-                .product(name: \"RDPMacView\", package: \"RDPMac\")
-            ]
-        )
-    ]
-)
-EOF
-    cd \$M/harness-pkg && swift build -c release 2>&1 | tail -3"
+    [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh > \$M/ironrdp-build.log 2>&1
+    swift build -c release --product rdp-engine-harness 2>&1 | tail -3"
 }
 
 # Runs one scenario on the Mac. FreeRDP's own known_hosts lives under \$HOME, so the
@@ -195,7 +174,7 @@ run_scenario() {
   set +e
   mac "set -a; source \$HOME/${MAC_DIR}/secrets.env; set +a; M=\$HOME/${MAC_DIR}
     mkdir -p \$M/home \$M/results \$M/work
-    HOME=\$M/home \$M/harness-pkg/.build/release/RDPEngineHarness \
+    HOME=\$M/home \$M/cndf-rdp/.build/release/rdp-engine-harness \
       --scenario \$M/scenarios/${base}.json --out \$M/results/${base}.json --engine ${ENGINE} \
       --trust-suite cndf.rdp-engine-harness.${HARNESS_BATCH} --work-dir \$M/work $*" \
     > "${WORK}/results/${base}.stdout.log" 2> "${WORK}/results/${base}.stderr.log"
@@ -224,6 +203,15 @@ scenarios() {
   run_scenario "${s}/baseline-b1.json" --reset-trust 1
   run_scenario "${s}/baseline-b2.json"
   run_scenario "${s}/baseline-b3.json"
+  if [[ "${ENGINE}" == ironrdp ]]; then
+    # The interop pin below is about the FreeRDP client; with IronRDP only I3 is added: the
+    # same server first through FreeRDP, then IronRDP, must not prompt (design I3).
+    mac "rm -rf \$HOME/${MAC_DIR}/home"
+    start_b1 a
+    run_scenario "${s}/i3-freerdp-then-ironrdp.json" --reset-trust 1 --drop-trust 1
+    log "results in ${WORK}/results"
+    return
+  fi
   # Pins a known interop gap: FreeRDP 3.33.1 client with networkAutoDetect off (the app
   # default) fails against the 3.33.1 shadow server at capabilities ("MCS message channel
   # id == 0"); baseline-b2 therefore turns auto-detect on.

@@ -58,7 +58,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     public weak var delegate: RDPConnectionViewDelegate?
 
     public let clientView: RDPClientView
-    private var session: RDPSession?
+    private var session: RDPEngineSession?
     private var clipboardTimer: Timer?
     private var isShutdown = false
     private let mainCallbackLock = NSLock()
@@ -121,7 +121,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
         disconnect()
 
-        let session = try RDPSession()
+        let session = try makeSession(for: options.engine)
         session.delegate = self
         self.session = session
         clientView.session = session
@@ -131,6 +131,21 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         clientView.sendForcedDesktopSize()
         startClipboardPolling()
         delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
+    }
+
+    /// The engine of the current session; nil when there is none.
+    public var engine: RDPEngineKind? {
+        session?.engine
+    }
+
+    /// One session class per engine (design D3); the choice is fixed for the session's lifetime.
+    private func makeSession(for engine: RDPEngineKind) throws -> RDPEngineSession {
+        switch engine {
+        case .freeRDP:
+            return try RDPSession()
+        case .ironRDP:
+            return try IronRDPSession()
+        }
     }
 
     public func disconnect() {
@@ -402,7 +417,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         max(0, Int(Date().timeIntervalSince(startDate) * 1000))
     }
 
-    public func rdpSessionOutputResumedForInput(_ session: RDPSession) {
+    public func rdpSessionOutputResumedForInput(_ session: RDPEngineSession) {
         enqueueMainCallback { [weak self, weak session] in
             guard let self, !self.isShutdown, let session, self.session === session else { return }
             self.outputSuppression.outputResumedForInput()
@@ -410,19 +425,20 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
     }
 
-    public func rdpSession(_ session: RDPSession, didLog message: String) {
+    public func rdpSession(_ session: RDPEngineSession, didLog message: String) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didLog: message)
         enqueueMainCallback { [weak self] in
             guard let self, !self.isShutdown else { return }
-            if message == "FreeRDP connected." || message == "Display control channel connected." {
+            let connected = message == "FreeRDP connected." || message == "IronRDP connected."
+            if connected || message == "Display control channel connected." {
                 self.clientView.sendForcedDesktopSize()
             }
-            if message == "FreeRDP connected." {
-                // A fresh FreeRDP connection starts with output allowed; re-evaluate from there.
+            if connected {
+                // A fresh connection starts with output allowed; re-evaluate from there.
                 self.outputSuppression.connectionDidReset()
                 self.evaluateOutputSuppression()
-            } else if message == "FreeRDP disconnected." {
+            } else if message == "FreeRDP disconnected." || message == "IronRDP disconnected." {
                 self.evaluateOutputSuppression()
             }
             self.delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
@@ -430,7 +446,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     }
 
     public func rdpSession(
-        _ session: RDPSession,
+        _ session: RDPEngineSession,
         shouldTrustCertificateFingerprint fingerprint: String,
         hostname: String,
         port: UInt16
@@ -446,27 +462,27 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         ) ?? false
     }
 
-    public func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {
+    public func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didFailWith: error)
     }
 
-    public func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {
+    public func rdpSession(_ session: RDPEngineSession, didDisconnectWith reason: RDPDisconnectReason) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didDisconnectWith: reason)
     }
 
-    public func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String) {
+    public func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didReceiveRemoteText: text)
     }
 
-    public func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
+    public func rdpSession(_ session: RDPEngineSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
         guard !isShutdown else { return }
         delegate?.rdpConnectionView(self, didReceiveRemoteFiles: files)
     }
 
-    public func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {
+    public func rdpSession(_ session: RDPEngineSession, didUpdatePointer pointer: RDPRemotePointer) {
         guard !isShutdown else { return }
         pointerSlotLock.lock()
         let deliveryQueued = pendingPointer != nil
@@ -484,7 +500,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
     }
 
-    public func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
+    public func rdpSession(_ session: RDPEngineSession, didReceiveFrame frame: RDPFrame) {
         guard !isShutdown else { return }
         frameSlotLock.lock()
         let deliveryQueued = pendingFrame != nil

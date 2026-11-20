@@ -22,6 +22,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     /// Lets the server run RDP network auto-detection (RTT/bandwidth). Off by default.
     public let networkAutoDetect: Bool
     public let graphicsMode: RDPGraphicsMode
+    /// The engine `RDPConnectionView.connect` creates the session with. Fixed for the session.
+    public let engine: RDPEngineKind
 
     public init(
         host: String,
@@ -42,7 +44,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         colorDepth: RDPColorDepth = .depth32,
         forcedDesktopSize: CGSize? = nil,
         networkAutoDetect: Bool = false,
-        graphicsMode: RDPGraphicsMode = .automatic
+        graphicsMode: RDPGraphicsMode = .automatic,
+        engine: RDPEngineKind = .freeRDP
     ) {
         self.host = host
         self.port = port
@@ -63,12 +66,18 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.forcedDesktopSize = forcedDesktopSize
         self.networkAutoDetect = networkAutoDetect
         self.graphicsMode = graphicsMode
+        self.engine = engine
     }
 }
 
 public enum RDPGraphicsMode: String, Codable, Sendable {
     case automatic = "auto"
     case compatibility = "compat"
+}
+
+public enum RDPEngineKind: String, Codable, Sendable {
+    case freeRDP = "freerdp"
+    case ironRDP = "ironrdp"
 }
 
 public enum RDPAudioPlaybackMode: UInt32, Equatable, Sendable {

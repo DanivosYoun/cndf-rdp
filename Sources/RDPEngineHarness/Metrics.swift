@@ -80,6 +80,8 @@ struct IterationResult: Encodable {
     var trustCallbacks: [String] = []
     /// SHA-256 of each certificate inside each trust string (see HarnessDelegate).
     var trustStringCertificates: [[String]] = []
+    /// SHA-256 of each raw trust string (see HarnessDelegate).
+    var trustStringDigests: [String] = []
     var prompts = 0
     var failure: String?
     var failureDetail: String?
@@ -108,6 +110,7 @@ struct IterationResult: Encodable {
 
 struct RunResult: Encodable {
     var id: String
+    var engine: String
     var host: String
     var port: UInt16
     var iterations: [IterationResult]

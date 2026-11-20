@@ -117,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
         window = nil
     }
 
-    func rdpSession(_ session: RDPSession, didLog message: String) {
+    func rdpSession(_ session: RDPEngineSession, didLog message: String) {
         NSLog("[RDP] \(message)")
         DispatchQueue.main.async { [weak self] in
             self?.connectionBar?.setStatus(message)
@@ -132,26 +132,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
         }
     }
 
-    func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String) {
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String) {
         NSLog("[RDP] received remote text, \(text.count) chars")
     }
 
-    func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {
+    func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError) {
         NSLog("[RDP] failed: \(String(describing: error))")
         DispatchQueue.main.async { [weak self] in
             self?.connectionBar?.setStatus("Failed: \(String(describing: error))")
         }
     }
 
-    func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {
+    func rdpSession(_ session: RDPEngineSession, didDisconnectWith reason: RDPDisconnectReason) {
         NSLog("[RDP] disconnected: \(String(describing: reason))")
     }
 
-    func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
         NSLog("[RDP] received remote files, \(files.count) files")
     }
 
-    func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {
+    func rdpSession(_ session: RDPEngineSession, didReceiveFrame frame: RDPFrame) {
         receivedFrameCount += 1
         let frameSize = CGSize(width: frame.width, height: frame.height)
         if receivedFrameCount == 1 || receivedFrameCount % 120 == 0 || frameSize != lastFrameSize {

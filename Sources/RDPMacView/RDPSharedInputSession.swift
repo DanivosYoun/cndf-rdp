@@ -148,7 +148,7 @@ public final class RDPSharedInputSession: @unchecked Sendable {
 
 // MARK: - Native connection seam
 
-/// The final native sender. Production binds it to one `RDPSession` connection generation;
+/// The final native sender. Production binds it to one `RDPEngineSession` connection generation;
 /// tests substitute a recording fake.
 protocol RDPInputSending: AnyObject {
     var connectionLifetime: AnyObject? { get }
@@ -168,11 +168,11 @@ extension RDPInputSending {
 }
 
 final class RDPSessionInputSender: RDPInputSending {
-    weak var session: RDPSession?
+    weak var session: RDPEngineSession?
     var connectionLifetime: AnyObject? { session }
     let generation: UInt64
 
-    init(session: RDPSession, generation: UInt64? = nil) {
+    init(session: RDPEngineSession, generation: UInt64? = nil) {
         self.session = session
         self.generation = generation ?? session.connectionGeneration
     }
@@ -232,13 +232,13 @@ final class RDPInputExecutorRegistry {
         }
     }
     private static let lock = NSLock()
-    private static let bindings = NSMapTable<RDPSession, Binding>(keyOptions: .weakMemory, valueOptions: .strongMemory)
+    private static let bindings = NSMapTable<AnyObject, Binding>(keyOptions: .weakMemory, valueOptions: .strongMemory)
 
     static func executor(
-        for session: RDPSession,
+        for session: RDPEngineSession,
         generation: UInt64? = nil,
         schedule: @escaping (@escaping () -> Void) -> Void,
-        makeSender: (RDPSession, UInt64) -> RDPInputSending = { RDPSessionInputSender(session: $0, generation: $1) }
+        makeSender: (RDPEngineSession, UInt64) -> RDPInputSending = { RDPSessionInputSender(session: $0, generation: $1) }
     ) -> RDPInputExecutor {
         let generation = generation ?? session.connectionGeneration
         lock.lock()

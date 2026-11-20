@@ -17,12 +17,12 @@ final class PointerDeliveryTests: XCTestCase {
 }
 
 private final class PointerDelegate: RDPSessionDelegate {
-    func rdpSession(_ session: RDPSession, didLog message: String) {}
-    func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String) {}
-    func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {}
-    func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame) {}
+    func rdpSession(_ session: RDPEngineSession, didLog message: String) {}
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String) {}
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {}
+    func rdpSession(_ session: RDPEngineSession, didReceiveFrame frame: RDPFrame) {}
     var pointers: [RDPRemotePointer] = []
-    func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {
+    func rdpSession(_ session: RDPEngineSession, didUpdatePointer pointer: RDPRemotePointer) {
         pointers.append(pointer)
     }
 }

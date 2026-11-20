@@ -4,7 +4,7 @@ import Foundation
 /// one certificate trust store (so "new -> same -> changed -> rejected" can be chained).
 struct HarnessScenario: Decodable {
     var name: String
-    /// Engine to drive. Only `freerdp` exists until C2 adds `RDPConnectionOptions.engine`.
+    /// Default engine for runs without their own: `freerdp` or `ironrdp` (`--engine` overrides).
     var engine: String?
     var runs: [HarnessRun]
 }
@@ -29,9 +29,15 @@ struct HarnessRun: Decodable {
     var promptAnswer: String?
     var steps: [HarnessStep]
     var expect: HarnessExpectation?
+    /// Engine for this run only (overrides `--engine`); lets one scenario mix engines.
+    var engine: String?
+    /// Replaces `expect` when this run uses the keyed engine. IronRDP has no known_hosts of
+    /// its own, so a stored certificate reaches the app as a "same" callback instead of none.
+    var expectByEngine: [String: HarnessExpectation]?
 
     enum CodingKeys: String, CodingKey {
         case id, host, port, username, passwordEnv, domain, graphicsMode, networkAutoDetect, window, steps, expect
+        case engine, expectByEngine
         case promptAnswer
         case repeatCount = "repeat"
     }

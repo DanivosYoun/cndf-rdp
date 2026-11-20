@@ -28,6 +28,8 @@ public enum RDPSessionError: Error, Equatable, Sendable {
     case certificateRejected
     case freerdp(code: UInt32, description: String)
     case configurationInvalid(reason: String)
+    /// An IronRDP failure outside the shared categories; `code` is in the 0x4952xxxx range.
+    case ironrdp(code: UInt32, description: String)
 }
 
 public enum RDPDisconnectReason: Equatable, Sendable {
@@ -55,34 +57,34 @@ public struct RDPConnectionStatistics: Equatable, Sendable {
 }
 
 public protocol RDPSessionDelegate: AnyObject {
-    func rdpSession(_ session: RDPSession, didLog message: String)
+    func rdpSession(_ session: RDPEngineSession, didLog message: String)
     func rdpSession(
-        _ session: RDPSession,
+        _ session: RDPEngineSession,
         shouldTrustCertificateFingerprint fingerprint: String,
         hostname: String,
         port: UInt16
     ) async -> Bool
-    func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError)
-    func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason)
-    func rdpSession(_ session: RDPSession, didReceiveRemoteText text: String)
-    func rdpSession(_ session: RDPSession, didReceiveRemoteFiles files: [RDPRemoteFile])
-    func rdpSession(_ session: RDPSession, didReceiveFrame frame: RDPFrame)
-    func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer)
-    func rdpSessionOutputResumedForInput(_ session: RDPSession)
+    func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError)
+    func rdpSession(_ session: RDPEngineSession, didDisconnectWith reason: RDPDisconnectReason)
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String)
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteFiles files: [RDPRemoteFile])
+    func rdpSession(_ session: RDPEngineSession, didReceiveFrame frame: RDPFrame)
+    func rdpSession(_ session: RDPEngineSession, didUpdatePointer pointer: RDPRemotePointer)
+    func rdpSessionOutputResumedForInput(_ session: RDPEngineSession)
 }
 
 public extension RDPSessionDelegate {
     func rdpSession(
-        _ session: RDPSession,
+        _ session: RDPEngineSession,
         shouldTrustCertificateFingerprint fingerprint: String,
         hostname: String,
         port: UInt16
     ) async -> Bool { false }  // fail closed: a conformer that omits this must NOT auto-trust certs
 
-    func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError) {}
-    func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason) {}
-    func rdpSession(_ session: RDPSession, didUpdatePointer pointer: RDPRemotePointer) {}
-    func rdpSessionOutputResumedForInput(_ session: RDPSession) {}
+    func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError) {}
+    func rdpSession(_ session: RDPEngineSession, didDisconnectWith reason: RDPDisconnectReason) {}
+    func rdpSession(_ session: RDPEngineSession, didUpdatePointer pointer: RDPRemotePointer) {}
+    func rdpSessionOutputResumedForInput(_ session: RDPEngineSession) {}
 }
 
 public final class RDPSession {
@@ -653,6 +655,11 @@ public final class RDPSession {
             }
         }
     }
+}
+
+extension RDPSession: RDPEngineSession {
+    public var engine: RDPEngineKind { .freeRDP }
+    public var supportsClipboard: Bool { true }
 }
 
 private extension RDPPointerButton {
