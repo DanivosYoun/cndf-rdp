@@ -73,6 +73,8 @@ struct HarnessExpectation: Decodable {
     var prompts: Int?
     /// Expected failure case name (e.g. "certificateRejected"); nil = no failure expected.
     var failure: String?
+    /// Expected disconnect case name before the harness shuts down the view.
+    var disconnect: String?
     /// Upper bound for view.shutdown() wall time.
     var maxShutdownMs: Int?
     /// The resize step leaves the session connected, without a disconnect or reconnect.

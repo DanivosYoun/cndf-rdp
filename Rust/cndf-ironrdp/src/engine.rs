@@ -23,9 +23,10 @@ pub(super) fn start_workers(
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let (output, updates) = async_channel::channel(128);
     let delivery = Arc::clone(&connection);
+    let minimum = options.log_level;
     let deliver_thread = thread::Builder::new()
         .name(format!("cndf-iron-{}-deliver", connection.generation))
-        .spawn(move || delivery.worker(|| deliver(&delivery, updates)))?;
+        .spawn(move || delivery.worker(|| deliver(&delivery, updates, minimum)))?;
     let session_thread = thread::Builder::new()
         .name(format!("cndf-iron-{}-session", connection.generation))
         .spawn(move || {
@@ -321,7 +322,11 @@ async fn forward(
     }
 }
 
-fn deliver(connection: &Connection, mut updates: async_channel::Receiver<Output>) {
+fn deliver(
+    connection: &Connection,
+    mut updates: async_channel::Receiver<Output>,
+    minimum: CNDFIronLogLevel,
+) {
     let mut frame = Frame::default();
     let mut batch = Instant::now();
     let mut pending = None;
@@ -353,7 +358,7 @@ fn deliver(connection: &Connection, mut updates: async_channel::Receiver<Output>
                     if matches!(event, RdpOutputEvent::Terminated(_)) {
                         frame.publish(connection, false);
                     }
-                    deliver_event(connection, event);
+                    deliver_event(connection, event, minimum);
                 }
                 Output::Redeliver => frame.publish(connection, true),
             },
@@ -397,7 +402,7 @@ fn report_active_framebuffer_failure(
     );
 }
 
-fn deliver_event(connection: &Connection, event: RdpOutputEvent) {
+fn deliver_event(connection: &Connection, event: RdpOutputEvent, minimum: CNDFIronLogLevel) {
     use CNDFIronDisconnectKind::*;
     use CNDFIronPointerKind::*;
     let generation = connection.generation;
@@ -412,6 +417,16 @@ fn deliver_event(connection: &Connection, event: RdpOutputEvent) {
         }
         RdpOutputEvent::Terminated(result) => {
             if let Err(error) = &result {
+                // Display gives the session context. Include the immediate PDU error, whose
+                // description is static, without walking sources such as CredSSP or TLS.
+                let mut message = format!("IronRDP session terminated: {error}");
+                if let Some(pdu) = std::error::Error::source(error)
+                    .and_then(|source| source.downcast_ref::<ironrdp_pdu::PduError>())
+                {
+                    use std::fmt::Write as _;
+                    let _ = write!(message, ": {pdu}");
+                }
+                log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_ERROR, &message);
                 if let Some(error) = errors::framebuffer_cause(error) {
                     report_active_framebuffer_failure(connection, error);
                     return;
@@ -461,5 +476,67 @@ fn deliver_event(connection: &Connection, event: RdpOutputEvent) {
             });
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironrdp_session::{SessionError, SessionErrorExt as _};
+    use std::ffi::c_void;
+
+    extern "C" fn capture_log(
+        _: u64,
+        _: CNDFIronLogLevel,
+        bytes: *const u8,
+        len: usize,
+        context: *mut c_void,
+    ) {
+        let message = unsafe { std::slice::from_raw_parts(bytes, len) };
+        let messages = unsafe { &mut *context.cast::<Vec<String>>() };
+        messages.push(String::from_utf8_lossy(message).into_owned());
+    }
+
+    #[test]
+    fn logs_termination_without_private_source_details() {
+        let mut messages = Vec::<String>::new();
+        let table = CNDFIronCallbacks {
+            log: Some(capture_log),
+            certificate_trust: None,
+            connected: None,
+            failure: None,
+            disconnect: None,
+            frame: None,
+            pointer: None,
+            context: (&mut messages as *mut Vec<String>).cast(),
+        };
+        let connection = Connection {
+            generation: 1,
+            connected: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            input: Mutex::default(),
+            callbacks: Arc::new(Callbacks {
+                table,
+                gate: Mutex::default(),
+                closed: AtomicBool::new(false),
+            }),
+            statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
+        };
+        let error = ironrdp_pdu::PduError::new(
+            "graphics update",
+            ironrdp_pdu::PduErrorKind::Other {
+                description: "unknown surface",
+            },
+        )
+        .with_source(std::io::Error::other("private source sentinel"));
+        deliver_event(
+            &connection,
+            RdpOutputEvent::Terminated(Err(SessionError::pdu(error))),
+            CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("unknown surface"));
+        assert!(!messages[0].contains("private source sentinel"));
     }
 }

@@ -455,6 +455,7 @@ private func runIteration(
             result.connectedAfterResize = view.isConnected && delegate.disconnectReason == nil
             result.steps.append("resize:\(Int(width))x\(Int(height))")
         case "shutdown":
+            result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {
                 result.framesReceived = statistics.framesReceived
                 result.frameBytesReceived = statistics.frameBytesReceived
@@ -480,6 +481,7 @@ private func runIteration(
         }
     }
     if !didShutdown {
+        result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
         view.shutdown()
         delegate.shutdownReturned = true
         probe.shutdownReturned = true
@@ -521,7 +523,7 @@ private func runIteration(
     return result
 }
 
-private func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?) -> [String] {
+func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?) -> [String] {
     var failures: [String] = []
     let prefix = "iteration \(iteration.iteration):"
     if iteration.callbacksAfterShutdown != 0 {
@@ -529,6 +531,16 @@ private func evaluate(_ iteration: IterationResult, against expect: HarnessExpec
     }
     if iteration.passwordFoundInSessionLog == true {
         failures.append("\(prefix) password found in session log")
+    }
+    if let disconnect = expect?.disconnect {
+        if iteration.disconnectBeforeShutdown != disconnect {
+            failures.append("\(prefix) disconnectBeforeShutdown=\(iteration.disconnectBeforeShutdown ?? "nil"), expected \(disconnect)")
+        }
+    } else if let disconnect = iteration.disconnectBeforeShutdown, expect?.failure == nil {
+        failures.append("\(prefix) unexpected disconnect before shutdown: \(disconnect)")
+    }
+    if expect?.failure != iteration.failure {
+        failures.append("\(prefix) failure=\(iteration.failure ?? "nil"), expected \(expect?.failure ?? "nil")")
     }
     guard let expect else { return failures }
     if let connected = expect.connected, connected != iteration.connected {
@@ -542,9 +554,6 @@ private func evaluate(_ iteration: IterationResult, against expect: HarnessExpec
     }
     if let prompts = expect.prompts, prompts != iteration.prompts {
         failures.append("\(prefix) prompts=\(iteration.prompts), expected \(prompts)")
-    }
-    if expect.failure != iteration.failure {
-        failures.append("\(prefix) failure=\(iteration.failure ?? "nil"), expected \(expect.failure ?? "nil")")
     }
     if expect.resizeKeepsSession == true,
        iteration.connectedAfterResize != true || iteration.connectRises > 1 {

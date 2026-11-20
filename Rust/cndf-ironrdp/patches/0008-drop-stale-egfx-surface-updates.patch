@@ -1,0 +1,99 @@
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index f5d510f..746b3dd 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -1155,10 +1155,10 @@ impl GraphicsPipelineClient {
+     }
+ 
+     fn handle_wire_to_surface1(&mut self, pdu: crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+-        let surface = self
+-            .surfaces
+-            .get(&pdu.surface_id)
+-            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
++        let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
++            warn!(surface_id = pdu.surface_id, "WireToSurface1 for unknown surface dropped");
++            return Ok(());
++        };
+ 
+         // Validate rectangle ordering (left <= right, top <= bottom)
+         let rect = &pdu.destination_rectangle;
+@@ -1222,10 +1222,10 @@ impl GraphicsPipelineClient {
+     /// Decode RemoteFX Progressive bitmap data, applying each decoded tile to the
+     /// persistent surface before delivering the same RGBA update to the handler.
+     fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
+-        let surface = self
+-            .surfaces
+-            .get(&pdu.surface_id)
+-            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
++        let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
++            warn!(surface_id = pdu.surface_id, "WireToSurface2 for unknown surface dropped");
++            return Ok(());
++        };
+         let (surface_width, surface_height) = (surface.width, surface.height);
+ 
+         let tiles = match self.progressive_decoder.decode_bitmap(
+@@ -1468,6 +1468,11 @@ impl GraphicsPipelineClient {
+     ///
+     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+     fn decode_avc444(&mut self, codec_id: Codec1Type, surface_id: u16, bitmap_data: &[u8]) -> PduResult<()> {
++        let Some(surface) = self.surfaces.get(&surface_id) else {
++            warn!(surface_id, "AVC444 update for unknown surface dropped");
++            return Ok(());
++        };
++        let (width, height) = (surface.width, surface.height);
+         let mut cursor = ReadCursor::new(bitmap_data);
+         let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
+         let layout = if codec_id == Codec1Type::Avc444 {
+@@ -1475,11 +1480,6 @@ impl GraphicsPipelineClient {
+         } else {
+             Avc444Layout::V2
+         };
+-        let (width, height) = self
+-            .surfaces
+-            .get(&surface_id)
+-            .map(|surface| (surface.width, surface.height))
+-            .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface1"))?;
+ 
+         trace!(surface_id, ?codec_id, encoding = ?stream.encoding, "AVC444 update");
+         let (main, auxiliary) = match stream.encoding {
+@@ -3448,6 +3448,40 @@ mod tests {
+         assert_eq!(client.dropped_updates, 1);
+     }
+ 
++    #[test]
++    fn frames_for_a_surface_discarded_by_reset_are_ignored() {
++        let mut client = progressive_client();
++        client
++            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
++                width: 64,
++                height: 64,
++                monitors: vec![],
++            }))
++            .unwrap();
++
++        let wire1 = client.handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
++            surface_id: 1,
++            codec_id: Codec1Type::ClearCodec,
++            pixel_format: PixelFormat::XRgb,
++            destination_rectangle: ExclusiveRectangle {
++                left: 0,
++                top: 0,
++                right: 64,
++                bottom: 64,
++            },
++            bitmap_data: Vec::new(),
++        }));
++        let wire2 = wire_progressive(&mut client, Vec::new());
++        let avc444 = client.decode_avc444(Codec1Type::Avc444, 1, &[]);
++        assert!(
++            wire1.is_ok() && wire2.is_ok() && avc444.is_ok(),
++            "stale frames must be dropped, got {:?}, {:?}, {:?}",
++            wire1.err(),
++            wire2.err(),
++            avc444.err(),
++        );
++    }
++
+     #[test]
+     fn progressive_context_survives_graphics_reset() {
+         let updates = Arc::new(Mutex::new(Vec::new()));

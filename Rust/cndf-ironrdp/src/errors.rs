@@ -111,7 +111,7 @@ pub(super) fn classify(error: &ConnectorError, rejected: bool) -> Failure {
         let (code, message) = match tls {
             Some(rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion))
             | Some(rustls::Error::PeerIncompatible(_)) => (
-                0x4952000A,
+                0x4952000B,
                 "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
             ),
             _ => (0x49520006, "TLS handshake failed"),
@@ -168,14 +168,14 @@ mod tests {
         let cases = [
             (
                 rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion),
-                0x4952000A,
+                0x4952000B,
                 "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
             ),
             (
                 rustls::Error::PeerIncompatible(
                     rustls::PeerIncompatible::ServerDoesNotSupportTls12Or13,
                 ),
-                0x4952000A,
+                0x4952000B,
                 "TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)",
             ),
             (

@@ -103,6 +103,10 @@ let package = Package(
             dependencies: ["RDPClientCore", "IronRDPBridge"]
         ),
         .testTarget(
+            name: "RDPEngineHarnessTests",
+            dependencies: ["RDPEngineHarness"]
+        ),
+        .testTarget(
             name: "RDPMacViewTests",
             dependencies: ["RDPMacView"]
         )
