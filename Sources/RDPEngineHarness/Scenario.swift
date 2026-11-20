@@ -49,7 +49,7 @@ struct HarnessSize: Decodable {
 }
 
 struct HarnessStep: Decodable {
-    /// connect | waitConnected | waitFirstFrame | idle | inputLatency | resize | tap | shutdown
+    /// connect | waitConnected | waitFirstFrame | idle | inputLatency | resize | tap | scroll | shutdown
     var op: String
     var timeout: Double?
     var seconds: Double?
@@ -62,6 +62,19 @@ struct HarnessStep: Decodable {
     var probeY: Int?
     /// inputLatency: scan code to press (default 0x1E, "A").
     var scanCode: UInt16?
+    /// scroll: "line" or "pixel" builds a real scroll-wheel NSEvent (CGEvent with that unit)
+    /// and hands it to the view's scrollWheel(with:), like a mouse wheel or a trackpad;
+    /// "raw" calls injectScroll with the values as they are.
+    var scrollUnit: String?
+    /// scroll: vertical value of each event, in `scrollUnit` (positive = wheel away from user).
+    var scrollDeltas: [Int32]?
+    /// scroll: horizontal value of each event; defaults to 0.
+    var scrollDeltasX: [Int32]?
+    /// scroll: pause between events (default 50 ms).
+    var intervalMs: Double?
+    /// scroll: remote pixel the pointer moves to before the first event.
+    var pointerX: Int32?
+    var pointerY: Int32?
 }
 
 struct HarnessExpectation: Decodable {

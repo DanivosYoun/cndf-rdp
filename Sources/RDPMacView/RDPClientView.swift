@@ -156,11 +156,23 @@ public final class RDPClientView: NSView {
     }
 
     public override func scrollWheel(with event: NSEvent) {
+        let rotation = Self.wheelRotation(for: event)
         inputExecutor()?.hostScroll(
             at: pointerLocation(for: event),
-            deltaX: Int32(event.scrollingDeltaX.rounded()),
-            deltaY: Int32(event.scrollingDeltaY.rounded())
+            deltaX: rotation.x,
+            deltaY: rotation.y
         )
+    }
+
+    /// RDP wheel rotation (WHEEL_DELTA units, 120 = one notch) for a scroll event. This is the
+    /// rule FreeRDP's own macOS client uses: AppKit's `deltaX`/`deltaY` are line-scaled for a
+    /// mouse wheel and a trackpad alike (`scrollingDelta*` would be pixels on a trackpad). The
+    /// raw deltas used before were 1/120 of a notch per wheel click, which Windows ignores.
+    static func wheelRotation(for event: NSEvent) -> (x: Int32, y: Int32) {
+        func units(_ lines: CGFloat) -> Int32 {
+            Int32(max(-32_768, min(32_767, (lines * 120).rounded())))
+        }
+        return (units(event.deltaX), units(event.deltaY))
     }
 
     // Mac numeric-keypad digit (0-9) and decimal keycodes. Their RDP keypad scancodes
