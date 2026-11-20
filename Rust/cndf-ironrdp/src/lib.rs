@@ -277,7 +277,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=1\0"
+            " ironrdp=15b4a03ff552 patches=3\0"
         );
         version.as_ptr().cast()
     })
@@ -472,11 +472,36 @@ pub unsafe extern "C" fn cndf_iron_resize(
         return session.send(generation, Command::Resize(width, height), Duration::ZERO);
         #[cfg(not(feature = "stub"))]
         {
-            // This upstream revision reconnects on Display Control failure.
-            if cndf_iron_is_connected(session, generation) {
-                CNDF_IRON_INTERNAL
-            } else {
-                CNDF_IRON_NOT_CONNECTED
+            use ironrdp_client::rdp::RdpInputEvent;
+            use tokio::sync::mpsc::error::TrySendError;
+
+            let state = lock(&session.state);
+            let Some(run) = state.run.as_ref() else {
+                return CNDF_IRON_NOT_CONNECTED;
+            };
+            if session.callbacks.closed.load(Ordering::Acquire) {
+                return CNDF_IRON_CLOSED;
+            }
+            let connection = &run.connection;
+            if connection.generation != generation
+                || connection.stop.load(Ordering::Acquire)
+                || !connection.connected.load(Ordering::Acquire)
+            {
+                return CNDF_IRON_NOT_CONNECTED;
+            }
+            let input = lock(&connection.input);
+            let Some(input) = input.as_ref() else {
+                return CNDF_IRON_NOT_CONNECTED;
+            };
+            match input.try_send(RdpInputEvent::Resize {
+                width: width as u16,
+                height: height as u16,
+                scale_factor: scale_percent,
+                physical_size: None,
+            }) {
+                Ok(()) => CNDF_IRON_OK,
+                Err(TrySendError::Closed(_)) => CNDF_IRON_NOT_CONNECTED,
+                Err(TrySendError::Full(_)) => CNDF_IRON_BUSY,
             }
         }
     })

@@ -1,0 +1,177 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index f8cba0b..417052c 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -103,7 +103,7 @@ use ironrdp_rail::pdu::{ExecutePdu, ExecuteResultPdu};
+ 
+ // ── Public event types ────────────────────────────────────────────────────────
+ 
+-/// Explains why a dynamic display update must reconnect instead of completing in-session.
++/// Explains why a dynamic display update could not complete in-session.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum DisplayResizeFallbackReason {
+     /// Display Control is not configured or its dynamic channel became unavailable.
+@@ -222,7 +222,7 @@ pub enum RdpOutputEvent {
+     MalformedBitmapDisplayRedraw,
+     /// Dynamic Display Control could not update the session in place.
+     ///
+-    /// The next connection attempt uses the requested desktop size.
++    /// If resize fallback reconnection is enabled, the next connection attempt uses the requested desktop size.
+     DisplayResizeFallback(DisplayResizeFallbackReason),
+     /// An active session was interrupted and a cookie-based reconnect is about to start.
+     ///
+@@ -1172,6 +1172,7 @@ pub struct RdpClient {
+     graceful_close_receiver: watch::Receiver<bool>,
+     auto_reconnect_maximum_attempts: Option<u32>,
+     desktop_update_enabled: bool,
++    reconnect_on_display_resize_failure: bool,
+     #[cfg(feature = "clipboard")]
+     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
+     #[cfg(feature = "rdpdr")]
+@@ -1197,6 +1198,7 @@ impl RdpClient {
+             graceful_close_receiver,
+             auto_reconnect_maximum_attempts: None,
+             desktop_update_enabled: false,
++            reconnect_on_display_resize_failure: true,
+             #[cfg(feature = "clipboard")]
+             cliprdr_backend_factory: None,
+             #[cfg(feature = "rdpdr")]
+@@ -1239,6 +1241,16 @@ impl RdpClient {
+         self
+     }
+ 
++    /// Controls whether a failed Display Control resize opens a new connection.
++    ///
++    /// Enabled by default. When disabled, unavailable Display Control and resize
++    /// timeouts still emit [`RdpOutputEvent::DisplayResizeFallback`].
++    #[must_use]
++    pub fn with_display_resize_fallback_reconnect(mut self, enabled: bool) -> Self {
++        self.reconnect_on_display_resize_failure = enabled;
++        self
++    }
++
+     /// Delivers tightly packed dirty regions ([`RdpOutputEvent::DesktopUpdate`]) instead of full
+     /// [`RdpOutputEvent::Image`] snapshots.
+     ///
+@@ -1673,6 +1685,7 @@ impl RdpClient {
+                 self.config.rail_initial_execute.clone(),
+                 &self.output_event_sender,
+                 self.desktop_update_enabled,
++                self.reconnect_on_display_resize_failure,
+                 &mut self.input_event_receiver,
+                 &mut self.clipboard_event_receiver,
+                 &mut self.close_receiver,
+@@ -1967,6 +1980,16 @@ async fn send_cancellable_output_event(
+ /// Reports a monitor layout dropped because it does not fit the server's Display Control capabilities.
+ ///
+ /// Returns `false` when the output channel is closed and the session must end.
++async fn report_resize_fallback(
++    output_event_sender: &crate::output_channel::OutputEventSender,
++    close_receiver: &mut watch::Receiver<bool>,
++    reason: DisplayResizeFallbackReason,
++) -> SessionResult<()> {
++    send_active_output_event(output_event_sender, RdpOutputEvent::DisplayResizeFallback(reason), close_receiver).await?;
++    Ok(())
++}
++
++/// Reports a monitor layout dropped because it does not fit the server's Display Control capabilities.
+ async fn report_rejected_monitor_layout(
+     output_event_sender: &crate::output_channel::OutputEventSender,
+     close_receiver: &mut watch::Receiver<bool>,
+@@ -4626,6 +4649,7 @@ async fn active_session(
+     initial_rail_execute: Option<ExecutePdu>,
+     output_event_sender: &crate::output_channel::OutputEventSender,
+     desktop_update_enabled: bool,
++    reconnect_on_display_resize_failure: bool,
+     input_event_receiver: &mut mpsc::Receiver<RdpInputEvent>,
+     clipboard_event_receiver: &mut mpsc::UnboundedReceiver<RdpInputEvent>,
+     close_receiver: &mut watch::Receiver<bool>,
+@@ -4977,7 +5001,7 @@ async fn active_session(
+                             ActiveSessionIteration::outputs(Vec::new())
+                         } else if let Some(dvc_batch) = request.prepare(&mut active_stage) {
+                             match dvc_batch {
+-                                Err(error) if request.layout.is_some() => {
++                                Err(error) if request.layout.is_some() || !reconnect_on_display_resize_failure => {
+                                     if !report_rejected_monitor_layout(output_event_sender, close_receiver, &error).await? {
+                                         return Ok(RdpControlFlow::TerminatedGracefully(
+                                             GracefulDisconnectReason::UserInitiated,
+@@ -5002,9 +5026,12 @@ async fn active_session(
+                                 }
+                             }
+                         } else {
+-                            // TODO(#271): use the "auto-reconnect cookie": https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/15b0d1c9-2891-4adb-a45e-deb4aeeeab7c
+-                            debug!("Reconnecting with new size");
+-                            return Ok(request.reconnect_with_new_size(DisplayResizeFallbackReason::DisplayControlUnavailable))
++                            let reason = DisplayResizeFallbackReason::DisplayControlUnavailable;
++                            if reconnect_on_display_resize_failure {
++                                return Ok(request.reconnect_with_new_size(reason));
++                            }
++                            report_resize_fallback(output_event_sender, close_receiver, reason).await?;
++                            ActiveSessionIteration::outputs(Vec::new())
+                         }
+                     }
+                     RdpInputEvent::FastPath(events) => {
+@@ -5358,7 +5385,12 @@ async fn active_session(
+                 let (request, reason) = resize_queue
+                     .timed_out_request(tokio::time::Instant::now())
+                     .expect("resize deadline must correspond to a queued request");
+-                return Ok(request.reconnect_with_new_size(reason));
++                if reconnect_on_display_resize_failure {
++                    return Ok(request.reconnect_with_new_size(reason));
++                }
++                resize_queue = ResizeQueue::default();
++                report_resize_fallback(output_event_sender, close_receiver, reason).await?;
++                ActiveSessionIteration::outputs(Vec::new())
+                 }
+                 _ = async {
+                     match rail_queue_release_deadline {
+@@ -5780,12 +5812,19 @@ async fn active_session(
+                             {
+                                 Some(Ok(result)) => result,
+                                 Some(Err(_)) => {
+-                                    let request = resize_queue
+-                                        .pending
+-                                        .as_ref()
+-                                        .map_or(&in_flight.request, |pending| &pending.request);
+-                                    return Ok(request
+-                                        .reconnect_with_new_size(DisplayResizeFallbackReason::ReactivationTimedOut));
++                                    let reason = DisplayResizeFallbackReason::ReactivationTimedOut;
++                                    if reconnect_on_display_resize_failure {
++                                        let request = resize_queue
++                                            .pending
++                                            .as_ref()
++                                            .map_or(&in_flight.request, |pending| &pending.request);
++                                        return Ok(request.reconnect_with_new_size(reason));
++                                    }
++                                    // The peer already deactivated the session. Keep reading the
++                                    // activation sequence, without the expired resize deadline.
++                                    resize_queue = ResizeQueue::default();
++                                    report_resize_fallback(output_event_sender, close_receiver, reason).await?;
++                                    continue 'activation_seq;
+                                 }
+                                 None => {
+                                     return Ok(RdpControlFlow::TerminatedGracefully(
+@@ -6144,7 +6183,7 @@ async fn active_session(
+                         .prepare(&mut active_stage)
+                         .ok_or_else(|| ironrdp_session::general_err!("Display Control became unavailable"))?
+                     {
+-                        Err(error) if request.layout.is_some() => {
++                        Err(error) if request.layout.is_some() || !reconnect_on_display_resize_failure => {
+                             resize_queue.pending = None;
+                             if !report_rejected_monitor_layout(output_event_sender, close_receiver, &error).await? {
+                                 return Ok(RdpControlFlow::TerminatedGracefully(
+@@ -6211,8 +6250,12 @@ async fn active_session(
+                     }
+                 }
+                 None => {
+-                    debug!("Reconnecting because Display Control is unavailable");
+-                    return Ok(request.reconnect_with_new_size(DisplayResizeFallbackReason::DisplayControlUnavailable));
++                    let reason = DisplayResizeFallbackReason::DisplayControlUnavailable;
++                    if reconnect_on_display_resize_failure {
++                        return Ok(request.reconnect_with_new_size(reason));
++                    }
++                    resize_queue.pending = None;
++                    report_resize_fallback(output_event_sender, close_receiver, reason).await?;
+                 }
+                 Some(false) => {}
+             }

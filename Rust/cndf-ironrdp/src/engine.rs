@@ -167,7 +167,9 @@ fn run(
         return;
     };
     let (sender, receiver) = output_channel(128);
-    let client = RdpClient::new(config, sender).with_desktop_updates();
+    let client = RdpClient::new(config, sender)
+        .with_desktop_updates()
+        .with_display_resize_fallback_reconnect(false);
     let input = client.input_sender();
     *lock(&connection.input) = Some(input.clone());
 
@@ -240,8 +242,12 @@ async fn forward(
                         let _ = response.send(AutoReconnectDecision::Stop);
                         continue;
                     }
-                    RdpOutputEvent::DisplayResizeFallback(_) => {
-                        log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_WARN, "Display Control unavailable");
+                    RdpOutputEvent::DisplayResizeFallback(reason) => {
+                        log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_WARN, &format!("Display Control resize failed: {reason:?}"));
+                        continue;
+                    }
+                    RdpOutputEvent::MonitorLayoutRejected => {
+                        log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_WARN, "Display Control rejected the monitor layout");
                         continue;
                     }
                     event => Output::Rdp(event),
