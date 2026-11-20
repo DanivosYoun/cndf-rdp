@@ -1,0 +1,233 @@
+{
+  "engine" : "freerdp",
+  "finishedAt" : "2026-11-21T02:39:08+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 0
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b4-tls10-ironrdp",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 0,
+          "connected" : false,
+          "cpuSystemMs" : 29.227999999999998,
+          "cpuUserMs" : 75.675,
+          "disconnectReason" : "error",
+          "durationMs" : 1230.5,
+          "failure" : "tlsHandshakeFailed",
+          "failureDetail" : "tlsHandshakeFailed(reason: \"TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)\", code: 1230110726, stage: RDPClientCore.RDPConnectStage.negotiation)",
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 11371264,
+          "physFootprintMaxBytes" : 12419840,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 0,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 0.7,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:failed",
+            "waitFirstFrame:skipped",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33895,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 0.7,
+        "min" : 0.7,
+        "p50" : 0.7,
+        "p95" : 0.7
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 0
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b4-tls11-ironrdp",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 0,
+          "connected" : false,
+          "cpuSystemMs" : 38.926,
+          "cpuUserMs" : 75.32999999999998,
+          "disconnectReason" : "error",
+          "durationMs" : 1250,
+          "failure" : "tlsHandshakeFailed",
+          "failureDetail" : "tlsHandshakeFailed(reason: \"TLS protocol negotiation failed (servers below TLS 1.2 are unsupported)\", code: 1230110726, stage: RDPClientCore.RDPConnectStage.negotiation)",
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 14653541,
+          "physFootprintMaxBytes" : 15745816,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 0,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 0.5,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:failed",
+            "waitFirstFrame:skipped",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33896,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 0.5,
+        "min" : 0.5,
+        "p50" : 0.5,
+        "p95" : 0.5
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 510.3,
+        "min" : 510.3,
+        "p50" : 510.3,
+        "p95" : 510.3
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 552.7,
+        "min" : 552.7,
+        "p50" : 552.7,
+        "p95" : 552.7
+      },
+      "host" : "127.0.0.1",
+      "id" : "b4-tls12-ironrdp",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 510.3,
+          "connected" : true,
+          "cpuSystemMs" : 72.27199999999999,
+          "cpuUserMs" : 117.33099999999999,
+          "durationMs" : 1613,
+          "firstFrameMs" : 552.7,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 12288000,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 3,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 26952472,
+          "physFootprintMaxBytes" : 32555800,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 52,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 54.9,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 4096000,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5",
+              "4961b2d2380265c2beabf90cf9833b4b3ed782f3a3db27c60302a5300dbd57e5"
+            ]
+          ],
+          "trustStringDigests" : [
+            "7c2d5699246b2d82f39bc42b45fc56591a694351d015c0715fe4313746e2322b"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33897,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 54.9,
+        "min" : 54.9,
+        "p50" : 54.9,
+        "p95" : 54.9
+      }
+    }
+  ],
+  "scenario" : "legacy-tls-ironrdp",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-21T02:39:03+09:00"
+}
