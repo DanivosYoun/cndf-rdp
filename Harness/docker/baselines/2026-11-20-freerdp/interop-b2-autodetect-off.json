@@ -1,0 +1,77 @@
+{
+  "engine" : "freerdp",
+  "finishedAt" : "2026-11-20T12:20:37+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 0
+      },
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b2-autodetect-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connected" : false,
+          "cpuSystemMs" : 47.388000000000005,
+          "cpuUserMs" : 46.803,
+          "disconnectReason" : "error",
+          "durationMs" : 1666.6,
+          "failure" : "networkUnreachable",
+          "failureDetail" : "networkUnreachable(underlying: \"The connection transport layer failed.\", code: 131085, stage: RDPClientCore.RDPConnectStage.capabilities)",
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 32331869,
+          "physFootprintMaxBytes" : 43909912,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 0,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 2.4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:failed",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33893,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 2.4,
+        "min" : 2.4,
+        "p50" : 2.4,
+        "p95" : 2.4
+      }
+    }
+  ],
+  "scenario" : "interop-b2-autodetect-off",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-20T12:20:35+09:00"
+}

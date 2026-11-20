@@ -1,0 +1,315 @@
+{
+  "engine" : "freerdp",
+  "finishedAt" : "2026-11-20T12:18:48+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 5,
+        "max" : 467.2,
+        "min" : 425,
+        "p50" : 430.6,
+        "p95" : 467.2
+      },
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 5,
+        "max" : 686,
+        "min" : 615.2,
+        "p50" : 657.1,
+        "p95" : 686
+      },
+      "host" : "127.0.0.1",
+      "id" : "b2-baseline",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 425,
+          "connected" : true,
+          "cpuSystemMs" : 760.729,
+          "cpuUserMs" : 402.006,
+          "durationMs" : 33652.9,
+          "firstFrameMs" : 686,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 208896000,
+          "framesDisplayedWithTap" : 51,
+          "framesReceived" : 51,
+          "inputLatencyMs" : {
+            "count" : 50,
+            "max" : 139.9,
+            "min" : 62.6,
+            "p50" : 79.2,
+            "p95" : 132.3
+          },
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 100635718,
+          "physFootprintMaxBytes" : 105153496,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 7,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 9.2,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:10.0s",
+            "inputLatency:50\/50",
+            "tap:5.0s",
+            "resize:1024x700",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 208896000,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "0e61a0647894b7018976c8b36b80d12a126ac2c8ac8afb3541534032ed507338",
+              "0e61a0647894b7018976c8b36b80d12a126ac2c8ac8afb3541534032ed507338"
+            ]
+          ]
+        },
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 425.8,
+          "connected" : true,
+          "cpuSystemMs" : 768.774,
+          "cpuUserMs" : 404.17,
+          "durationMs" : 35147.1,
+          "firstFrameMs" : 615.2,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 208896000,
+          "framesDisplayedWithTap" : 51,
+          "framesReceived" : 51,
+          "inputLatencyMs" : {
+            "count" : 50,
+            "max" : 220.9,
+            "min" : 65,
+            "p50" : 122.5,
+            "p95" : 170.5
+          },
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 2,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 124760273,
+          "physFootprintMaxBytes" : 127370200,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 6,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 7.4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:10.0s",
+            "inputLatency:50\/50",
+            "tap:5.0s",
+            "resize:1024x700",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 208896000,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ]
+        },
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 446.4,
+          "connected" : true,
+          "cpuSystemMs" : 1278.9769999999999,
+          "cpuUserMs" : 506.28,
+          "durationMs" : 35426.2,
+          "firstFrameMs" : 657.1,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 208896000,
+          "framesDisplayedWithTap" : 51,
+          "framesReceived" : 51,
+          "inputLatencyMs" : {
+            "count" : 50,
+            "max" : 185.8,
+            "min" : 65.1,
+            "p50" : 125.9,
+            "p95" : 148.5
+          },
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 3,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 121739417,
+          "physFootprintMaxBytes" : 122880984,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 5,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 6.4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:10.0s",
+            "inputLatency:50\/50",
+            "tap:5.0s",
+            "resize:1024x700",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 208896000,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ]
+        },
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 467.2,
+          "connected" : true,
+          "cpuSystemMs" : 1033.2640000000001,
+          "cpuUserMs" : 422.5179999999998,
+          "durationMs" : 34639.3,
+          "firstFrameMs" : 667.4,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 208896000,
+          "framesDisplayedWithTap" : 51,
+          "framesReceived" : 51,
+          "inputLatencyMs" : {
+            "count" : 50,
+            "max" : 146.5,
+            "min" : 63.1,
+            "p50" : 120.7,
+            "p95" : 135.9
+          },
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 4,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 116747906,
+          "physFootprintMaxBytes" : 117294040,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 8,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 10.6,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:10.0s",
+            "inputLatency:50\/50",
+            "tap:5.0s",
+            "resize:1024x700",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 208896000,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ]
+        },
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectToConnectedMs" : 430.6,
+          "connected" : true,
+          "cpuSystemMs" : 805.902,
+          "cpuUserMs" : 412.63699999999994,
+          "durationMs" : 35213.8,
+          "firstFrameMs" : 622.2,
+          "firstFrameSize" : [
+            1280,
+            800
+          ],
+          "frameBytesReceived" : 208896000,
+          "framesDisplayedWithTap" : 51,
+          "framesReceived" : 51,
+          "inputLatencyMs" : {
+            "count" : 50,
+            "max" : 278.9,
+            "min" : 62.7,
+            "p50" : 123,
+            "p95" : 143
+          },
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 5,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 116861856,
+          "physFootprintMaxBytes" : 117277656,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 4,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 5.6,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:10.0s",
+            "inputLatency:50\/50",
+            "tap:5.0s",
+            "resize:1024x700",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 208896000,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33893,
+      "shutdownMs" : {
+        "count" : 5,
+        "max" : 10.6,
+        "min" : 5.6,
+        "p50" : 7.4,
+        "p95" : 10.6
+      }
+    }
+  ],
+  "scenario" : "baseline-b2",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-20T12:15:52+09:00"
+}

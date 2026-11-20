@@ -1,0 +1,80 @@
+{
+  "engine" : "freerdp",
+  "finishedAt" : "2026-11-20T12:14:10+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 0
+      },
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-cert-changed-deny",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connected" : false,
+          "cpuSystemMs" : 18.526999999999997,
+          "cpuUserMs" : 26.786,
+          "disconnectReason" : "error",
+          "durationMs" : 1165.9,
+          "failure" : "certificateRejected",
+          "failureDetail" : "certificateRejected",
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 30043554,
+          "physFootprintMaxBytes" : 40485632,
+          "prompts" : 1,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 0,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 1.4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:failed",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+            "changed"
+          ],
+          "trustStringCertificates" : [
+            [
+              "19000b60c4d1a7fce8ab03279f01d3060c355e6a22a1a771ad355be19e2c61bc",
+              "19000b60c4d1a7fce8ab03279f01d3060c355e6a22a1a771ad355be19e2c61bc"
+            ]
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 1.4,
+        "min" : 1.4,
+        "p50" : 1.4,
+        "p95" : 1.4
+      }
+    }
+  ],
+  "scenario" : "cert-3-rejected",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-20T12:14:08+09:00"
+}

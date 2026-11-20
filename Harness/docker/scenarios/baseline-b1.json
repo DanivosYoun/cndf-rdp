@@ -1,0 +1,11 @@
+{
+  "name": "baseline-b1",
+  "runs": [
+    {"id": "b1-baseline", "host": "127.0.0.1", "port": 33891, "username": "harness", "passwordEnv": "HARNESS_B1_PASS",
+     "repeat": 5,
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 30},
+               {"op": "idle", "seconds": 10}, {"op": "tap", "seconds": 5},
+               {"op": "resize", "width": 1024, "height": 700, "seconds": 2}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true, "maxShutdownMs": 1000}}
+  ]
+}

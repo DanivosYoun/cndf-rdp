@@ -1,0 +1,30 @@
+{
+  "name": "interop-b2-autodetect-off",
+  "runs": [
+    {
+      "id": "b2-autodetect-off",
+      "host": "127.0.0.1",
+      "port": 33893,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B2_PASS",
+      "networkAutoDetect": false,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 20
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": false,
+        "failure": "networkUnreachable",
+        "maxShutdownMs": 1000
+      }
+    }
+  ]
+}

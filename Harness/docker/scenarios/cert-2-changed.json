@@ -1,0 +1,9 @@
+{
+  "name": "cert-2-changed",
+  "runs": [
+    {"id": "b1-cert-changed-approve", "host": "127.0.0.1", "port": 33891, "username": "harness", "passwordEnv": "HARNESS_B1_PASS",
+     "promptAnswer": "approve",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 20}, {"op": "waitFirstFrame", "timeout": 15}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true, "trustCallbacks": ["changed"], "prompts": 1, "maxShutdownMs": 1000}}
+  ]
+}

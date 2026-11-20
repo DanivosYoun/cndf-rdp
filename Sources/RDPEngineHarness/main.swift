@@ -1,0 +1,604 @@
+import AppKit
+import CryptoKit
+import CoreVideo
+import QuartzCore
+import RDPClientCore
+import RDPMacView
+
+// RDPEngineHarness (design D7 H-A): drives a real RDPConnectionView in an off-screen window
+// from a JSON scenario and writes metrics JSON. No mocks — every number comes from a live
+// connection to a test server (Harness/docker, Scripts/run-engine-harness.sh).
+//
+// usage: rdp-engine-harness --scenario <file.json> --out <result.json>
+//            [--engine freerdp|ironrdp] [--trust-suite <UserDefaults suite>] [--work-dir <dir>]
+//            [--reset-trust 1] [--drop-trust 1]
+//
+// The trust store persists across invocations with the same --trust-suite so a scenario can
+// span server restarts (cert A -> B -> A). --reset-trust clears it first, --drop-trust last.
+//
+// FreeRDP keeps its own known_hosts under $HOME; run with an isolated HOME so trust
+// scenarios start clean (the run script does this).
+
+private enum HarnessError: Error, CustomStringConvertible {
+    case usage(String)
+    case engineUnavailable(String)
+
+    var description: String {
+        switch self {
+        case .usage(let message):
+            "usage error: \(message)"
+        case .engineUnavailable(let engine):
+            "engine '\(engine)' is not available in this build (RDPConnectionOptions.engine lands with C2)"
+        }
+    }
+}
+
+private struct Arguments {
+    var scenarioURL: URL
+    var outURL: URL
+    var engine: String?
+    var trustSuite: String
+    var workDirectory: URL
+    var resetTrust: Bool
+    var dropTrust: Bool
+
+    init(_ argv: [String]) throws {
+        var values: [String: String] = [:]
+        var index = 1
+        while index < argv.count {
+            let key = argv[index]
+            guard key.hasPrefix("--"), index + 1 < argv.count else {
+                throw HarnessError.usage("unexpected argument \(key)")
+            }
+            values[String(key.dropFirst(2))] = argv[index + 1]
+            index += 2
+        }
+        guard let scenario = values["scenario"], let out = values["out"] else {
+            throw HarnessError.usage("--scenario and --out are required")
+        }
+        scenarioURL = URL(fileURLWithPath: scenario)
+        outURL = URL(fileURLWithPath: out)
+        engine = values["engine"]
+        trustSuite = values["trust-suite"] ?? "cndf.rdp-engine-harness.\(getpid())"
+        workDirectory = URL(fileURLWithPath: values["work-dir"] ?? FileManager.default.currentDirectoryPath)
+        resetTrust = values["reset-trust"] == "1"
+        dropTrust = values["drop-trust"] == "1"
+    }
+}
+
+/// Harness-only certificate trust store, keyed like the app's KnownHostStore (host:port ->
+/// lowercased trust string). Policy follows design I4: new = accept and store after the
+/// connection succeeds, same = accept, changed = prompt (answered by the scenario).
+private final class TrustStore {
+    private let defaults: UserDefaults
+    private let suiteName: String
+    private let lock = NSLock()
+
+    init(suiteName: String) {
+        self.suiteName = suiteName
+        defaults = UserDefaults(suiteName: suiteName)!
+    }
+
+    func stored(for key: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return defaults.string(forKey: key)
+    }
+
+    func store(_ value: String, for key: String) {
+        lock.lock()
+        defaults.set(value, forKey: key)
+        lock.unlock()
+    }
+
+    func removeAll() {
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+}
+
+private final class HarnessDelegate: RDPConnectionViewDelegate {
+    private let lock = NSLock()
+    private let trustStore: TrustStore
+    private let approveChanged: Bool
+    private var pendingTrust: (key: String, value: String)?
+
+    private(set) var connected = false
+    private(set) var connectedAt: CFTimeInterval?
+    private(set) var trustCallbacks: [String] = []
+    /// Per trust callback: SHA-256 of each certificate in the trust string, in order. Shows
+    /// what the engine puts in the string (leaf only, leaf + chain, ...) for design I3.
+    private(set) var trustStringCertificates: [[String]] = []
+    private(set) var prompts = 0
+    private(set) var failure: RDPSessionError?
+    private(set) var disconnectReason: RDPDisconnectReason?
+    private(set) var callbacksAfterShutdown = 0
+    var shutdownReturned = false
+
+    init(trustStore: TrustStore, approveChanged: Bool) {
+        self.trustStore = trustStore
+        self.approveChanged = approveChanged
+    }
+
+    private func noteCallback() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if shutdownReturned {
+            callbacksAfterShutdown += 1
+            return false
+        }
+        return true
+    }
+
+    func rdpConnectionView(_ view: RDPConnectionView, didLog message: String) {
+        guard noteCallback() else { return }
+        fputs("[RDP] \(message)\n", stderr)
+    }
+
+    func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {
+        guard noteCallback() else { return }
+        lock.lock()
+        if connected && !self.connected {
+            connectedAt = CACurrentMediaTime()
+            if let pendingTrust {
+                trustStore.store(pendingTrust.value, for: pendingTrust.key)
+                self.pendingTrust = nil
+            }
+        }
+        self.connected = self.connected || connected
+        lock.unlock()
+    }
+
+    func rdpConnectionView(
+        _ view: RDPConnectionView,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool {
+        guard noteCallback() else { return false }
+        return classifyTrust(
+            key: "\(hostname):\(port)",
+            value: fingerprint.lowercased(),
+            certificates: pemCertificateDigests(fingerprint)
+        )
+    }
+
+    private func classifyTrust(key: String, value: String, certificates: [String]) -> Bool {
+        let stored = trustStore.stored(for: key)
+        lock.lock()
+        defer { lock.unlock() }
+        trustStringCertificates.append(certificates)
+        if stored == nil {
+            trustCallbacks.append("new")
+            pendingTrust = (key, value)
+            return true
+        }
+        if stored == value {
+            trustCallbacks.append("same")
+            return true
+        }
+        trustCallbacks.append("changed")
+        prompts += 1
+        if approveChanged {
+            pendingTrust = (key, value)
+        }
+        return approveChanged
+    }
+
+    func rdpConnectionView(_ view: RDPConnectionView, didFailWith error: RDPSessionError) {
+        guard noteCallback() else { return }
+        lock.lock()
+        failure = error
+        lock.unlock()
+    }
+
+    func rdpConnectionView(_ view: RDPConnectionView, didDisconnectWith reason: RDPDisconnectReason) {
+        guard noteCallback() else { return }
+        lock.lock()
+        disconnectReason = reason
+        lock.unlock()
+    }
+
+    var currentFailure: RDPSessionError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure
+    }
+}
+
+/// SHA-256 (hex) of each PEM certificate block in a trust string, in order.
+private func pemCertificateDigests(_ pem: String) -> [String] {
+    pem.components(separatedBy: "-----BEGIN CERTIFICATE-----").dropFirst().map { block in
+        let body = block.components(separatedBy: "-----END CERTIFICATE-----")[0].filter { !$0.isWhitespace }
+        guard let der = Data(base64Encoded: body) else { return "undecodable" }
+        return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Frame tap state. Only touched on main (onRenderedFrame runs inside display on main).
+private final class FrameProbe {
+    var firstFrameAt: CFTimeInterval?
+    var firstFrameSize: [Int]?
+    var framesWithTap = 0
+    var pixelBufferBytes: UInt64 = 0
+    var probePoint: (x: Int, y: Int)?
+    var lastProbeColor: UInt32?
+    var lastProbeColorAt: CFTimeInterval = 0
+    var afterShutdown = 0
+    var shutdownReturned = false
+
+    func handle(_ buffer: CVPixelBuffer, at time: CFTimeInterval) {
+        if shutdownReturned {
+            afterShutdown += 1
+            return
+        }
+        framesWithTap += 1
+        pixelBufferBytes += UInt64(CVPixelBufferGetDataSize(buffer))
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let stride = CVPixelBufferGetBytesPerRow(buffer)
+        func pixel(_ x: Int, _ y: Int) -> UInt32 {
+            base.advanced(by: y * stride + x * 4).loadUnaligned(as: UInt32.self) & 0x00FF_FFFF
+        }
+        if firstFrameAt == nil {
+            // "Non-empty": some sampled pixel is not black.
+            var nonEmpty = false
+            for gy in 0..<16 where !nonEmpty {
+                for gx in 0..<16 where pixel(gx * width / 16, gy * height / 16) != 0 {
+                    nonEmpty = true
+                    break
+                }
+            }
+            if nonEmpty {
+                firstFrameAt = time
+                firstFrameSize = [width, height]
+            }
+        }
+        if let probePoint, probePoint.x < width, probePoint.y < height {
+            let color = pixel(probePoint.x, probePoint.y)
+            if color != lastProbeColor {
+                lastProbeColor = color
+                lastProbeColorAt = time
+            }
+        }
+    }
+}
+
+private func drainRunLoop(_ duration: TimeInterval) {
+    let deadline = Date().addingTimeInterval(duration)
+    while Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.005))
+    }
+}
+
+/// Runs the loop until `condition` holds or `timeout` passes. Returns whether it held.
+private func waitUntil(_ timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.005))
+    }
+    return condition()
+}
+
+private func milliseconds(_ seconds: CFTimeInterval) -> Double {
+    (seconds * 1000 * 10).rounded() / 10
+}
+
+private func failureName(_ error: RDPSessionError) -> String {
+    switch error {
+    case .unableToCreateBridgeSession: "unableToCreateBridgeSession"
+    case .bridgeRejectedOperation: "bridgeRejectedOperation"
+    case .networkUnreachable: "networkUnreachable"
+    case .tlsHandshakeFailed: "tlsHandshakeFailed"
+    case .authenticationFailed: "authenticationFailed"
+    case .certificateRejected: "certificateRejected"
+    case .freerdp: "freerdp"
+    case .configurationInvalid: "configurationInvalid"
+    }
+}
+
+private func disconnectName(_ reason: RDPDisconnectReason) -> String {
+    switch reason {
+    case .localRequest: "localRequest"
+    case .serverDisconnect(let code): "serverDisconnect(\(code.map(String.init) ?? "nil"))"
+    case .timeout: "timeout"
+    case .error: "error"
+    }
+}
+
+private func runIteration(
+    _ run: HarnessRun,
+    iteration: Int,
+    trustStore: TrustStore,
+    workDirectory: URL
+) -> IterationResult {
+    var result = IterationResult(iteration: iteration)
+    let password = run.passwordEnv.flatMap { ProcessInfo.processInfo.environment[$0] }
+    let logURL = workDirectory.appendingPathComponent("\(run.id)-\(iteration).session.log")
+    try? FileManager.default.removeItem(at: logURL)
+    let options = RDPConnectionOptions(
+        host: run.host,
+        port: run.port,
+        username: run.username,
+        securePassword: password.map(RDPSecureString.init),
+        domain: run.domain,
+        enableClipboard: false,
+        logFileURL: logURL,
+        logLevel: .info,
+        networkAutoDetect: run.networkAutoDetect ?? false,
+        graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic
+    )
+
+    let size = run.window ?? HarnessSize(width: 1280, height: 800)
+    // Borderless so AppKit does not pull the window back onto a screen.
+    let window = NSWindow(
+        contentRect: NSRect(x: -20_000, y: -20_000, width: size.width, height: size.height),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    let view = RDPConnectionView(frame: NSRect(origin: .zero, size: NSSize(width: size.width, height: size.height)))
+    let delegate = HarnessDelegate(trustStore: trustStore, approveChanged: run.promptAnswer == "approve")
+    let probe = FrameProbe()
+    view.delegate = delegate
+    window.contentView = view
+    window.orderFront(nil)
+
+    let attachTap = {
+        view.onRenderedFrame = { buffer, time in probe.handle(buffer, at: time) }
+    }
+    let startCPU = processCPUMilliseconds()
+    let sampler = FootprintSampler()
+    sampler.start()
+    let startedAt = CACurrentMediaTime()
+    var connectAt: CFTimeInterval?
+    var aborted = false
+    var didShutdown = false
+
+    for step in run.steps {
+        if aborted && step.op != "shutdown" {
+            result.steps.append("\(step.op):skipped")
+            continue
+        }
+        switch step.op {
+        case "connect":
+            attachTap()
+            connectAt = CACurrentMediaTime()
+            do {
+                try view.connect(options)
+                result.steps.append("connect:ok")
+            } catch {
+                result.steps.append("connect:threw")
+                result.failure = "connectThrew"
+                result.failureDetail = String(describing: error)
+                aborted = true
+            }
+        case "waitConnected":
+            let ok = waitUntil(step.timeout ?? 15) {
+                view.isConnected || delegate.connected || delegate.currentFailure != nil
+            } && delegate.currentFailure == nil && (view.isConnected || delegate.connected)
+            result.steps.append("waitConnected:\(ok ? "ok" : "failed")")
+            if !ok { aborted = true }
+        case "waitFirstFrame":
+            if view.onRenderedFrame == nil { attachTap() }
+            let ok = waitUntil(step.timeout ?? 15) {
+                probe.firstFrameAt != nil || delegate.currentFailure != nil
+            } && probe.firstFrameAt != nil
+            result.steps.append("waitFirstFrame:\(ok ? "ok" : "timeout")")
+            // Keep the tap only where a step needs it: its CVPixelBuffer copy costs CPU.
+            view.onRenderedFrame = nil
+            if !ok { aborted = true }
+        case "idle":
+            drainRunLoop(step.seconds ?? 5)
+            result.steps.append("idle:\(step.seconds ?? 5)s")
+        case "tap":
+            attachTap()
+            drainRunLoop(step.seconds ?? 5)
+            view.onRenderedFrame = nil
+            result.steps.append("tap:\(step.seconds ?? 5)s")
+        case "inputLatency":
+            attachTap()
+            probe.probePoint = (step.probeX ?? 100, step.probeY ?? 100)
+            view.sendForcedDesktopSize()
+            _ = waitUntil(3) { probe.lastProbeColor != nil }
+            let scanCode = step.scanCode ?? 0x1E
+            var samples: [Double] = []
+            for _ in 0..<(step.samples ?? 20) {
+                drainRunLoop(0.15)
+                let before = probe.lastProbeColor
+                let sentAt = CACurrentMediaTime()
+                view.injectKey(virtualKeyCode: 0, scanCode: scanCode, flags: .down)
+                view.injectKey(virtualKeyCode: 0, scanCode: scanCode, flags: .up)
+                if waitUntil(2.0, { probe.lastProbeColor != before && probe.lastProbeColorAt >= sentAt }) {
+                    samples.append(milliseconds(probe.lastProbeColorAt - sentAt))
+                } else {
+                    result.inputLatencyTimeouts += 1
+                }
+            }
+            result.inputLatencyMs = DistributionSummary(samples)
+            view.onRenderedFrame = nil
+            probe.probePoint = nil
+            result.steps.append("inputLatency:\(samples.count)/\(step.samples ?? 20)")
+        case "resize":
+            let width = step.width ?? 1024
+            let height = step.height ?? 700
+            window.setContentSize(NSSize(width: width, height: height))
+            view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+            drainRunLoop(step.seconds ?? 2)
+            result.steps.append("resize:\(Int(width))x\(Int(height))")
+        case "shutdown":
+            if let statistics = view.statistics {
+                result.framesReceived = statistics.framesReceived
+                result.frameBytesReceived = statistics.frameBytesReceived
+            }
+            let shutdownStart = CACurrentMediaTime()
+            let diagnostics = view.shutdown()
+            result.shutdownMs = milliseconds(CACurrentMediaTime() - shutdownStart)
+            delegate.shutdownReturned = true
+            probe.shutdownReturned = true
+            result.shutdownDiagnostics = [
+                "freeRDPWorkerWaitMs": diagnostics.freeRDPWorkerWaitDurationMs,
+                "renderDrainMs": diagnostics.metalDrainDurationMs,
+                "pendingMain": diagnostics.pendingMainQueueTasks,
+                "inFlightCommandBuffers": diagnostics.inFlightCommandBuffers
+            ]
+            window.close()
+            didShutdown = true
+            drainRunLoop(1.0)
+            result.steps.append("shutdown:ok")
+        default:
+            result.steps.append("\(step.op):unknown")
+            aborted = true
+        }
+    }
+    if !didShutdown {
+        view.shutdown()
+        delegate.shutdownReturned = true
+        probe.shutdownReturned = true
+        window.close()
+        drainRunLoop(1.0)
+    }
+
+    sampler.stop()
+    let endCPU = processCPUMilliseconds()
+    result.durationMs = milliseconds(CACurrentMediaTime() - startedAt)
+    result.cpuUserMs = endCPU.user - startCPU.user
+    result.cpuSystemMs = endCPU.system - startCPU.system
+    result.physFootprintMaxBytes = sampler.maxBytes
+    result.physFootprintAvgBytes = sampler.averageBytes
+    result.connected = delegate.connected
+    if let connectAt, let connectedAt = delegate.connectedAt {
+        result.connectToConnectedMs = milliseconds(connectedAt - connectAt)
+    }
+    if let connectAt, let firstFrameAt = probe.firstFrameAt {
+        result.firstFrameMs = milliseconds(firstFrameAt - connectAt)
+        result.firstFrameSize = probe.firstFrameSize
+    }
+    result.framesDisplayedWithTap = probe.framesWithTap
+    result.tapPixelBufferBytes = probe.pixelBufferBytes
+    result.trustCallbacks = delegate.trustCallbacks
+    result.trustStringCertificates = delegate.trustStringCertificates
+    result.prompts = delegate.prompts
+    if let failure = delegate.failure {
+        result.failure = failureName(failure)
+        result.failureDetail = String(describing: failure)
+    }
+    result.disconnectReason = delegate.disconnectReason.map(disconnectName)
+    result.callbacksAfterShutdown = delegate.callbacksAfterShutdown + probe.afterShutdown
+    if let password, !password.isEmpty, let log = try? String(contentsOf: logURL, encoding: .utf8) {
+        result.passwordFoundInSessionLog = log.contains(password)
+    }
+    return result
+}
+
+private func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?) -> [String] {
+    var failures: [String] = []
+    let prefix = "iteration \(iteration.iteration):"
+    if iteration.callbacksAfterShutdown != 0 {
+        failures.append("\(prefix) \(iteration.callbacksAfterShutdown) callbacks after shutdown")
+    }
+    if iteration.passwordFoundInSessionLog == true {
+        failures.append("\(prefix) password found in session log")
+    }
+    guard let expect else { return failures }
+    if let connected = expect.connected, connected != iteration.connected {
+        failures.append("\(prefix) connected=\(iteration.connected), expected \(connected)")
+    }
+    if let firstFrame = expect.firstFrame, firstFrame != (iteration.firstFrameMs != nil) {
+        failures.append("\(prefix) firstFrame=\(iteration.firstFrameMs != nil), expected \(firstFrame)")
+    }
+    if let callbacks = expect.trustCallbacks, callbacks != iteration.trustCallbacks {
+        failures.append("\(prefix) trustCallbacks=\(iteration.trustCallbacks), expected \(callbacks)")
+    }
+    if let prompts = expect.prompts, prompts != iteration.prompts {
+        failures.append("\(prefix) prompts=\(iteration.prompts), expected \(prompts)")
+    }
+    if expect.failure != iteration.failure {
+        failures.append("\(prefix) failure=\(iteration.failure ?? "nil"), expected \(expect.failure ?? "nil")")
+    }
+    if let maxShutdownMs = expect.maxShutdownMs, let shutdownMs = iteration.shutdownMs,
+       shutdownMs > Double(maxShutdownMs) {
+        failures.append("\(prefix) shutdownMs=\(shutdownMs) > \(maxShutdownMs)")
+    }
+    return failures
+}
+
+private func iso8601Now() -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
+    return formatter.string(from: Date())
+}
+
+private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
+    let scenario = try JSONDecoder().decode(HarnessScenario.self, from: Data(contentsOf: arguments.scenarioURL))
+    let engine = arguments.engine ?? scenario.engine ?? "freerdp"
+    // Engine selection is a placeholder until C2: only the FreeRDP session exists.
+    guard engine == "freerdp" else {
+        throw HarnessError.engineUnavailable(engine)
+    }
+    try FileManager.default.createDirectory(at: arguments.workDirectory, withIntermediateDirectories: true)
+    let trustStore = TrustStore(suiteName: arguments.trustSuite)
+    if arguments.resetTrust { trustStore.removeAll() }
+    defer { if arguments.dropTrust { trustStore.removeAll() } }
+
+    let startedAt = iso8601Now()
+    var runs: [RunResult] = []
+    for run in scenario.runs {
+        fputs("== run \(run.id) (\(run.host):\(run.port))\n", stderr)
+        var iterations: [IterationResult] = []
+        var failures: [String] = []
+        for iteration in 1...max(1, run.repeatCount ?? 1) {
+            let result = autoreleasepool {
+                runIteration(run, iteration: iteration, trustStore: trustStore, workDirectory: arguments.workDirectory)
+            }
+            failures += evaluate(result, against: run.expect)
+            iterations.append(result)
+            drainRunLoop(0.5)
+        }
+        runs.append(RunResult(
+            id: run.id,
+            host: run.host,
+            port: run.port,
+            iterations: iterations,
+            firstFrameMs: DistributionSummary(iterations.compactMap(\.firstFrameMs)),
+            connectToConnectedMs: DistributionSummary(iterations.compactMap(\.connectToConnectedMs)),
+            shutdownMs: DistributionSummary(iterations.compactMap(\.shutdownMs)),
+            passed: failures.isEmpty,
+            expectationFailures: failures
+        ))
+        fputs("== run \(run.id): \(failures.isEmpty ? "PASS" : "FAIL \(failures)")\n", stderr)
+    }
+    return ScenarioResult(
+        scenario: scenario.name,
+        engine: engine,
+        startedAt: startedAt,
+        finishedAt: iso8601Now(),
+        host: [
+            "hostName": ProcessInfo.processInfo.hostName,
+            "osVersion": ProcessInfo.processInfo.operatingSystemVersionString,
+            "backingScaleFactor": "\(NSScreen.main?.backingScaleFactor ?? 0)"
+        ],
+        runs: runs,
+        passed: runs.allSatisfy(\.passed)
+    )
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+do {
+    let arguments = try Arguments(CommandLine.arguments)
+    let result = try runScenario(arguments)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(result).write(to: arguments.outURL)
+    print("rdp-engine-harness: \(result.scenario) \(result.passed ? "PASS" : "FAIL") -> \(arguments.outURL.path)")
+    exit(result.passed ? 0 : 1)
+} catch {
+    fputs("rdp-engine-harness failed: \(error)\n", stderr)
+    exit(2)
+}
