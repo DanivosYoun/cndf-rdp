@@ -6,6 +6,7 @@ public enum FileTransferStagingError: Error, Equatable {
     case unableToReadFileSize(URL)
     case unsafeRemoteFileName(String)
     case unableToCreateRemoteDropFile(URL, errno: Int32)
+    case refusedToRemove(URL)
 }
 
 /// A new, empty file created exclusively inside the staging root for a remote clipboard file.
@@ -184,5 +185,165 @@ public final class FileTransferStaging {
             .split(separator: "\\", omittingEmptySubsequences: false)
             .map { FileNameNormalization.normalizeForTransfer(String($0)) }
             .joined(separator: "\\")
+    }
+
+    /// Starts materializing one remote file list. Folder entries become directories (design D1).
+    public func beginRemoteDrop() throws -> RemoteDropTree {
+        try prepare()
+        return RemoteDropTree(staging: self, rootPath: rootURL.standardizedFileURL.path)
+    }
+
+    /// Removes staged items that will not reach the pasteboard (design D2, INV-L3).
+    ///
+    /// Only items directly under `rootURL` are accepted; the whole batch is refused before
+    /// anything is removed if one is the root itself or lies elsewhere. Symbolic links are
+    /// removed, never followed. Items that no longer exist are skipped.
+    public func removeRemoteDropItems(_ urls: [URL]) throws {
+        let rootPath = rootURL.standardizedFileURL.path
+        let paths = try urls.map { url -> String in
+            let standardized = url.standardizedFileURL
+            let name = standardized.lastPathComponent
+            guard !name.isEmpty, name != ".", name != "..", name != "/",
+                  standardized.deletingLastPathComponent().standardizedFileURL.path == rootPath else {
+                throw FileTransferStagingError.refusedToRemove(url)
+            }
+            return standardized.path
+        }
+        for path in paths {
+            var stats = stat()
+            guard lstat(path, &stats) == 0 else { continue }
+            try fileManager.removeItem(atPath: path)
+        }
+    }
+
+    /// Path components of a remote name: split on "\\", empty components dropped, each one
+    /// reduced to one safe name by `safeRemoteFileName`.
+    fileprivate static func remoteDropComponents(_ path: String) -> [String] {
+        let components = path.split(separator: "\\", omittingEmptySubsequences: true)
+            .map { safeRemoteFileName(String($0)) }
+        return components.isEmpty ? ["untitled"] : components
+    }
+
+    /// Creates a new top-level directory directly under the root (`mkdir 0700`, " N" on EEXIST)
+    /// and opens it without following links.
+    fileprivate func createRemoteDropTopDirectory(_ name: String, rootPath: String) throws -> (descriptor: Int32, url: URL) {
+        for index in 0...Int.max {
+            let candidateName = Self.fitFileSystemNameLimit(base: name, suffix: index == 0 ? "" : " \(index)", ext: "")
+            let candidatePath = rootPath + "/" + candidateName
+            let candidate = URL(fileURLWithPath: candidatePath, isDirectory: true)
+            guard candidate.lastPathComponent == candidateName,
+                  candidate.deletingLastPathComponent().standardizedFileURL.path == rootPath else {
+                throw FileTransferStagingError.unsafeRemoteFileName(name)
+            }
+            if candidatePath.withCString({ mkdir($0, 0o700) }) == 0 {
+                let descriptor = candidatePath.withCString {
+                    open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                }
+                guard descriptor >= 0 else {
+                    throw FileTransferStagingError.unableToCreateRemoteDropFile(candidate, errno: errno)
+                }
+                return (descriptor, candidate)
+            }
+            let error = errno
+            guard error == EEXIST else {
+                throw FileTransferStagingError.unableToCreateRemoteDropFile(candidate, errno: error)
+            }
+        }
+        throw FileTransferStagingError.unsafeRemoteFileName(name)
+    }
+
+    /// Creates a new file in an open directory (`O_EXCL | O_NOFOLLOW`, " N" on EEXIST).
+    fileprivate static func createRemoteDropFile(named name: String, in directory: Int32, directoryURL: URL) throws -> RemoteDropFile {
+        let (base, ext) = splitExtension(name)
+        let directoryPath = directoryURL.standardizedFileURL.path
+        for index in 0...Int.max {
+            let candidateName = fitFileSystemNameLimit(base: base, suffix: index == 0 ? "" : " \(index)", ext: ext)
+            let candidate = URL(fileURLWithPath: directoryPath + "/" + candidateName, isDirectory: false)
+            let descriptor = candidateName.withCString {
+                openat(directory, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+            }
+            if descriptor >= 0 {
+                return RemoteDropFile(url: candidate, handle: FileHandle(fileDescriptor: descriptor, closeOnDealloc: true))
+            }
+            let error = errno
+            guard error == EEXIST else {
+                throw FileTransferStagingError.unableToCreateRemoteDropFile(candidate, errno: error)
+            }
+        }
+        throw FileTransferStagingError.unsafeRemoteFileName(name)
+    }
+}
+
+/// One remote file list being materialized under the staging root (design D1, INV-F1).
+///
+/// Names are remote "\\"-separated paths. Each first component gets one directory of this list,
+/// created exclusively; deeper directories are made with `mkdirat` and opened with
+/// `O_DIRECTORY | O_NOFOLLOW`, so nothing outside that directory is ever reached. A name with
+/// one component is a top-level file and is created by `createRemoteDropFile`.
+public final class RemoteDropTree {
+    private let staging: FileTransferStaging
+    private let rootPath: String
+    private var directories: [String: (descriptor: Int32, url: URL)] = [:]
+    /// The list's top-level items (directories and files), in first-seen order.
+    public private(set) var topLevelURLs: [URL] = []
+
+    fileprivate init(staging: FileTransferStaging, rootPath: String) {
+        self.staging = staging
+        self.rootPath = rootPath
+    }
+
+    deinit {
+        for directory in directories.values {
+            close(directory.descriptor)
+        }
+    }
+
+    public func createDirectory(path: String) throws {
+        let opened = try openDirectory(FileTransferStaging.remoteDropComponents(path)[...])
+        if opened.owned { close(opened.descriptor) }
+    }
+
+    public func createFile(path: String) throws -> RemoteDropFile {
+        let components = FileTransferStaging.remoteDropComponents(path)
+        guard components.count > 1 else {
+            let file = try staging.createRemoteDropFile(fileName: components[0])
+            topLevelURLs.append(file.url)
+            return file
+        }
+        let parent = try openDirectory(components.dropLast())
+        defer { if parent.owned { close(parent.descriptor) } }
+        return try FileTransferStaging.createRemoteDropFile(named: components[components.count - 1], in: parent.descriptor, directoryURL: parent.url)
+    }
+
+    /// The directory for `components`, created as needed. `owned` descriptors are the caller's to close.
+    private func openDirectory(_ components: ArraySlice<String>) throws -> (descriptor: Int32, url: URL, owned: Bool) {
+        let top = components[components.startIndex]
+        let topDirectory: (descriptor: Int32, url: URL)
+        if let existing = directories[top] {
+            topDirectory = existing
+        } else {
+            topDirectory = try staging.createRemoteDropTopDirectory(top, rootPath: rootPath)
+            directories[top] = topDirectory
+            topLevelURLs.append(topDirectory.url)
+        }
+
+        var current = (descriptor: topDirectory.descriptor, url: topDirectory.url, owned: false)
+        for name in components.dropFirst() {
+            let url = URL(fileURLWithPath: current.url.standardizedFileURL.path + "/" + name, isDirectory: true)
+            let made = name.withCString { mkdirat(current.descriptor, $0, 0o700) }
+            if made != 0, errno != EEXIST {
+                let error = errno
+                if current.owned { close(current.descriptor) }
+                throw FileTransferStagingError.unableToCreateRemoteDropFile(url, errno: error)
+            }
+            let next = name.withCString { openat(current.descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            let error = errno
+            if current.owned { close(current.descriptor) }
+            guard next >= 0 else {
+                throw FileTransferStagingError.unableToCreateRemoteDropFile(url, errno: error)
+            }
+            current = (next, url, true)
+        }
+        return current
     }
 }

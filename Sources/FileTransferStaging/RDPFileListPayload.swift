@@ -4,11 +4,14 @@ public struct RDPFileListEntry: Equatable, Sendable {
     public let fileName: String
     public let byteCount: UInt64
     public let localURL: URL?
+    /// A remote folder entry: it becomes a directory and has no contents to request (design D1).
+    public let isDirectory: Bool
 
-    public init(fileName: String, byteCount: UInt64, localURL: URL?) {
+    public init(fileName: String, byteCount: UInt64, localURL: URL?, isDirectory: Bool = false) {
         self.fileName = fileName
         self.byteCount = byteCount
         self.localURL = localURL
+        self.isDirectory = isDirectory
     }
 }
 
