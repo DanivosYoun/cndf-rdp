@@ -118,6 +118,10 @@ struct Connection {
     input: Mutex<Option<ironrdp_client::rdp::RdpInputSender>>,
     #[cfg(feature = "stub")]
     clipboard: Mutex<Option<mpsc::Sender<clipboard::ClipboardCommand>>>,
+    #[cfg(not(feature = "stub"))]
+    log_level: CNDFIronLogLevel,
+    #[cfg(not(feature = "stub"))]
+    clipboard: Mutex<Option<clipboard::Channel>>,
     callbacks: Arc<Callbacks>,
     statistics: Arc<Mutex<CNDFIronStatistics>>,
 }
@@ -286,7 +290,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=7\0"
+            " ironrdp=15b4a03ff552 patches=13\0"
         );
         version.as_ptr().cast()
     })
@@ -350,9 +354,21 @@ pub unsafe extern "C" fn cndf_iron_connect(
         {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
-        let Some(channel_options) = channels::Options::read(options) else {
+        let Some(mut channel_options) = channels::Options::read(options) else {
             return CNDF_IRON_INVALID_ARGUMENT;
         };
+        use CNDFIronAudioMode::*;
+        let capabilities = cndf_iron_capabilities();
+        channel_options.audio = match channel_options.audio {
+            CNDF_IRON_AUDIO_LOCAL if capabilities & CNDF_IRON_CAP_AUDIO_LOCAL == 0 => {
+                CNDF_IRON_AUDIO_OFF
+            }
+            CNDF_IRON_AUDIO_REMOTE if capabilities & CNDF_IRON_CAP_AUDIO_REMOTE == 0 => {
+                CNDF_IRON_AUDIO_OFF
+            }
+            mode => mode,
+        };
+        channel_options.clipboard &= capabilities & CNDF_IRON_CAP_CLIPBOARD != 0;
         if ptr::addr_of!((*options).log_level).cast::<u32>().read() > 6
             || ptr::addr_of!((*options).graphics_pipeline)
                 .cast::<u8>()
@@ -427,8 +443,9 @@ pub unsafe extern "C" fn cndf_iron_connect(
             stop: AtomicBool::new(false),
             #[cfg(not(feature = "stub"))]
             input: Mutex::default(),
-            #[cfg(feature = "stub")]
             clipboard: Mutex::default(),
+            #[cfg(not(feature = "stub"))]
+            log_level: options.log_level,
             callbacks: Arc::clone(&session.callbacks),
             statistics: Arc::clone(&session.statistics),
         });
@@ -693,8 +710,9 @@ mod tests {
             stop: AtomicBool::new(false),
             #[cfg(not(feature = "stub"))]
             input: Mutex::default(),
-            #[cfg(feature = "stub")]
             clipboard: Mutex::default(),
+            #[cfg(not(feature = "stub"))]
+            log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
             callbacks: Arc::clone(&owner.callbacks),
             statistics: Arc::clone(&owner.statistics),
         });

@@ -1,0 +1,203 @@
+diff --git a/crates/ironrdp-client/src/config.rs b/crates/ironrdp-client/src/config.rs
+--- a/crates/ironrdp-client/src/config.rs
++++ b/crates/ironrdp-client/src/config.rs
+@@ -1039,6 +1039,7 @@
+     pointer_software_rendering: Option<bool>,
+     performance_flags: Option<ironrdp_pdu::rdp::client_info::PerformanceFlags>,
+     enable_audio_playback: Option<bool>,
++    remote_console_audio: bool,
+     enable_audio_capture: Option<bool>,
+     compression_type: Option<ironrdp_pdu::rdp::client_info::CompressionType>,
+     compression_enabled: Option<bool>,
+@@ -1863,14 +1864,13 @@
+ 
+     /// Set the public RDP audio redirection mode.
+     ///
+-    /// `PlayOnServer` and `Disabled` currently share the same client-info outcome:
+-    /// both clear local RDPSND playback and set `INFO_NOAUDIOPLAYBACK`. Distinct
+-    /// `INFO_REMOTECONSOLEAUDIO` (true “play on server console”) is not wired yet.
++    /// `PlayOnServer` requests playback on the server console.
+     #[cfg(feature = "sound")]
+     #[must_use]
+     pub fn with_audio_mode(mut self, mode: ironrdp_cfg::AudioMode) -> Self {
+         self.channels.sound = matches!(mode, ironrdp_cfg::AudioMode::RedirectToClient);
+         self.enable_audio_playback = Some(matches!(mode, ironrdp_cfg::AudioMode::RedirectToClient));
++        self.remote_console_audio = matches!(mode, ironrdp_cfg::AudioMode::PlayOnServer);
+         self.properties.set_audio_mode(mode);
+         self
+     }
+@@ -2803,6 +2803,7 @@
+             enable_server_pointer: self.enable_server_pointer.unwrap_or(true),
+             autologon: self.autologon.unwrap_or(false),
+             enable_audio_playback: self.enable_audio_playback.unwrap_or(true),
++            remote_console_audio: self.remote_console_audio,
+             enable_audio_capture: self.enable_audio_capture.unwrap_or(false),
+             request_data: None,
+             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
+@@ -3078,6 +3079,9 @@
+         if let Some(depth) = ps.color_depth() {
+             self.color_depth = Some(depth);
+         }
++        if let Ok(Some(mode)) = ps.audio_mode() {
++            self.remote_console_audio = matches!(mode, AudioMode::PlayOnServer);
++        }
+         #[cfg(feature = "sound")]
+         match ps.audio_mode() {
+             Ok(Some(AudioMode::RedirectToClient)) => {
+diff --git a/crates/ironrdp-connector/src/connection.rs b/crates/ironrdp-connector/src/connection.rs
+--- a/crates/ironrdp-connector/src/connection.rs
++++ b/crates/ironrdp-connector/src/connection.rs
+@@ -2381,6 +2381,10 @@
+         flags |= ClientInfoFlags::NO_AUDIO_PLAYBACK;
+     }
+ 
++    if config.remote_console_audio {
++        flags |= ClientInfoFlags::REMOTE_CONSOLE_AUDIO;
++    }
++
+     if config.enable_audio_capture {
+         flags |= ClientInfoFlags::AUDIO_CAPTURE;
+     }
+@@ -2507,6 +2511,7 @@
+             request_data: None,
+             autologon: false,
+             enable_audio_playback: false,
++            remote_console_audio: false,
+             enable_audio_capture: false,
+             performance_flags: Default::default(),
+             license_cache: None,
+@@ -2570,6 +2575,7 @@
+             request_data: None,
+             autologon: false,
+             enable_audio_playback: true,
++            remote_console_audio: false,
+             enable_audio_capture: true,
+             performance_flags: Default::default(),
+             license_cache: None,
+@@ -2588,9 +2594,19 @@
+         assert!(!client_info.flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+ 
+         config.enable_audio_capture = false;
+-        let client_info =
+-            create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None, false, false).client_info;
+-        assert!(!client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
++        let mask = ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO;
++        for (playback, remote, expected) in [
++            (false, false, ClientInfoFlags::NO_AUDIO_PLAYBACK),
++            (true, false, ClientInfoFlags::empty()),
++            (false, true, mask),
++        ] {
++            config.enable_audio_playback = playback;
++            config.remote_console_audio = remote;
++            let client_info =
++                create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None, false, false).client_info;
++            assert_eq!(client_info.flags & mask, expected);
++            assert!(!client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
++        }
+     }
+ 
+     /// A plain client [`Config`] for tests to change what they look at.
+@@ -2635,6 +2651,7 @@
+             request_data: None,
+             autologon: false,
+             enable_audio_playback: false,
++            remote_console_audio: false,
+             enable_audio_capture: false,
+             performance_flags: Default::default(),
+             license_cache: None,
+@@ -2742,6 +2759,7 @@
+             request_data: None,
+             autologon: false,
+             enable_audio_playback: false,
++            remote_console_audio: false,
+             enable_audio_capture: false,
+             performance_flags: Default::default(),
+             license_cache: None,
+diff --git a/crates/ironrdp-connector/src/connection_activation.rs b/crates/ironrdp-connector/src/connection_activation.rs
+--- a/crates/ironrdp-connector/src/connection_activation.rs
++++ b/crates/ironrdp-connector/src/connection_activation.rs
+@@ -1009,6 +1009,7 @@
+             request_data: None,
+             autologon: false,
+             enable_audio_playback: false,
++            remote_console_audio: false,
+             enable_audio_capture: false,
+             license_cache: None,
+             compression_type: None,
+diff --git a/crates/ironrdp-connector/src/lib.rs b/crates/ironrdp-connector/src/lib.rs
+--- a/crates/ironrdp-connector/src/lib.rs
++++ b/crates/ironrdp-connector/src/lib.rs
+@@ -339,6 +339,7 @@
+     /// If true, local audio playback is enabled and `INFO_NOAUDIOPLAYBACK` is left clear
+     /// in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu).
+     pub enable_audio_playback: bool,
++    pub remote_console_audio: bool,
+     /// If true, client microphone capture is enabled and `INFO_AUDIOCAPTURE` is set
+     /// in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu).
+     pub enable_audio_capture: bool,
+diff --git a/crates/ironrdp-testsuite-core/tests/connector/mod.rs b/crates/ironrdp-testsuite-core/tests/connector/mod.rs
+--- a/crates/ironrdp-testsuite-core/tests/connector/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/connector/mod.rs
+@@ -49,6 +49,7 @@
+         request_data: None,
+         autologon: false,
+         enable_audio_playback: false,
++        remote_console_audio: false,
+         enable_audio_capture: false,
+         license_cache: None,
+         compression_type: None,
+diff --git a/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs b/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs
+--- a/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs
++++ b/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs
+@@ -66,6 +66,7 @@
+         request_data: None,
+         autologon: false,
+         enable_audio_playback: false,
++        remote_console_audio: false,
+         enable_audio_capture: false,
+         license_cache: None,
+         compression_type: None,
+diff --git a/crates/ironrdp-testsuite-extra/tests/e2e.rs b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+--- a/crates/ironrdp-testsuite-extra/tests/e2e.rs
++++ b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+@@ -4217,6 +4217,7 @@
+         request_data: None,
+         autologon: false,
+         enable_audio_playback: true,
++        remote_console_audio: false,
+         enable_audio_capture: false,
+         license_cache: None,
+         compression_type: None,
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -1884,6 +1884,7 @@
+         enable_server_pointer: true,
+         autologon: false,
+         enable_audio_playback: false,
++        remote_console_audio: false,
+         enable_audio_capture: false,
+         request_data: None,
+         pointer_software_rendering: false,
+diff --git a/crates/ironrdp/examples/screenshot.rs b/crates/ironrdp/examples/screenshot.rs
+--- a/crates/ironrdp/examples/screenshot.rs
++++ b/crates/ironrdp/examples/screenshot.rs
+@@ -289,6 +289,7 @@
+         request_data: None,
+         autologon,
+         enable_audio_playback: false,
++        remote_console_audio: false,
+         enable_audio_capture: false,
+         compression_type,
+         pointer_software_rendering: true,
+diff --git a/ffi/src/connector/config.rs b/ffi/src/connector/config.rs
+--- a/ffi/src/connector/config.rs
++++ b/ffi/src/connector/config.rs
+@@ -286,6 +286,7 @@
+                 enable_server_pointer: self.enable_server_pointer.unwrap_or(false),
+                 autologon: self.autologon.unwrap_or(false),
+                 enable_audio_playback: !self.no_audio_playback.unwrap_or(false),
++                remote_console_audio: false,
+                 enable_audio_capture: false,
+                 request_data: None,
+                 compression_type: None,

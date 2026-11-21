@@ -4,3 +4,14 @@ cpp_compat = true
 usize_is_size_t = true
 style = "both"
 documentation = true
+
+# cbindgen emits integer literals without a C unsigned suffix.
+after_includes = """
+#define CNDF_IRON_CAP_CLIPBOARD 0x1u
+#define CNDF_IRON_CAP_DRIVE 0x2u
+#define CNDF_IRON_CAP_AUDIO_LOCAL 0x4u
+#define CNDF_IRON_CAP_AUDIO_REMOTE 0x8u
+"""
+
+[export]
+exclude = ["CNDF_IRON_CAP_CLIPBOARD", "CNDF_IRON_CAP_DRIVE", "CNDF_IRON_CAP_AUDIO_LOCAL", "CNDF_IRON_CAP_AUDIO_REMOTE"]

@@ -8,14 +8,21 @@ crate-type = ["staticlib"]
 
 [features]
 default = ["engine"]
-engine = ["dep:ironrdp-client", "dep:ironrdp-connector", "dep:ironrdp-pdu", "dep:ironrdp-tls", "dep:tokio", "dep:tracing", "dep:rustls", "dep:smallvec", "dep:tracing-subscriber"]
+engine = ["dep:ironrdp-client", "dep:ironrdp-cliprdr", "dep:ironrdp-core", "dep:ironrdp-cfg", "dep:ironrdp-rdpdr", "dep:ironrdp-rdpdr-native", "dep:ironrdp-svc", "dep:libc", "dep:ironrdp-connector", "dep:ironrdp-pdu", "dep:ironrdp-tls", "dep:tokio", "dep:tracing", "dep:rustls", "dep:smallvec", "dep:tracing-subscriber"]
 stub = []
 # Legacy TLS 1.0-1.1 through vendored OpenSSL 3 (design D-L1). Off by default.
 legacy-tls = ["engine", "dep:openssl", "dep:tokio-openssl"]
 
 [dependencies]
+ironrdp-cfg = { path = "../../Vendor/IronRDP/src/crates/ironrdp-cfg", optional = true }
+ironrdp-rdpdr = { path = "../../Vendor/IronRDP/src/crates/ironrdp-rdpdr", optional = true }
+ironrdp-rdpdr-native = { path = "../../Vendor/IronRDP/src/crates/ironrdp-rdpdr-native", optional = true }
+ironrdp-svc = { path = "../../Vendor/IronRDP/src/crates/ironrdp-svc", optional = true }
+libc = { version = "0.2", optional = true }
+ironrdp-cliprdr = { path = "../../Vendor/IronRDP/src/crates/ironrdp-cliprdr", optional = true }
+ironrdp-core = { path = "../../Vendor/IronRDP/src/crates/ironrdp-core", optional = true }
 zeroize = "1.8"
-ironrdp-client = { path = "../../Vendor/IronRDP/src/crates/ironrdp-client", default-features = false, features = ["rustls"], optional = true }
+ironrdp-client = { path = "../../Vendor/IronRDP/src/crates/ironrdp-client", default-features = false, features = ["rustls", "clipboard", "rdpdr", "sound"], optional = true }
 ironrdp-connector = { path = "../../Vendor/IronRDP/src/crates/ironrdp-connector", default-features = false, optional = true }
 ironrdp-pdu = { path = "../../Vendor/IronRDP/src/crates/ironrdp-pdu", optional = true }
 ironrdp-tls = { path = "../../Vendor/IronRDP/src/crates/ironrdp-tls", optional = true }
@@ -38,3 +45,24 @@ panic = "unwind"
 # Rust 1.94.1 stripping misaligns proc-macro dylibs rejected by macOS 27 dyld.
 # Revisit when the pinned toolchain includes the fix for rust-lang/rust#157750.
 strip = "none"
+
+[profile.release.package.ironrdp-cliprdr]
+opt-level = "s"
+
+[profile.release.package.ironrdp-rdpdr]
+opt-level = "s"
+
+[profile.release.package.ironrdp-rdpdr-native]
+opt-level = "s"
+
+[profile.release.package.ironrdp-rdpsnd]
+opt-level = "s"
+
+[profile.release.package.nix]
+opt-level = "s"
+
+[profile.release.package.ironrdp-rdpsnd-native]
+opt-level = "s"
+
+[profile.release.package.cpal]
+opt-level = "s"

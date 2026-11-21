@@ -78,10 +78,12 @@ if [[ -n $exported ]]; then
     printf '%s\n' "libcndf_ironrdp.a exports symbols outside _cndf_iron_*:" "$exported" >&2
     exit 1
 fi
-if ! grep -Fxq '_cndf_iron_abi_version' <<< "$symbols"; then
-    printf '%s\n' "libcndf_ironrdp.a does not export _cndf_iron_abi_version" >&2
-    exit 1
-fi
+while IFS= read -r symbol; do
+    if ! grep -Fxq "$symbol" <<< "$symbols"; then
+        printf 'libcndf_ironrdp.a does not export %s\n' "$symbol" >&2
+        exit 1
+    fi
+done < "$root/Rust/cndf-ironrdp/cndf_iron.exports"
 install -d "$root/Vendor/IronRDP/install/lib"
 install -m 644 "$prelink/libcndf_ironrdp.a" "$root/Vendor/IronRDP/install/lib/libcndf_ironrdp.a"
 rm -rf -- "$prelink"

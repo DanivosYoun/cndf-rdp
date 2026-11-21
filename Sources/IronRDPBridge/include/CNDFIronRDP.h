@@ -6,16 +6,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#define CNDF_IRON_CAP_CLIPBOARD 0x1u
+#define CNDF_IRON_CAP_DRIVE 0x2u
+#define CNDF_IRON_CAP_AUDIO_LOCAL 0x4u
+#define CNDF_IRON_CAP_AUDIO_REMOTE 0x8u
+
 
 #define CNDF_IRON_ABI_VERSION 1
-
-#define CNDF_IRON_CAP_CLIPBOARD 1
-
-#define CNDF_IRON_CAP_DRIVE 2
-
-#define CNDF_IRON_CAP_AUDIO_LOCAL 4
-
-#define CNDF_IRON_CAP_AUDIO_REMOTE 8
 
 #define CNDF_IRON_CERT_CHAIN_UNTRUSTED 1
 

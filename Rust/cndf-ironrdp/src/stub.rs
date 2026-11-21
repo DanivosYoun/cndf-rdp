@@ -240,6 +240,7 @@ mod tests {
     struct Probe {
         trust: AtomicUsize,
         frames: SyncSender<(u64, u64, [u8; 4])>,
+        clipboard: SyncSender<(u64, Vec<u8>)>,
     }
 
     extern "C" fn trust(_: u64, _: *const CNDFIronCertificateChain, context: *mut c_void) -> bool {
@@ -263,12 +264,50 @@ mod tests {
         let _ = probe.frames.try_send((generation, sequence, pixel));
     }
 
+    extern "C" fn remote_text(generation: u64, bytes: *const u8, len: usize, context: *mut c_void) {
+        let probe = unsafe { &*context.cast::<Probe>() };
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+        let _ = probe.clipboard.try_send((generation, bytes.to_vec()));
+    }
+
+    extern "C" fn remote_file_list(
+        generation: u64,
+        files: *const CNDFIronRemoteFile,
+        len: usize,
+        context: *mut c_void,
+    ) {
+        if len == 1 {
+            let file = unsafe { &*files };
+            remote_text(generation, file.name_utf8, file.name_length, context);
+        }
+    }
+
+    extern "C" fn remote_file_contents(
+        generation: u64,
+        stream: u32,
+        ok: bool,
+        bytes: *const u8,
+        len: usize,
+        context: *mut c_void,
+    ) {
+        if ok {
+            remote_text(generation, bytes, len, context);
+        } else if bytes.is_null() && len == 0 {
+            let probe = unsafe { &*context.cast::<Probe>() };
+            let _ = probe
+                .clipboard
+                .try_send((generation, stream.to_le_bytes().to_vec()));
+        }
+    }
+
     #[test]
     fn stub_abi_delivers_frames_and_echoes_only_current_input() {
         let (send, receive) = mpsc::sync_channel(8);
+        let (clip_send, clip_receive) = mpsc::sync_channel(8);
         let mut probe = Probe {
             trust: AtomicUsize::new(0),
             frames: send,
+            clipboard: clip_send,
         };
         let callbacks = CNDFIronCallbacks {
             log: None,
@@ -278,9 +317,9 @@ mod tests {
             disconnect: None,
             frame: Some(frame),
             pointer: None,
-            remote_text: None,
-            remote_file_list: None,
-            remote_file_contents: None,
+            remote_text: Some(remote_text),
+            remote_file_list: Some(remote_file_list),
+            remote_file_contents: Some(remote_file_contents),
             context: (&mut probe as *mut Probe).cast(),
         };
         let options = CNDFIronConnectOptions {
@@ -295,7 +334,7 @@ mod tests {
             color_depth: 32,
             graphics_pipeline: true,
             log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
-            clipboard: false,
+            clipboard: true,
             drive_path: ptr::null(),
             drive_name: ptr::null(),
             audio_mode: CNDFIronAudioMode::CNDF_IRON_AUDIO_OFF,
@@ -337,11 +376,62 @@ mod tests {
                 receive.recv_timeout(Duration::from_secs(2)).unwrap(),
                 (generation, 3, result.2)
             );
+            let text = "한글";
+            assert_eq!(
+                cndf_iron_clipboard_offer_text(session, generation + 1, text.as_ptr(), text.len()),
+                CNDF_IRON_NOT_CONNECTED
+            );
+            assert_eq!(
+                cndf_iron_clipboard_offer_text(session, generation, text.as_ptr(), text.len()),
+                CNDF_IRON_OK
+            );
+            assert_eq!(
+                clip_receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (generation, text.as_bytes().to_vec())
+            );
+            let path = std::env::temp_dir().join(format!("cndf-iron-stub-{}", std::process::id()));
+            std::fs::write(&path, b"file").unwrap();
+            let path_c = CString::new(path.to_str().unwrap()).unwrap();
+            let name = c"root\\한글.txt";
+            let file = CNDFIronLocalFile {
+                path: path_c.as_ptr(),
+                name: name.as_ptr(),
+                size: 4,
+            };
+            assert_eq!(
+                cndf_iron_clipboard_offer_files(session, generation, &file, 1),
+                CNDF_IRON_OK
+            );
+            assert_eq!(
+                clip_receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (generation, name.to_bytes().to_vec())
+            );
+            assert_eq!(
+                cndf_iron_clipboard_request_file_range(session, generation, 3, 0, 0, 4),
+                CNDF_IRON_OK
+            );
+            assert_eq!(
+                clip_receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (generation, b"file".to_vec())
+            );
+            assert_eq!(
+                cndf_iron_clipboard_request_file_range(session, generation, 4, 1, 0, 4),
+                CNDF_IRON_OK
+            );
+            assert_eq!(
+                clip_receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (generation, 4_u32.to_le_bytes().to_vec())
+            );
             cndf_iron_session_destroy(session, 2000);
+            std::fs::remove_file(path).unwrap();
             result
         };
         assert_eq!((generation, sequence, pixel), (1, 2, [0, 0, 4, 255]));
         assert_eq!(probe.trust.load(Ordering::Relaxed), 1);
         assert!(receive.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(clip_receive
+            .recv_timeout(Duration::from_millis(30))
+            .is_err());
+        assert_eq!(cndf_iron_capabilities(), 0xf);
     }
 }

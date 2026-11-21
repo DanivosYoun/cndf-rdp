@@ -1,16 +1,14 @@
 use super::*;
 
-#[cfg(feature = "stub")]
 use std::io::{Read, Seek, SeekFrom};
 
-#[cfg_attr(not(feature = "stub"), allow(dead_code))]
+#[derive(Clone)]
 pub(super) struct LocalFile {
     path: String,
     name: String,
     size: u64,
 }
 
-#[cfg_attr(not(feature = "stub"), allow(dead_code))]
 pub(super) enum ClipboardCommand {
     Text(String),
     Files(Vec<LocalFile>),
@@ -31,7 +29,11 @@ pub extern "C" fn cndf_iron_capabilities() -> u32 {
             | CNDF_IRON_CAP_AUDIO_LOCAL
             | CNDF_IRON_CAP_AUDIO_REMOTE;
         #[cfg(not(feature = "stub"))]
-        0
+        {
+            // Upstream range validation also aborts the active session.
+            // The native playback backend has no wave observation hook.
+            CNDF_IRON_CAP_DRIVE | CNDF_IRON_CAP_AUDIO_REMOTE
+        }
     })
 }
 
@@ -66,7 +68,9 @@ fn submit(session: &CNDFIronSession, generation: u64, command: ClipboardCommand)
         };
     }
     #[cfg(not(feature = "stub"))]
-    drop(command);
+    if let Some(channel) = lock(&connection.clipboard).as_ref() {
+        return channel.submit(command);
+    }
     CNDF_IRON_NOT_CONNECTED
 }
 
@@ -154,7 +158,6 @@ pub unsafe extern "C" fn cndf_iron_clipboard_request_file_range(
 #[cfg(feature = "stub")]
 pub(super) fn run_stub(connection: &Connection, commands: Receiver<ClipboardCommand>) {
     let mut files = Vec::new();
-    let generation = connection.generation;
     while !connection.stop.load(Ordering::Acquire) {
         let command = match commands.recv_timeout(Duration::from_millis(5)) {
             Ok(command) => command,
@@ -164,32 +167,14 @@ pub(super) fn run_stub(connection: &Connection, commands: Receiver<ClipboardComm
         match command {
             ClipboardCommand::Text(text) => {
                 files.clear();
-                connection.callbacks.invoke(|table| {
-                    if let Some(callback) = table.remote_text {
-                        callback(generation, text.as_ptr(), text.len(), table.context);
-                    }
-                });
+                notify_text(connection, &text);
             }
             ClipboardCommand::Files(offer) => {
                 files = offer;
-                let descriptors: Vec<_> = files
-                    .iter()
-                    .map(|file| CNDFIronRemoteFile {
-                        name_utf8: file.name.as_ptr(),
-                        name_length: file.name.len(),
-                        size: file.size,
-                    })
-                    .collect();
-                connection.callbacks.invoke(|table| {
-                    if let Some(callback) = table.remote_file_list {
-                        callback(
-                            generation,
-                            descriptors.as_ptr(),
-                            descriptors.len(),
-                            table.context,
-                        );
-                    }
-                });
+                notify_files(
+                    connection,
+                    files.iter().map(|file| (file.name.as_str(), file.size)),
+                );
             }
             ClipboardCommand::Range {
                 stream_id,
@@ -200,27 +185,12 @@ pub(super) fn run_stub(connection: &Connection, commands: Receiver<ClipboardComm
                 let bytes = files
                     .get(list_index as usize)
                     .and_then(|file| read_range(file, offset, length));
-                connection.callbacks.invoke(|table| {
-                    if let Some(callback) = table.remote_file_contents {
-                        let (data, count) = bytes
-                            .as_ref()
-                            .map_or((ptr::null(), 0), |bytes| (bytes.as_ptr(), bytes.len()));
-                        callback(
-                            generation,
-                            stream_id,
-                            bytes.is_some(),
-                            data,
-                            count,
-                            table.context,
-                        );
-                    }
-                });
+                notify_range(connection, stream_id, bytes.as_deref());
             }
         }
     }
 }
 
-#[cfg(feature = "stub")]
 fn read_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
     if length > 64 * 1024 * 1024 || offset.checked_add(u64::from(length))? > file.size {
         return None;
@@ -230,4 +200,571 @@ fn read_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
     let mut bytes = vec![0; length as usize];
     source.read_exact(&mut bytes).ok()?;
     Some(bytes)
+}
+
+fn notify_text(connection: &Connection, text: &str) {
+    connection.callbacks.invoke(|table| {
+        if let Some(callback) = table.remote_text {
+            callback(
+                connection.generation,
+                text.as_ptr(),
+                text.len(),
+                table.context,
+            );
+        }
+    });
+}
+
+fn notify_files<'a>(connection: &Connection, files: impl Iterator<Item = (&'a str, u64)>) {
+    let descriptors: Vec<_> = files
+        .map(|(name, size)| CNDFIronRemoteFile {
+            name_utf8: name.as_ptr(),
+            name_length: name.len(),
+            size,
+        })
+        .collect();
+    connection.callbacks.invoke(|table| {
+        if let Some(callback) = table.remote_file_list {
+            callback(
+                connection.generation,
+                descriptors.as_ptr(),
+                descriptors.len(),
+                table.context,
+            );
+        }
+    });
+}
+
+fn notify_range(connection: &Connection, stream_id: u32, bytes: Option<&[u8]>) {
+    connection.callbacks.invoke(|table| {
+        if let Some(callback) = table.remote_file_contents {
+            let (data, count) =
+                bytes.map_or((ptr::null(), 0), |bytes| (bytes.as_ptr(), bytes.len()));
+            callback(
+                connection.generation,
+                stream_id,
+                bytes.is_some(),
+                data,
+                count,
+                table.context,
+            );
+        }
+    });
+}
+
+#[cfg(not(feature = "stub"))]
+pub(super) use real::{Channel, ClipWork, Job};
+
+#[cfg(not(feature = "stub"))]
+mod real {
+    use super::*;
+    use ironrdp_client::rdp::RdpInputSender;
+    use ironrdp_cliprdr::backend::{
+        ClipboardMessage as Message, CliprdrBackend, CliprdrBackendFactory,
+    };
+    use ironrdp_cliprdr::pdu::{
+        ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId,
+        ClipboardGeneralCapabilityFlags as Capabilities, FileContentsFlags, FileContentsRequest,
+        FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
+    };
+    use ironrdp_core::IntoOwned;
+    use std::collections::{HashSet, VecDeque};
+
+    pub(crate) type Job = Box<dyn FnOnce(&Connection) + Send>;
+
+    pub(crate) struct ClipWork;
+    impl ClipWork {
+        pub(crate) fn spawn(
+            connection: Arc<Connection>,
+        ) -> std::io::Result<(mpsc::Sender<Job>, JoinHandle<()>)> {
+            let (send, recv) = mpsc::channel::<Job>();
+            let worker = thread::Builder::new()
+                .name(format!("cndf-iron-{}-clip", connection.generation))
+                .spawn(move || {
+                    connection.worker(|| {
+                        while !connection.stop.load(Ordering::Acquire) {
+                            match recv.recv_timeout(Duration::from_millis(5)) {
+                                Ok(job) => job(&connection),
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    })
+                })?;
+            Ok((send, worker))
+        }
+    }
+
+    #[derive(Default)]
+    enum Offer {
+        #[default]
+        Empty,
+        Text(String),
+        Files(Vec<LocalFile>),
+    }
+
+    #[derive(Default)]
+    struct State {
+        ready: bool,
+        dirty_offer: bool,
+        negotiated: Option<Capabilities>,
+        offer: Offer,
+        advertised: Vec<Arc<LocalFile>>,
+        deferred_paste: Option<(ClipboardFormatId, bool)>,
+        pastes: VecDeque<bool>,
+        requests: HashSet<u32>,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct Channel {
+        state: Arc<Mutex<State>>,
+        input: RdpInputSender,
+        work: mpsc::Sender<Job>,
+        #[cfg(test)]
+        messages: Option<mpsc::Sender<Message>>,
+    }
+
+    impl Channel {
+        pub(crate) fn new(input: RdpInputSender, work: mpsc::Sender<Job>) -> Self {
+            Self {
+                state: Arc::default(),
+                input,
+                work,
+                #[cfg(test)]
+                messages: None,
+            }
+        }
+
+        fn send(&self, message: Message) -> bool {
+            #[cfg(test)]
+            if let Some(messages) = &self.messages {
+                return messages.send(message).is_ok();
+            }
+            self.input.send_clipboard(message).is_ok()
+        }
+
+        fn queue(&self, job: impl FnOnce(&Connection) + Send + 'static) {
+            let _ = self.work.send(Box::new(job));
+        }
+
+        fn advertise(&self, state: &mut State) -> bool {
+            state.advertised.clear();
+            let Offer::Files(files) = &state.offer else {
+                let formats = if matches!(state.offer, Offer::Text(_)) {
+                    vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
+                } else {
+                    Vec::new()
+                };
+                return self.send(Message::SendInitiateCopy(formats));
+            };
+            if !state
+                .negotiated
+                .is_some_and(|flags| flags.contains(Capabilities::STREAM_FILECLIP_ENABLED))
+            {
+                self.queue(|connection| {
+                    connection.clip_log(
+                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                        "Clipboard server did not negotiate file streaming",
+                    )
+                });
+                return true;
+            }
+            let mut descriptors = Vec::with_capacity(files.len());
+            for file in files {
+                let (relative_path, name) = match file.name.rsplit_once('\\') {
+                    Some((parent, name)) => (Some(parent.to_owned()), name),
+                    None => (None, file.name.as_str()),
+                };
+                // Keep the I/O index aligned with the entries retained by initiate_file_copy.
+                if name.is_empty()
+                    || file.name.chars().count() > 259
+                    || file.name.starts_with(['/', '\\'])
+                    || file.name.as_bytes().get(1) == Some(&b':')
+                {
+                    continue;
+                }
+                let mut descriptor = FileDescriptor::new(name)
+                    .with_attributes(ClipboardFileAttributes::NORMAL)
+                    .with_file_size(file.size);
+                descriptor.relative_path = relative_path;
+                descriptors.push(descriptor);
+                state.advertised.push(Arc::new(file.clone()));
+            }
+            if descriptors.is_empty() {
+                return self.send(Message::SendInitiateCopy(Vec::new()));
+            }
+            self.send(Message::SendInitiateFileCopy(descriptors))
+        }
+
+        pub(crate) fn submit(&self, command: ClipboardCommand) -> CNDFIronStatus {
+            let mut state = lock(&self.state);
+            let sent = match command {
+                ClipboardCommand::Text(text) => {
+                    state.offer = Offer::Text(text);
+                    state.dirty_offer = !state.ready;
+                    !state.ready || self.advertise(&mut state)
+                }
+                ClipboardCommand::Files(files) => {
+                    state.offer = Offer::Files(files);
+                    state.dirty_offer = !state.ready;
+                    !state.ready || self.advertise(&mut state)
+                }
+                ClipboardCommand::Range {
+                    stream_id,
+                    list_index,
+                    offset,
+                    length,
+                } => {
+                    if !state.ready {
+                        return CNDF_IRON_NOT_CONNECTED;
+                    }
+                    let Ok(index) = i32::try_from(list_index) else {
+                        self.queue(move |connection| notify_range(connection, stream_id, None));
+                        return CNDF_IRON_OK;
+                    };
+                    if !self.send(Message::SendFileContentsRequest(FileContentsRequest {
+                        stream_id,
+                        index,
+                        flags: FileContentsFlags::RANGE,
+                        position: offset,
+                        requested_size: length,
+                        data_id: None,
+                    })) {
+                        return CNDF_IRON_NOT_CONNECTED;
+                    }
+                    state.requests.insert(stream_id);
+                    true
+                }
+            };
+            if sent {
+                CNDF_IRON_OK
+            } else {
+                CNDF_IRON_NOT_CONNECTED
+            }
+        }
+
+        fn paste(&self, state: &mut State, id: ClipboardFormatId, file: bool) {
+            if self.send(Message::SendInitiatePaste(id)) {
+                state.pastes.push_back(file);
+            }
+        }
+    }
+
+    impl CliprdrBackendFactory for Channel {
+        fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+            Box::new(CndfCliprdrBackend(self.clone()))
+        }
+    }
+
+    struct CndfCliprdrBackend(Channel);
+    ironrdp_core::impl_as_any!(CndfCliprdrBackend);
+
+    impl std::fmt::Debug for CndfCliprdrBackend {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("CndfCliprdrBackend")
+        }
+    }
+
+    impl Drop for CndfCliprdrBackend {
+        fn drop(&mut self) {
+            let mut state = lock(&self.0.state);
+            state.ready = false;
+            for stream in state.requests.drain() {
+                self.0
+                    .queue(move |connection| notify_range(connection, stream, None));
+            }
+        }
+    }
+
+    fn choose_format(formats: &[ClipboardFormat]) -> Option<(ClipboardFormatId, bool)> {
+        formats.iter().find_map(|format| {
+            if format
+                .name
+                .as_ref()
+                .is_some_and(|name| name.value() == "FileGroupDescriptorW")
+            {
+                Some((format.id, true))
+            } else if format.id == ClipboardFormatId::CF_UNICODETEXT {
+                Some((format.id, false))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn remote_name(file: &FileDescriptor) -> String {
+        match file.relative_path.as_deref() {
+            Some(path) if !path.is_empty() => format!("{path}\\{}", file.name),
+            _ => file.name.clone(),
+        }
+    }
+
+    fn decode_text(data: &[u8]) -> Option<String> {
+        let mut units = Vec::new();
+        let mut chunks = data.chunks_exact(2);
+        for chunk in &mut chunks {
+            let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if unit == 0 {
+                return String::from_utf16(&units).ok();
+            }
+            units.push(unit);
+        }
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+        String::from_utf16(&units).ok()
+    }
+
+    impl CliprdrBackend for CndfCliprdrBackend {
+        fn temporary_directory(&self) -> &str {
+            ""
+        }
+
+        fn client_capabilities(&self) -> Capabilities {
+            Capabilities::USE_LONG_FORMAT_NAMES
+                | Capabilities::STREAM_FILECLIP_ENABLED
+                | Capabilities::FILECLIP_NO_FILE_PATHS
+                | Capabilities::HUGE_FILE_SUPPORT_ENABLED
+        }
+
+        fn on_ready(&mut self) {
+            let mut state = lock(&self.0.state);
+            state.ready = true;
+            // Offers can change while the initial format list is awaiting acknowledgment.
+            if state.dirty_offer {
+                self.0.advertise(&mut state);
+            }
+            if let Some((id, file)) = state.deferred_paste.take() {
+                self.0.paste(&mut state, id, file);
+            }
+        }
+
+        fn on_request_format_list(&mut self) {
+            let mut state = lock(&self.0.state);
+            state.dirty_offer = matches!(state.offer, Offer::Files(_));
+            let formats = if matches!(state.offer, Offer::Text(_)) {
+                vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
+            } else {
+                Vec::new()
+            };
+            self.0.send(Message::SendInitiateCopy(formats));
+        }
+
+        fn on_process_negotiated_capabilities(&mut self, capabilities: Capabilities) {
+            lock(&self.0.state).negotiated = Some(capabilities);
+        }
+
+        fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+            let mut state = lock(&self.0.state);
+            let choice = choose_format(formats);
+            if !state.ready {
+                state.deferred_paste = choice;
+            } else if let Some((id, file)) = choice {
+                self.0.paste(&mut state, id, file);
+            }
+        }
+
+        fn on_format_data_request(&mut self, request: FormatDataRequest) {
+            let state = lock(&self.0.state);
+            let response = match &state.offer {
+                Offer::Text(text) if request.format == ClipboardFormatId::CF_UNICODETEXT => {
+                    FormatDataResponse::new_unicode_string(text)
+                }
+                _ => FormatDataResponse::new_error(),
+            };
+            self.0.send(Message::SendFormatData(response.into_owned()));
+        }
+
+        fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+            if lock(&self.0.state).pastes.pop_front() != Some(false) || response.is_error() {
+                return;
+            }
+            let bytes = response.data().to_vec();
+            self.0.queue(move |connection| match decode_text(&bytes) {
+                Some(text) => notify_text(connection, &text),
+                None => connection.clip_log(
+                    CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                    "Discarded malformed clipboard UTF-16",
+                ),
+            });
+        }
+
+        fn on_remote_file_list(&mut self, files: &[FileDescriptor], _: Option<u32>) {
+            lock(&self.0.state).pastes.pop_front();
+            let files: Vec<_> = files
+                .iter()
+                .map(|file| (remote_name(file), file.file_size.unwrap_or(0)))
+                .collect();
+            self.0.queue(move |connection| {
+                notify_files(
+                    connection,
+                    files.iter().map(|(name, size)| (name.as_str(), *size)),
+                );
+            });
+        }
+
+        fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+            let file = lock(&self.0.state)
+                .advertised
+                .get(request.index as usize)
+                .cloned();
+            let stream = request.stream_id;
+            if let Some(file) = file
+                .as_ref()
+                .filter(|_| request.flags == FileContentsFlags::SIZE)
+            {
+                self.0.send(Message::SendFileContentsResponse(
+                    FileContentsResponse::new_size_response(stream, file.size),
+                ));
+                return;
+            }
+            let input = self.0.input.clone();
+            self.0.queue(move |_| {
+                let data = file
+                    .and_then(|file| read_range(&file, request.position, request.requested_size));
+                let response = match data {
+                    Some(bytes) => FileContentsResponse::new_data_response(stream, bytes),
+                    None => FileContentsResponse::new_error(stream),
+                };
+                let _ = input.send_clipboard(Message::SendFileContentsResponse(response));
+            });
+        }
+
+        fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+            let stream = response.stream_id();
+            if lock(&self.0.state).requests.remove(&stream) {
+                let data = (!response.is_error()).then(|| response.data().to_vec());
+                self.0
+                    .queue(move |connection| notify_range(connection, stream, data.as_deref()));
+            }
+        }
+
+        fn on_lock(&mut self, _: LockDataId) {}
+        fn on_unlock(&mut self, _: LockDataId) {}
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ironrdp_cliprdr::pdu::ClipboardFormatName;
+
+        #[test]
+        fn clipboard_defers_offers_until_ready_and_gates_file_streaming() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (work, jobs) = mpsc::channel();
+            let (messages, receive) = mpsc::channel();
+            let mut channel = Channel::new(input, work);
+            channel.messages = Some(messages);
+            let mut backend = CndfCliprdrBackend(channel.clone());
+
+            assert_eq!(backend.client_capabilities().bits(), 0x2e);
+            assert_eq!(
+                channel.submit(ClipboardCommand::Range {
+                    stream_id: 1,
+                    list_index: 0,
+                    offset: 0,
+                    length: 1
+                }),
+                CNDF_IRON_NOT_CONNECTED
+            );
+            backend.on_request_format_list();
+            assert!(
+                matches!(receive.try_recv().unwrap(), Message::SendInitiateCopy(formats) if formats.is_empty())
+            );
+            channel.submit(ClipboardCommand::Text("한글".into()));
+            assert!(receive.try_recv().is_err());
+            backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+            backend.on_ready();
+            assert!(
+                matches!(receive.try_recv().unwrap(), Message::SendInitiateCopy(formats)
+                if formats.len() == 1 && formats[0].id == ClipboardFormatId::CF_UNICODETEXT)
+            );
+            assert!(matches!(
+                receive.try_recv().unwrap(),
+                Message::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+            ));
+            backend.on_format_data_request(FormatDataRequest {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+            });
+            assert!(
+                matches!(receive.try_recv().unwrap(), Message::SendFormatData(response)
+                if decode_text(response.data()).as_deref() == Some("한글"))
+            );
+
+            let file = LocalFile {
+                path: "/unused".into(),
+                name: "file.txt".into(),
+                size: 7,
+            };
+            channel.submit(ClipboardCommand::Files(vec![file.clone()]));
+            assert!(receive.try_recv().is_err());
+            assert!(jobs.try_recv().is_ok());
+            backend.on_process_negotiated_capabilities(Capabilities::STREAM_FILECLIP_ENABLED);
+            channel.submit(ClipboardCommand::Files(vec![file]));
+            assert!(
+                matches!(receive.try_recv().unwrap(), Message::SendInitiateFileCopy(files)
+                if files.len() == 1 && files[0].file_size == Some(7))
+            );
+        }
+
+        #[test]
+        fn selects_first_matching_format() {
+            let text = ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT);
+            let files = ClipboardFormat::new(ClipboardFormatId::new(0xc001))
+                .with_name(ClipboardFormatName::FILE_LIST);
+            assert_eq!(
+                choose_format(&[text.clone(), files.clone()]),
+                Some((text.id, false))
+            );
+            assert_eq!(
+                choose_format(&[files.clone(), text]),
+                Some((files.id, true))
+            );
+        }
+
+        #[test]
+        fn decodes_text_until_first_nul_and_rejects_invalid_utf16() {
+            assert_eq!(decode_text(&[65, 0, 0, 0, 0, 0xd8]).as_deref(), Some("A"));
+            assert_eq!(decode_text(&[0, 0xd8]), None);
+            assert_eq!(decode_text(&[65]), None);
+        }
+
+        #[test]
+        fn joins_normalized_remote_components() {
+            let file = FileDescriptor::new("문서.txt").with_relative_path(r"root\sub");
+            assert_eq!(remote_name(&file), r"root\sub\문서.txt");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn reads_sparse_range_above_four_gib_and_caps_allocations() {
+        let path = std::env::temp_dir().join(format!("cndf-iron-range-{}", std::process::id()));
+        let mut sparse = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let offset = 5_u64 << 30;
+        sparse.seek(SeekFrom::Start(offset)).unwrap();
+        sparse.write_all(b"CNDF").unwrap();
+        drop(sparse);
+        let file = LocalFile {
+            path: path.to_str().unwrap().to_owned(),
+            name: "test".into(),
+            size: offset + 4,
+        };
+        let range = read_range(&file, offset, 4);
+        let over_limit = read_range(&file, 0, 64 * 1024 * 1024 + 1);
+        let past_eof = read_range(&file, offset, 5);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(range.as_deref(), Some(&b"CNDF"[..]));
+        assert!(over_limit.is_none());
+        assert!(past_eof.is_none());
+    }
 }

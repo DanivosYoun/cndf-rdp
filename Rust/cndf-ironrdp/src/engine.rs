@@ -1,7 +1,7 @@
 use super::*;
 use crate::errors::{self, Failure};
 use crate::frame::Frame;
-use ironrdp_client::config::{Config, ConfigBuilder, Destination};
+use ironrdp_client::config::{ClipboardType, Config, ConfigBuilder, Destination};
 use ironrdp_client::output_channel::{output_channel, OutputEventReceiver};
 use ironrdp_client::rdp::{AutoReconnectDecision, RdpClient, RdpOutputEvent};
 use std::ffi::CString;
@@ -27,24 +27,37 @@ pub(super) fn start_workers(
     let deliver_thread = thread::Builder::new()
         .name(format!("cndf-iron-{}-deliver", connection.generation))
         .spawn(move || delivery.worker(|| deliver(&delivery, updates, minimum)))?;
+    let (clip_jobs, clip) = if options.channels.clipboard {
+        let (jobs, worker) = clipboard::ClipWork::spawn(Arc::clone(&connection))?;
+        (Some(jobs), Some(worker))
+    } else {
+        (None, None)
+    };
     let session_thread = thread::Builder::new()
         .name(format!("cndf-iron-{}-session", connection.generation))
         .spawn(move || {
             if catch_worker(|| {
                 if ready.recv().is_ok() {
-                    run(&connection, options, commands, &output);
+                    run(&connection, options, commands, &output, clip_jobs.as_ref());
                 }
             })
             .is_err()
             {
+                lock(&connection.clipboard).take();
                 connection.stop.store(true, Ordering::Release);
                 connection.connected.store(false, Ordering::Release);
                 let _ = output.blocking_send(Output::Failure(errors::PANIC));
             }
         });
     match session_thread {
-        Ok(session_thread) => Ok(vec![session_thread, deliver_thread]),
+        Ok(session_thread) => Ok([Some(session_thread), Some(deliver_thread), clip]
+            .into_iter()
+            .flatten()
+            .collect()),
         Err(error) => {
+            if let Some(clip) = clip {
+                let _ = clip.join();
+            }
             let _ = deliver_thread.join();
             Err(error)
         }
@@ -97,6 +110,12 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
     }
 }
 
+impl Connection {
+    pub(super) fn clip_log(&self, level: CNDFIronLogLevel, message: &str) {
+        log(self, self.log_level, level, message);
+    }
+}
+
 fn log(connection: &Connection, minimum: CNDFIronLogLevel, level: CNDFIronLogLevel, message: &str) {
     if (level as u32) < (minimum as u32) {
         return;
@@ -119,6 +138,7 @@ fn run(
     options: Options,
     commands: Receiver<Command>,
     output: &async_channel::Sender<Output>,
+    clip_jobs: Option<&mpsc::Sender<clipboard::Job>>,
 ) {
     let rejected = Arc::new(AtomicBool::new(false));
     let trust_outcome = Arc::clone(&rejected);
@@ -163,7 +183,20 @@ fn run(
         .with_client_build(420)
         .with_client_dir("")
         .with_platform(ironrdp_pdu::rdp::capability_sets::MajorPlatformType::OSX)
-        .with_client_name("CNDF Terminal")
+        .with_client_name(channels::client_name())
+        .with_rdpdr(channels::rdpdr_enabled(
+            options.channels.drive.is_some(),
+            options.channels.audio,
+        ))
+        .with_printers(false)
+        .with_ports(false)
+        .with_audio_mode(channels::audio_mode(options.channels.audio))
+        .with_audio_capture(false)
+        .with_clipboard(if options.channels.clipboard {
+            ClipboardType::Enable
+        } else {
+            ClipboardType::Disable
+        })
         .with_username(options.username)
         .with_password(options.password.as_str())
         .with_desktop_width(options.width as u16)
@@ -240,6 +273,8 @@ fn run(
                 minimum,
                 retry_config,
                 false,
+                clip_jobs,
+                options.channels.drive.as_ref(),
             )
             .await;
             #[cfg(feature = "legacy-tls")]
@@ -251,7 +286,16 @@ fn run(
                 // run_attempt has dropped the original client and its transport.
                 // The next client checks the same generation's stop flag before polling.
                 run_attempt(
-                    connection, config, &commands, output, &rejected, minimum, None, true,
+                    connection,
+                    config,
+                    &commands,
+                    output,
+                    &rejected,
+                    minimum,
+                    None,
+                    true,
+                    clip_jobs,
+                    options.channels.drive.as_ref(),
                 )
                 .await;
             }
@@ -275,12 +319,26 @@ async fn run_attempt(
     minimum: CNDFIronLogLevel,
     retry_config: Option<Config>,
     legacy: bool,
+    clip_jobs: Option<&mpsc::Sender<clipboard::Job>>,
+    drive: Option<&(String, String)>,
 ) -> Option<Config> {
     let (sender, receiver) = output_channel(128);
-    let client = RdpClient::new(config, sender)
+    let mut client = RdpClient::new(config, sender)
         .with_desktop_updates()
         .with_display_resize_fallback_reconnect(false);
+    if let Some((path, name)) = drive {
+        client = client.with_rdpdr_backend_factory(Box::new(channels::DriveFactory::new(
+            path.clone(),
+            name.clone(),
+            Arc::clone(&connection.statistics),
+        )));
+    }
     let input = client.input_sender();
+    if let Some(jobs) = clip_jobs {
+        let channel = clipboard::Channel::new(input.clone(), jobs.clone());
+        client = client.with_cliprdr_backend_factory(Box::new(channel.clone()));
+        *lock(&connection.clipboard) = Some(channel);
+    }
     *lock(&connection.input) = Some(input.clone());
     if connection.stop.load(Ordering::Acquire) {
         input.request_close();
@@ -305,6 +363,7 @@ async fn run_attempt(
             retry = &mut bridge => retry,
         }
     };
+    *lock(&connection.clipboard) = None;
     *lock(&connection.input) = None;
     retry
 }
@@ -602,6 +661,8 @@ mod tests {
             connected: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             input: Mutex::default(),
+            clipboard: Mutex::default(),
+            log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
             callbacks: Arc::new(Callbacks {
                 table,
                 gate: Mutex::default(),
