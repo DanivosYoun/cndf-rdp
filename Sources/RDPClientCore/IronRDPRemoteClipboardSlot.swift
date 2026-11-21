@@ -26,6 +26,27 @@ final class IronRDPRemoteClipboardSlot<Value> {
     }
 }
 
+/// Freshness of server clipboard callbacks across the whole session: each accepted callback
+/// takes the next value, and a pasteboard write or materialization start goes ahead only while
+/// its value is still the newest. Never reset, so values stay ordered across reconnects.
+final class IronRDPRemoteClipboardFreshness {
+    private let lock = NSLock()
+    private var newest: UInt64 = 0
+
+    func advance() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        newest += 1
+        return newest
+    }
+
+    func isNewest(_ value: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value == newest
+    }
+}
+
 /// Runs at most one remote file list materialization at a time and keeps only the newest
 /// list that arrives while one runs.
 final class IronRDPRemoteFileMaterializationQueue<Job> {

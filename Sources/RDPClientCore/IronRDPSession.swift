@@ -163,10 +163,13 @@ public final class IronRDPSession: RDPEngineSession {
             guard let context else { return }
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
             guard let clipboard = session.clipboardContext(for: generation) else { return }
+            let freshness = session.remoteClipboardFreshness.advance()
             let text = utf8String(bytes, length)
             session.deliverNewestRemoteClipboard(generation, connection: clipboard.connection) { session in
                 session.updateStatistics { $0.remoteClipboardTextsReceived += 1 }
-                session.clipboardCoordinator?.receiveRemoteText(text)
+                if session.remoteClipboardFreshness.isNewest(freshness) {
+                    session.clipboardCoordinator?.receiveRemoteText(text)
+                }
                 session.delegate?.rdpSession(session, didReceiveRemoteText: text)
             }
         }
@@ -174,6 +177,7 @@ public final class IronRDPSession: RDPEngineSession {
             guard let context, let files else { return }
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
             guard let clipboard = session.clipboardContext(for: generation) else { return }
+            let freshness = session.remoteClipboardFreshness.advance()
             let descriptors = UnsafeBufferPointer(start: files, count: count).map { file in
                 (name: utf8String(file.name_utf8, file.name_length), size: file.size)
             }
@@ -191,7 +195,13 @@ public final class IronRDPSession: RDPEngineSession {
                 }
                 session.delegate?.rdpSession(session, didReceiveRemoteFiles: entries.map(RDPRemoteFile.init(entry:)))
                 guard !entries.isEmpty, session.clipboardIsCurrent(generation, connection: clipboard.connection) else { return }
-                session.materializeRemoteFiles(entries, with: clipboard.manager, generation: generation, connection: clipboard.connection)
+                session.materializeRemoteFiles(
+                    entries,
+                    with: clipboard.manager,
+                    generation: generation,
+                    connection: clipboard.connection,
+                    freshness: freshness
+                )
             }
         }
         callbacks.remote_file_contents = { generation, stream, ok, bytes, length, context in
@@ -471,12 +481,20 @@ public final class IronRDPSession: RDPEngineSession {
         let manager: RDPRemoteFileDownloadManager
         let generation: UInt64
         let connection: UInt64
+        let freshness: UInt64
     }
 
     // Server clipboard callbacks keep only the newest text or file list for main, and file
     // lists materialize one at a time behind the newest waiting list.
     private let remoteClipboardSlot = IronRDPRemoteClipboardSlot<RemoteClipboardDelivery>()
     private let remoteFileMaterializations = IronRDPRemoteFileMaterializationQueue<RemoteFileMaterialization>()
+    // Orders server clipboard callbacks so an older materialization never overwrites a newer
+    // value on the pasteboard. Internal so tests can read it.
+    let remoteClipboardFreshness = IronRDPRemoteClipboardFreshness()
+    // Internal so tests can hold a materialization.
+    var materializeRemoteFileList: (RDPRemoteFileDownloadManager, [RDPFileListEntry]) throws -> [URL] = {
+        try $0.materialize($1)
+    }
 
     /// Server text and file lists. A newer one replaces a delivery still waiting for main.
     private func deliverNewestRemoteClipboard(
@@ -518,18 +536,31 @@ public final class IronRDPSession: RDPEngineSession {
         _ entries: [RDPFileListEntry],
         with manager: RDPRemoteFileDownloadManager,
         generation: UInt64,
-        connection: UInt64
+        connection: UInt64,
+        freshness: UInt64
     ) {
-        let job = RemoteFileMaterialization(entries: entries, manager: manager, generation: generation, connection: connection)
+        let job = RemoteFileMaterialization(
+            entries: entries,
+            manager: manager,
+            generation: generation,
+            connection: connection,
+            freshness: freshness
+        )
         guard remoteFileMaterializations.submit(job) else { return }
         // The session stays weak while a materialization waits on range replies.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             while let job = self?.remoteFileMaterializations.next() {
-                let (generation, connection) = (job.generation, job.connection)
-                guard self?.clipboardIsCurrent(generation, connection: connection) == true else { continue }
+                let (generation, connection, freshness) = (job.generation, job.connection, job.freshness)
+                guard self?.clipboardIsCurrent(generation, connection: connection) == true,
+                      self?.remoteClipboardFreshness.isNewest(freshness) == true,
+                      let materialize = self?.materializeRemoteFileList else { continue }
                 do {
-                    let urls = try job.manager.materialize(job.entries)
+                    let urls = try materialize(job.manager, job.entries)
                     self?.deliverClipboard(generation, connection: connection) { session in
+                        guard session.remoteClipboardFreshness.isNewest(freshness) else {
+                            session.emitLog("Remote file materialization superseded by a newer server clipboard.")
+                            return
+                        }
                         session.clipboardCoordinator?.receiveRemoteFiles(urls)
                         let fileNames = urls.map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
                             .joined(separator: ", ")
