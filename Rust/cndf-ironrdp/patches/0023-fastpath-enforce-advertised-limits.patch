@@ -1,0 +1,896 @@
+diff --git a/crates/ironrdp-session/src/fast_path.rs b/crates/ironrdp-session/src/fast_path.rs
+index b55bd8e..aab53ed 100644
+--- a/crates/ironrdp-session/src/fast_path.rs
++++ b/crates/ironrdp-session/src/fast_path.rs
+@@ -23,6 +23,21 @@ use crate::pointer::PointerCache;
+ use crate::qoiz;
+ use crate::{SessionError, SessionErrorExt as _, SessionErrorKind, SessionResult, reason_err, rfx};
+ 
++/// Largest reassembled Fast-Path update accepted, counted in decompressed bytes.
++///
++/// Equal to the Multifragment Update `MaxRequestSize` that `ironrdp-connector` advertises when the
++/// server does not send its own capability set ([MS-RDPBCGR] 2.2.7.2.6).
++pub const MAX_FRAGMENTED_UPDATE_SIZE: usize = 8 * 1024 * 1024;
++
++/// Pointer cache size advertised by `ironrdp-connector` in its Pointer capability set.
++pub const POINTER_CACHE_SIZE: u16 = 32;
++
++/// Largest Color and New pointer edge, as advertised by `LargePointerSupportFlags::UP_TO_96X96_PIXELS`.
++pub const MAX_COLOR_POINTER_EDGE: u16 = 96;
++
++/// Largest Large pointer edge, as advertised by `LargePointerSupportFlags::UP_TO_384X384_PIXELS`.
++pub const MAX_LARGE_POINTER_EDGE: u16 = 384;
++
+ /// A bounded category for a failed Fast-Path bulk decompression operation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum BulkDecompressionErrorKind {
+@@ -240,10 +255,16 @@ impl Processor {
+             update_pdu.data
+         };
+ 
+-        let Some(data) = self
++        let data = self
+             .complete_data
+-            .process_data(update_data, update_pdu.fragmentation, attributes)?
+-        else {
++            .process_data(update_data, update_pdu.fragmentation, attributes)?;
++        if let Some(update_code) = self.complete_data.take_oversized() {
++            if update_code == UpdateCode::Bitmap {
++                self.request_bitmap_recovery();
++            }
++            processor_updates.push(UpdateKind::None);
++        }
++        let Some(data) = data else {
+             return Ok(processor_updates);
+         };
+         let FragmentedUpdate { data, attributes } = data;
+@@ -586,10 +607,22 @@ impl Processor {
+             PointerUpdateData::Color(pointer) => {
+                 let cache_index = pointer.cache_index;
+ 
++                if let Some(rejection) =
++                    pointer_limit_violation(cache_index, pointer.width, pointer.height, MAX_COLOR_POINTER_EDGE)
++                {
++                    self.fallback_after_pointer_decode_failure(image, &mut processor_updates, cache_index, rejection)?;
++                    return Ok(processor_updates);
++                }
++
+                 let decoded_pointer = match DecodedPointer::decode_color_pointer_attribute(&pointer, bitmap_target) {
+                     Ok(pointer) => Arc::new(pointer),
+                     Err(error) => {
+-                        self.fallback_after_pointer_decode_failure(image, &mut processor_updates, cache_index, error)?;
++                        self.fallback_after_pointer_decode_failure(
++                            image,
++                            &mut processor_updates,
++                            cache_index,
++                            pointer_error_kind(&error),
++                        )?;
+                         return Ok(processor_updates);
+                     }
+                 };
+@@ -629,6 +662,16 @@ impl Processor {
+             PointerUpdateData::New(pointer) => {
+                 let cache_index = pointer.color_pointer.cache_index;
+ 
++                if let Some(rejection) = pointer_limit_violation(
++                    cache_index,
++                    pointer.color_pointer.width,
++                    pointer.color_pointer.height,
++                    MAX_COLOR_POINTER_EDGE,
++                ) {
++                    self.fallback_after_pointer_decode_failure(image, &mut processor_updates, cache_index, rejection)?;
++                    return Ok(processor_updates);
++                }
++
+                 let decoded_pointer = match DecodedPointer::decode_pointer_attribute_with_palette(
+                     &pointer,
+                     bitmap_target,
+@@ -636,7 +679,12 @@ impl Processor {
+                 ) {
+                     Ok(pointer) => Arc::new(pointer),
+                     Err(error) => {
+-                        self.fallback_after_pointer_decode_failure(image, &mut processor_updates, cache_index, error)?;
++                        self.fallback_after_pointer_decode_failure(
++                            image,
++                            &mut processor_updates,
++                            cache_index,
++                            pointer_error_kind(&error),
++                        )?;
+                         return Ok(processor_updates);
+                     }
+                 };
+@@ -654,6 +702,13 @@ impl Processor {
+             PointerUpdateData::Large(pointer) => {
+                 let cache_index = pointer.cache_index;
+ 
++                if let Some(rejection) =
++                    pointer_limit_violation(cache_index, pointer.width, pointer.height, MAX_LARGE_POINTER_EDGE)
++                {
++                    self.fallback_after_pointer_decode_failure(image, &mut processor_updates, cache_index, rejection)?;
++                    return Ok(processor_updates);
++                }
++
+                 let decoded_pointer = match DecodedPointer::decode_large_pointer_attribute_with_palette(
+                     &pointer,
+                     bitmap_target,
+@@ -661,7 +716,12 @@ impl Processor {
+                 ) {
+                     Ok(pointer) => Arc::new(pointer),
+                     Err(error) => {
+-                        self.fallback_after_pointer_decode_failure(image, &mut processor_updates, cache_index, error)?;
++                        self.fallback_after_pointer_decode_failure(
++                            image,
++                            &mut processor_updates,
++                            cache_index,
++                            pointer_error_kind(&error),
++                        )?;
+                         return Ok(processor_updates);
+                     }
+                 };
+@@ -698,14 +758,8 @@ impl Processor {
+         image: &mut DecodedImage,
+         processor_updates: &mut Vec<UpdateKind>,
+         cache_index: u16,
+-        error: PointerError,
++        error_kind: &'static str,
+     ) -> SessionResult<()> {
+-        let error_kind = match error {
+-            PointerError::InvalidXorMaskSize { .. } => "InvalidXorMaskSize",
+-            PointerError::InvalidAndMaskSize { .. } => "InvalidAndMaskSize",
+-            PointerError::NotSupportedBpp { .. } => "NotSupportedBpp",
+-            PointerError::Pdu(_) => "Pdu",
+-        };
+         warn!(pointer_error = error_kind, "Ignoring unsupported pointer update");
+         let _ = self.pointer_cache.remove(usize::from(cache_index));
+ 
+@@ -939,11 +993,42 @@ struct FragmentedUpdate {
+ #[derive(Debug, PartialEq)]
+ struct CompleteData {
+     fragmented_data: Option<FragmentedUpdate>,
++    max_size: usize,
++    /// Update code of a fragment sequence that exceeded `max_size`; its remaining fragments are dropped.
++    discarding: Option<UpdateCode>,
++    /// Update code of the sequence most recently discarded for its size, reported once to the processor.
++    oversized: Option<UpdateCode>,
+ }
+ 
+ impl CompleteData {
+     fn new() -> Self {
+-        Self { fragmented_data: None }
++        Self::with_max_size(MAX_FRAGMENTED_UPDATE_SIZE)
++    }
++
++    fn with_max_size(max_size: usize) -> Self {
++        Self {
++            fragmented_data: None,
++            max_size,
++            discarding: None,
++            oversized: None,
++        }
++    }
++
++    /// Returns the update code of a fragment sequence that was just discarded for exceeding the size limit.
++    fn take_oversized(&mut self) -> Option<UpdateCode> {
++        self.oversized.take()
++    }
++
++    fn start_discarding(&mut self, update_code: UpdateCode, received: usize) {
++        self.fragmented_data = None;
++        self.discarding = Some(update_code);
++        self.oversized = Some(update_code);
++        warn!(
++            update_code = update_code.as_u8(),
++            received,
++            limit = self.max_size,
++            "Discarding Fast-Path fragmented update larger than the advertised request size"
++        );
+     }
+ 
+     fn process_data(
+@@ -955,6 +1040,7 @@ impl CompleteData {
+         match fragmentation {
+             Fragmentation::Single => {
+                 self.check_data_is_empty();
++                self.discarding = None;
+ 
+                 Ok(Some(FragmentedUpdate {
+                     data: data.to_vec(),
+@@ -963,6 +1049,12 @@ impl CompleteData {
+             }
+             Fragmentation::First => {
+                 self.check_data_is_empty();
++                self.discarding = None;
++
++                if data.len() > self.max_size {
++                    self.start_discarding(attributes.update_code, data.len());
++                    return Ok(None);
++                }
+ 
+                 self.fragmented_data = Some(FragmentedUpdate {
+                     data: data.to_vec(),
+@@ -971,6 +1063,11 @@ impl CompleteData {
+ 
+                 Ok(None)
+             }
++            Fragmentation::Next if self.discarding.is_some() => Ok(None),
++            Fragmentation::Last if self.discarding.is_some() => {
++                self.discarding = None;
++                Ok(None)
++            }
+             Fragmentation::Next => {
+                 self.append_data(data, attributes)?;
+ 
+@@ -978,6 +1075,7 @@ impl CompleteData {
+             }
+             Fragmentation::Last => {
+                 self.append_data(data, attributes)?;
++                self.discarding = None;
+ 
+                 Ok(self.fragmented_data.take())
+             }
+@@ -1008,6 +1106,12 @@ impl CompleteData {
+             // MS-RDPBCGR 3.2.5.9.3.1 requires equal updateCode and header compression
+             // subfield values, but does not require equal compressionFlags. Each fragment
+             // has already applied its own compression flags before reassembly.
++            let received = fragmented_update.data.len().saturating_add(data.len());
++            if received > self.max_size {
++                let update_code = fragmented_update.attributes.update_code;
++                self.start_discarding(update_code, received);
++                return Ok(());
++            }
+             fragmented_update.data.extend_from_slice(data);
+             Ok(())
+         } else {
+@@ -1019,6 +1123,26 @@ impl CompleteData {
+     }
+ }
+ 
++fn pointer_error_kind(error: &PointerError) -> &'static str {
++    match error {
++        PointerError::InvalidXorMaskSize { .. } => "InvalidXorMaskSize",
++        PointerError::InvalidAndMaskSize { .. } => "InvalidAndMaskSize",
++        PointerError::NotSupportedBpp { .. } => "NotSupportedBpp",
++        PointerError::Pdu(_) => "Pdu",
++    }
++}
++
++/// Rejects pointer shapes outside the advertised cache size and pointer dimensions before decoding them.
++fn pointer_limit_violation(cache_index: u16, width: u16, height: u16, max_edge: u16) -> Option<&'static str> {
++    if cache_index >= POINTER_CACHE_SIZE {
++        Some("CacheIndexOutOfRange")
++    } else if width > max_edge || height > max_edge {
++        Some("DimensionsOutOfRange")
++    } else {
++        None
++    }
++}
++
+ fn is_visual_update_code(update_code: u8) -> bool {
+     update_code == UpdateCode::Bitmap.as_u8()
+         || matches!(
+@@ -1073,7 +1197,7 @@ impl FrameMarkerProcessor {
+ mod tests {
+     use ironrdp_pdu::bitmap::{BitmapData, Compression};
+     use ironrdp_pdu::geometry::ExclusiveRectangle;
+-    use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute};
++    use ironrdp_pdu::pointer::{ColorPointerAttribute, LargePointerAttribute, Point16, PointerAttribute};
+     use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu};
+ 
+     use ironrdp_graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
+@@ -1412,6 +1536,192 @@ mod tests {
+         assert!(matches!(updates.as_slice(), [UpdateKind::PointerDefault]));
+         assert!(!processor.pointer_cache.is_cached(0));
+     }
++
++    fn pointer_processor() -> Processor {
++        ProcessorBuilder {
++            io_channel_id: 0,
++            user_channel_id: 0,
++            share_id: 0,
++            enable_server_pointer: true,
++            pointer_software_rendering: false,
++        }
++        .build()
++    }
++
++    /// A 1 bpp mask with scanlines padded to 16 bits.
++    fn mono_mask(edge: u16) -> Vec<u8> {
++        vec![0; usize::from(edge).div_ceil(16) * 2 * usize::from(edge)]
++    }
++
++    fn large_pointer(processor: &mut Processor, cache_index: u16, edge: u16) -> Vec<UpdateKind> {
++        let mask = mono_mask(edge);
++        let pointer = LargePointerAttribute {
++            xor_bpp: 1,
++            cache_index,
++            hot_spot: Point16 { x: 0, y: 0 },
++            width: edge,
++            height: edge,
++            xor_mask: &mask,
++            and_mask: &mask,
++        };
++        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
++        processor
++            .process_pointer_update(&mut image, PointerUpdateData::Large(pointer))
++            .expect("pointer updates must not fail the session")
++    }
++
++    #[test]
++    fn pointer_cache_index_beyond_the_advertised_cache_is_not_stored() {
++        let mut processor = pointer_processor();
++
++        let updates = large_pointer(&mut processor, POINTER_CACHE_SIZE - 1, 32);
++        assert!(matches!(updates.as_slice(), [UpdateKind::PointerBitmap(_)]));
++        assert!(processor.pointer_cache.is_cached(usize::from(POINTER_CACHE_SIZE - 1)));
++
++        let updates = large_pointer(&mut processor, POINTER_CACHE_SIZE, 32);
++        assert!(matches!(updates.as_slice(), [UpdateKind::PointerDefault]));
++        assert!(!processor.pointer_cache.is_cached(usize::from(POINTER_CACHE_SIZE)));
++    }
++
++    #[test]
++    fn large_pointer_beyond_384_pixels_is_not_decoded() {
++        let mut processor = pointer_processor();
++
++        let updates = large_pointer(&mut processor, 0, MAX_LARGE_POINTER_EDGE);
++        assert!(matches!(updates.as_slice(), [UpdateKind::PointerBitmap(_)]));
++
++        let updates = large_pointer(&mut processor, 0, MAX_LARGE_POINTER_EDGE + 1);
++        assert!(matches!(updates.as_slice(), [UpdateKind::PointerDefault]));
++        assert!(!processor.pointer_cache.is_cached(0));
++    }
++
++    #[test]
++    fn color_and_new_pointers_beyond_96_pixels_are_not_decoded() {
++        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
++        for edge in [MAX_COLOR_POINTER_EDGE, MAX_COLOR_POINTER_EDGE + 1] {
++            let accepted = edge <= MAX_COLOR_POINTER_EDGE;
++            // 24 bpp XOR scanlines padded to 16 bits.
++            let xor_mask = vec![0; (usize::from(edge) * 3).next_multiple_of(2) * usize::from(edge)];
++            let and_mask = mono_mask(edge);
++            let color = ColorPointerAttribute {
++                cache_index: 1,
++                hot_spot: Point16 { x: 0, y: 0 },
++                width: edge,
++                height: edge,
++                xor_mask: &xor_mask,
++                and_mask: &and_mask,
++            };
++            let mut processor = pointer_processor();
++            let updates = processor
++                .process_pointer_update(&mut image, PointerUpdateData::Color(color.clone()))
++                .expect("pointer updates must not fail the session");
++            assert_eq!(matches!(updates.as_slice(), [UpdateKind::PointerBitmap(_)]), accepted, "{edge}");
++            assert_eq!(processor.pointer_cache.is_cached(1), accepted, "{edge}");
++
++            let mono = mono_mask(edge);
++            let new = PointerAttribute {
++                xor_bpp: 1,
++                color_pointer: ColorPointerAttribute {
++                    xor_mask: &mono,
++                    and_mask: &mono,
++                    ..color
++                },
++            };
++            let mut processor = pointer_processor();
++            let updates = processor
++                .process_pointer_update(&mut image, PointerUpdateData::New(new))
++                .expect("pointer updates must not fail the session");
++            assert_eq!(matches!(updates.as_slice(), [UpdateKind::PointerBitmap(_)]), accepted, "{edge}");
++            assert_eq!(processor.pointer_cache.is_cached(1), accepted, "{edge}");
++        }
++    }
++
++    fn fast_path_frame(updates: &[FastPathUpdatePdu<'_>]) -> Vec<u8> {
++        let mut body = Vec::new();
++        for update in updates {
++            body.extend_from_slice(&ironrdp_core::encode_vec(update).unwrap());
++        }
++        let mut frame = ironrdp_core::encode_vec(&FastPathHeader::new(
++            ironrdp_pdu::fast_path::EncryptionFlags::empty(),
++            body.len(),
++        ))
++        .unwrap();
++        frame.extend_from_slice(&body);
++        frame
++    }
++
++    #[test]
++    fn oversized_fragmented_bitmap_is_discarded_and_the_next_bitmap_decodes() {
++        let mut processor = ProcessorBuilder {
++            io_channel_id: 1003,
++            user_channel_id: 1001,
++            share_id: 1,
++            enable_server_pointer: false,
++            pointer_software_rendering: false,
++        }
++        .build();
++        let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
++        let mut output = WriteBuf::new();
++        let mut bulk_decompressor = None;
++        let chunk = vec![0u8; 16_000];
++        let fragment = |fragmentation| FastPathUpdatePdu {
++            fragmentation,
++            update_code: UpdateCode::Bitmap,
++            compression_flags: None,
++            compression_type: None,
++            data: &chunk,
++        };
++
++        let frame = fast_path_frame(&[fragment(Fragmentation::First)]);
++        processor
++            .process(&mut image, &frame, &mut output, &mut bulk_decompressor)
++            .expect("first fragment");
++        let next = fast_path_frame(&[fragment(Fragmentation::Next)]);
++        let mut discarded = 0;
++        for _ in 0..(MAX_FRAGMENTED_UPDATE_SIZE / chunk.len() + 8) {
++            let updates = processor
++                .process(&mut image, &next, &mut output, &mut bulk_decompressor)
++                .expect("oversized fragment sequences must not fail the session");
++            discarded += updates.iter().filter(|update| matches!(update, UpdateKind::None)).count();
++        }
++        assert_eq!(discarded, 1, "one discarded sequence reports once");
++        assert!(processor.complete_data.fragmented_data.is_none());
++        assert!(processor.take_bitmap_recovery_request());
++        let last = fast_path_frame(&[fragment(Fragmentation::Last)]);
++        let updates = processor
++            .process(&mut image, &last, &mut output, &mut bulk_decompressor)
++            .expect("the swallowed sequence ends without an error");
++        assert!(updates.is_empty());
++
++        // Two bottom-up BGR rows of two pixels each, with two pad bytes per row.
++        let bitmap_data = [3, 2, 1, 6, 5, 4, 0, 0, 9, 8, 7, 12, 11, 10, 0, 0];
++        let bitmap = ironrdp_core::encode_vec(&BitmapUpdateData {
++            rectangles: vec![BitmapData {
++                rectangle: InclusiveRectangle {
++                    left: 0,
++                    top: 0,
++                    right: 1,
++                    bottom: 1,
++                },
++                width: 2,
++                height: 2,
++                bits_per_pixel: 24,
++                compression_flags: Compression::empty(),
++                compressed_data_header: None,
++                bitmap_data: &bitmap_data,
++            }],
++        })
++        .unwrap();
++        let single = fast_path_frame(&[FastPathUpdatePdu {
++            data: &bitmap,
++            ..fragment(Fragmentation::Single)
++        }]);
++        let updates = processor
++            .process(&mut image, &single, &mut output, &mut bulk_decompressor)
++            .expect("a normal bitmap after the discarded sequence");
++        assert!(matches!(updates.as_slice(), [UpdateKind::Region(_)]), "{updates:?}");
++        assert_eq!(image.data()[..4], [7, 8, 9, 255]);
++    }
+ }
+ #[cfg(test)]
+ mod compression_tests {
+@@ -1477,6 +1787,89 @@ mod compression_tests {
+         );
+     }
+ 
++    fn bitmap_fragment(fragmentation: Fragmentation) -> FragmentAttributes {
++        FragmentAttributes {
++            fragmentation,
++            update_code: UpdateCode::Bitmap,
++            compression_flags: None,
++            compression_type: None,
++        }
++    }
++
++    fn reassemble(complete_data: &mut CompleteData, fragments: &[(Fragmentation, usize)]) -> Option<usize> {
++        let mut result = None;
++        for &(fragmentation, length) in fragments {
++            result = complete_data
++                .process_data(&vec![0; length], fragmentation, bitmap_fragment(fragmentation))
++                .expect("fragments within or beyond the limit never fail the session")
++                .map(|update| update.data.len());
++        }
++        result
++    }
++
++    #[test]
++    fn fragmented_update_of_exactly_the_advertised_size_is_reassembled() {
++        let half = MAX_FRAGMENTED_UPDATE_SIZE / 2;
++        let mut complete_data = CompleteData::new();
++        assert_eq!(
++            reassemble(&mut complete_data, &[(Fragmentation::First, half), (Fragmentation::Last, half)]),
++            Some(MAX_FRAGMENTED_UPDATE_SIZE)
++        );
++        assert_eq!(complete_data.take_oversized(), None);
++    }
++
++    #[test]
++    fn fragmented_update_one_byte_beyond_the_advertised_size_is_discarded() {
++        let half = MAX_FRAGMENTED_UPDATE_SIZE / 2;
++        let mut complete_data = CompleteData::new();
++        assert_eq!(
++            reassemble(
++                &mut complete_data,
++                &[(Fragmentation::First, half), (Fragmentation::Last, half + 1)]
++            ),
++            None
++        );
++        assert_eq!(complete_data.take_oversized(), Some(UpdateCode::Bitmap));
++        assert_eq!(complete_data.take_oversized(), None);
++        assert_eq!(complete_data.discarding, None, "Last ends the discarded sequence");
++
++        let mut complete_data = CompleteData::new();
++        assert_eq!(
++            reassemble(&mut complete_data, &[(Fragmentation::First, MAX_FRAGMENTED_UPDATE_SIZE + 1)]),
++            None
++        );
++        assert_eq!(complete_data.take_oversized(), Some(UpdateCode::Bitmap));
++        assert!(complete_data.fragmented_data.is_none());
++    }
++
++    #[test]
++    fn discarded_sequence_swallows_its_fragments_until_a_new_update_starts() {
++        let mut complete_data = CompleteData::with_max_size(10);
++        assert_eq!(
++            reassemble(
++                &mut complete_data,
++                &[(Fragmentation::First, 6), (Fragmentation::Next, 6), (Fragmentation::Next, 6)]
++            ),
++            None
++        );
++        assert_eq!(complete_data.take_oversized(), Some(UpdateCode::Bitmap));
++        assert!(complete_data.fragmented_data.is_none());
++        assert_eq!(reassemble(&mut complete_data, &[(Fragmentation::Last, 6)]), None);
++        assert_eq!(complete_data.take_oversized(), None, "one report per sequence");
++
++        // A Single or First after the discarded sequence is processed normally.
++        assert_eq!(reassemble(&mut complete_data, &[(Fragmentation::Single, 3)]), Some(3));
++        assert_eq!(
++            reassemble(
++                &mut complete_data,
++                &[(Fragmentation::First, 6), (Fragmentation::Next, 6), (Fragmentation::First, 4)]
++            ),
++            None
++        );
++        assert_eq!(complete_data.take_oversized(), Some(UpdateCode::Bitmap));
++        assert_eq!(reassemble(&mut complete_data, &[(Fragmentation::Last, 6)]), Some(10));
++    }
++
+     #[test]
+     fn bulk_decompression_failure_retains_only_bounded_metadata() {
+         let attributes = FragmentAttributes {
+diff --git a/crates/ironrdp-session/tests/fast_path_memory.rs b/crates/ironrdp-session/tests/fast_path_memory.rs
+new file mode 100644
+index 0000000..629e455
+--- /dev/null
++++ b/crates/ironrdp-session/tests/fast_path_memory.rs
+@@ -0,0 +1,257 @@
++//! Bytes the Fast-Path processor keeps after hostile server input.
++//!
++//! The global allocator counts bytes per thread, so each test measures only its own allocations
++//! even when the test harness runs tests in parallel.
++
++#![allow(unused_crate_dependencies)]
++#![allow(clippy::unwrap_used)]
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::cell::Cell;
++
++use ironrdp_bulk::{BulkCompressor, CompressionType as BulkType, flags};
++use ironrdp_core::{WriteBuf, encode_vec};
++use ironrdp_graphics::image_processing::PixelFormat;
++use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
++use ironrdp_pdu::fast_path::{EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
++use ironrdp_pdu::geometry::InclusiveRectangle;
++use ironrdp_pdu::pointer::{LargePointerAttribute, Point16};
++use ironrdp_pdu::rdp::client_info::CompressionType;
++use ironrdp_pdu::rdp::headers::CompressionFlags;
++use ironrdp_session::fast_path::{MAX_FRAGMENTED_UPDATE_SIZE, Processor, ProcessorBuilder, UpdateKind};
++use ironrdp_session::image::DecodedImage;
++
++const MIB: usize = 1024 * 1024;
++
++thread_local! {
++    static HELD: Cell<isize> = const { Cell::new(0) };
++}
++
++fn track(delta: isize) {
++    let _ = HELD.try_with(|held| held.set(held.get() + delta));
++}
++
++fn held() -> isize {
++    HELD.with(Cell::get)
++}
++
++struct ThreadCountingAllocator;
++
++#[global_allocator]
++static ALLOCATOR: ThreadCountingAllocator = ThreadCountingAllocator;
++
++fn signed(size: usize) -> isize {
++    isize::try_from(size).unwrap_or(isize::MAX)
++}
++
++// SAFETY: every method forwards to `System` with the caller's arguments and only adds bookkeeping.
++unsafe impl GlobalAlloc for ThreadCountingAllocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: forwarded with the caller's layout.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            track(signed(layout.size()));
++        }
++        ptr
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: forwarded with the caller's layout.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            track(signed(layout.size()));
++        }
++        ptr
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: forwarded with the caller's pointer and layout.
++        unsafe { System.dealloc(ptr, layout) };
++        track(-signed(layout.size()));
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: forwarded with the caller's pointer, layout and size.
++        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new_ptr.is_null() {
++            track(signed(new_size) - signed(layout.size()));
++        }
++        new_ptr
++    }
++}
++
++fn processor(enable_server_pointer: bool) -> Processor {
++    ProcessorBuilder {
++        io_channel_id: 1003,
++        user_channel_id: 1002,
++        share_id: 0x10000,
++        enable_server_pointer,
++        pointer_software_rendering: false,
++    }
++    .build()
++}
++
++fn update(fragmentation: Fragmentation, update_code: UpdateCode, data: &[u8], bulk_flags: Option<u32>) -> Vec<u8> {
++    let (compression_flags, compression_type) = match bulk_flags {
++        Some(bulk_flags) if bulk_flags & flags::PACKET_COMPRESSED != 0 => (
++            Some(CompressionFlags::from_bits_retain(
++                u8::try_from(bulk_flags & 0xE0).unwrap(),
++            )),
++            Some(CompressionType::K64),
++        ),
++        _ => (None, None),
++    };
++    encode_vec(&FastPathUpdatePdu {
++        fragmentation,
++        update_code,
++        compression_flags,
++        compression_type,
++        data,
++    })
++    .unwrap()
++}
++
++/// Packs updates into Fast-Path PDUs no longer than 0x7FFF bytes.
++fn pack(updates: &[Vec<u8>]) -> Vec<Vec<u8>> {
++    let mut pdus = Vec::new();
++    let mut body = Vec::new();
++    let flush = |body: &mut Vec<u8>, pdus: &mut Vec<Vec<u8>>| {
++        if !body.is_empty() {
++            let mut pdu = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), body.len())).unwrap();
++            pdu.append(body);
++            assert!(pdu.len() <= 0x7FFF);
++            pdus.push(pdu);
++        }
++    };
++    for update in updates {
++        if body.len() + update.len() + 3 > 0x7FFF {
++            flush(&mut body, &mut pdus);
++        }
++        body.extend_from_slice(update);
++    }
++    flush(&mut body, &mut pdus);
++    pdus
++}
++
++/// Design 0ba44ae2, first falsification point of patch 0023: about 0.7 MiB of MPPC-compressed Next
++/// fragments must not make the processor hold more than 16 MiB, and the next normal bitmap must decode.
++#[test]
++fn mppc_next_fragment_flood_stays_within_the_advertised_request_size() {
++    let mut processor = processor(true);
++    let mut image = DecodedImage::new(PixelFormat::RgbA32, 64, 64);
++    let mut client_bulk = Some(BulkCompressor::new(BulkType::Rdp5));
++    let mut server_bulk = BulkCompressor::new(BulkType::Rdp5);
++    let mut output = WriteBuf::new();
++    let zeros = vec![0u8; 16_000];
++    let mut compressed = |fragmentation| {
++        let (size, bulk_flags) = server_bulk.compress(&zeros).unwrap();
++        let data = server_bulk.compressed_data(size).to_vec();
++        update(fragmentation, UpdateCode::Bitmap, &data, Some(bulk_flags))
++    };
++
++    let base = held();
++    let mut wire = 0;
++    let mut reassembled = 0;
++    let mut max_held = 0;
++    let mut batch = vec![compressed(Fragmentation::First)];
++    while wire < 700 * 1024 {
++        while batch.len() < 256 {
++            batch.push(compressed(Fragmentation::Next));
++        }
++        for pdu in pack(&batch) {
++            wire += pdu.len();
++            processor
++                .process(&mut image, &pdu, &mut output, &mut client_bulk)
++                .expect("a hostile fragment flood must not fail the session");
++        }
++        reassembled += batch.len() * zeros.len();
++        batch.clear();
++        max_held = max_held.max(held() - base);
++    }
++    let held_after = held() - base;
++    println!(
++        "mppc flood: wire={wire} B reassembled={} MiB held={held_after} B max_held={max_held} B",
++        reassembled / MIB
++    );
++    assert!(reassembled > 100 * MAX_FRAGMENTED_UPDATE_SIZE, "the flood exceeds the limit many times over");
++    assert!(
++        max_held <= signed(16 * MIB),
++        "processor held {max_held} bytes after {wire} wire bytes"
++    );
++
++    // Two bottom-up BGR rows of two pixels each, with two pad bytes per row.
++    let bitmap_data = [3, 2, 1, 6, 5, 4, 0, 0, 9, 8, 7, 12, 11, 10, 0, 0];
++    let bitmap = encode_vec(&BitmapUpdateData {
++        rectangles: vec![BitmapData {
++            rectangle: InclusiveRectangle {
++                left: 0,
++                top: 0,
++                right: 1,
++                bottom: 1,
++            },
++            width: 2,
++            height: 2,
++            bits_per_pixel: 24,
++            compression_flags: Compression::empty(),
++            compressed_data_header: None,
++            bitmap_data: &bitmap_data,
++        }],
++    })
++    .unwrap();
++    let single = pack(&[update(Fragmentation::Single, UpdateCode::Bitmap, &bitmap, None)]);
++    let updates = processor
++        .process(&mut image, &single[0], &mut output, &mut client_bulk)
++        .expect("normal bitmap after the flood");
++    assert!(matches!(updates.as_slice(), [UpdateKind::Region(_)]), "{updates:?}");
++    assert_eq!(image.data()[..4], [7, 8, 9, 255]);
++}
++
++/// 1024 Large pointers of 384x384 must leave at most the 32 advertised cache entries behind.
++#[test]
++fn large_pointer_flood_keeps_only_the_advertised_cache_entries() {
++    let mut processor = processor(true);
++    let mut image = DecodedImage::new(PixelFormat::RgbA32, 64, 64);
++    let mut client_bulk = None;
++    let mut output = WriteBuf::new();
++    let edge = 384u16;
++    let mask = vec![0u8; usize::from(edge).div_ceil(16) * 2 * usize::from(edge)];
++
++    let base = held();
++    let mut wire = 0;
++    for cache_index in 0..1024u16 {
++        let attribute = encode_vec(&LargePointerAttribute {
++            xor_bpp: 1,
++            cache_index,
++            hot_spot: Point16 { x: 0, y: 0 },
++            width: edge,
++            height: edge,
++            xor_mask: &mask,
++            and_mask: &mask,
++        })
++        .unwrap();
++        let pieces: Vec<&[u8]> = attribute.chunks(30_000).collect();
++        for (index, piece) in pieces.iter().enumerate() {
++            let fragmentation = match index {
++                0 => Fragmentation::First,
++                index if index + 1 == pieces.len() => Fragmentation::Last,
++                _ => Fragmentation::Next,
++            };
++            for pdu in pack(&[update(fragmentation, UpdateCode::LargePointer, piece, None)]) {
++                wire += pdu.len();
++                let updates = processor
++                    .process(&mut image, &pdu, &mut output, &mut client_bulk)
++                    .expect("pointer updates must not fail the session");
++                if fragmentation == Fragmentation::Last && cache_index >= 32 {
++                    assert!(matches!(updates.as_slice(), [UpdateKind::PointerDefault]), "{updates:?}");
++                }
++            }
++        }
++    }
++    let held_after = held() - base;
++    println!("pointer flood: wire={wire} B held={held_after} B");
++    // Each decoded 384x384 shape keeps a 1 MiB buffer; 64 KiB covers the cache map and `Arc` headers.
++    assert!(
++        held_after <= signed(32 * MIB + 64 * 1024),
++        "processor held {held_after} bytes after {wire} wire bytes"
++    );
++}
+diff --git a/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs b/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs
+index 4937c4a..a4e3d74 100644
+--- a/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs
++++ b/crates/ironrdp-testsuite-core/tests/session/connection_activation.rs
+@@ -877,3 +877,66 @@ fn active_processor_processes_the_pdu_after_an_informational_server_redirection(
+ 
+     assert!(matches!(outputs.as_slice(), [ProcessorOutput::DeactivateAll]));
+ }
++
++// oracle: patch 0023 enforces the limits this client advertises, so the Fast-Path constants must equal
++// the Client Confirm Active values the connector sends when the server leaves them to the client.
++#[test]
++fn client_confirm_active_advertises_the_fast_path_enforced_limits() {
++    use ironrdp_pdu::rdp::capability_sets::LargePointerSupportFlags;
++    use ironrdp_session::fast_path::{
++        MAX_COLOR_POINTER_EDGE, MAX_FRAGMENTED_UPDATE_SIZE, MAX_LARGE_POINTER_EDGE, POINTER_CACHE_SIZE,
++    };
++
++    let mut demand_active = SERVER_DEMAND_ACTIVE.clone();
++    demand_active
++        .pdu
++        .capability_sets
++        .retain(|capability_set| !matches!(capability_set, CapabilitySet::MultiFragmentUpdate(_)));
++    let mut sequence = ConnectionActivationSequence::new(test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID);
++    let mut output = WriteBuf::new();
++    let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(demand_active));
++    sequence
++        .step(&frame, None, &mut output)
++        .expect("demand active should be accepted");
++
++    let X224(McsMessage::SendDataRequest(request)) = decode(output.filled()).unwrap() else {
++        panic!("the client confirm active must be written");
++    };
++    let header: ShareControlHeader = decode(&request.user_data).unwrap();
++    let ShareControlPdu::ClientConfirmActive(confirm) = header.share_control_pdu else {
++        panic!("expected a client confirm active");
++    };
++    let capability_sets = &confirm.pdu.capability_sets;
++
++    let pointer = capability_sets
++        .iter()
++        .find_map(|capability_set| match capability_set {
++            CapabilitySet::Pointer(pointer) => Some(pointer),
++            _ => None,
++        })
++        .expect("pointer capability");
++    assert_eq!(pointer.color_pointer_cache_size, POINTER_CACHE_SIZE);
++    assert_eq!(pointer.pointer_cache_size, POINTER_CACHE_SIZE);
++
++    let large_pointer = capability_sets
++        .iter()
++        .find_map(|capability_set| match capability_set {
++            CapabilitySet::LargePointer(large_pointer) => Some(large_pointer.flags),
++            _ => None,
++        })
++        .expect("large pointer capability");
++    assert_eq!(
++        large_pointer,
++        LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS
++    );
++    assert_eq!((MAX_COLOR_POINTER_EDGE, MAX_LARGE_POINTER_EDGE), (96, 384));
++
++    let max_request_size = capability_sets
++        .iter()
++        .find_map(|capability_set| match capability_set {
++            CapabilitySet::MultiFragmentUpdate(update) => Some(update.max_request_size),
++            _ => None,
++        })
++        .expect("multifragment update capability");
++    assert_eq!(usize::try_from(max_request_size).unwrap(), MAX_FRAGMENTED_UPDATE_SIZE);
++}
