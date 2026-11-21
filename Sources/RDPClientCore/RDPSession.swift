@@ -148,7 +148,9 @@ public final class RDPSession {
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
             session.lastRemotePointer = nil
-            // Waiting range requests get no reply after a disconnect (INV-L4).
+            // Advance before cancel: queued and finished materializations are stale too, and
+            // waiting range requests get no reply after a disconnect (INV-T1, INV-L4).
+            _ = session.remoteClipboardFreshness.advance()
             session.remoteFileDownloadManager?.cancelOutstanding()
             session.delegate?.rdpSession(session, didDisconnectWith: RDPDisconnectReason(kind: kind, code: code))
         }
@@ -280,8 +282,13 @@ public final class RDPSession {
 
         let sink = FreeRDPClipboardBridge(session: bridgeSession, staging: staging)
         self.remoteClipboardSink = sink
-        self.remoteFileDownloadManager = RDPRemoteFileDownloadManager(staging: staging) { stream, index, offset, length in
-            let status = rdp_bridge_request_remote_file_range(bridgeSession, stream, index, offset, length)
+        // The manager can outlive the session, so the bridge is reached through a weak session
+        // (INV-T2): it is freed only in deinit, which cannot start while this call holds `self`.
+        self.remoteFileDownloadManager = RDPRemoteFileDownloadManager(staging: staging) { [weak self] stream, index, offset, length in
+            guard let self, let bridge = self.bridgeSession else {
+                throw RDPSessionError.unableToCreateBridgeSession
+            }
+            let status = rdp_bridge_request_remote_file_range(bridge, stream, index, offset, length)
             guard status == RDPBridgeStatusOK else {
                 throw RDPSessionError.bridgeRejectedOperation(Int32(status.rawValue))
             }
@@ -293,6 +300,11 @@ public final class RDPSession {
     }
 
     deinit {
+        // `self` must not escape deinit through callbacks that destroy raises (INV-T4).
+        delegate = nil
+        // A waiting range ends now instead of after its timeout (INV-T1).
+        _ = remoteClipboardFreshness.advance()
+        remoteFileDownloadManager?.cancelOutstanding()
         if let bridgeSession {
             rdp_bridge_session_destroy(bridgeSession)
         }
@@ -432,6 +444,7 @@ public final class RDPSession {
     }
 
     public func disconnect() throws {
+        _ = remoteClipboardFreshness.advance()
         remoteFileDownloadManager?.cancelOutstanding()
         try withSessionLock {
             guard let bridgeSession else {

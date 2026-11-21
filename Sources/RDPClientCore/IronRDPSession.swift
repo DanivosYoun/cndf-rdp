@@ -224,7 +224,9 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     deinit {
-        // No delegate call from deinit: `self` must not escape it.
+        // No delegate call from deinit: `self` must not escape it, including through callbacks
+        // that destroy raises (INV-T4).
+        delegate = nil
         tearDownNativeSession(reportingDisconnect: false)
     }
 
@@ -576,7 +578,12 @@ public final class IronRDPSession: RDPEngineSession {
                         self?.clipboardIsCurrent(generation, connection: connection) == true
                             && self?.remoteClipboardFreshness.isNewest(freshness) == true
                     }
-                    self?.deliverClipboard(generation, connection: connection, dropped: { manager.discard(urls) }) { session in
+                    // The worker owns the result until it is handed over (INV-T3).
+                    guard let self else {
+                        manager.discard(urls)
+                        continue
+                    }
+                    self.deliverClipboard(generation, connection: connection, dropped: { manager.discard(urls) }) { session in
                         guard session.remoteClipboardFreshness.isNewest(freshness) else {
                             manager.discard(urls)
                             session.emitLog("Remote file materialization superseded by a newer server clipboard.")
