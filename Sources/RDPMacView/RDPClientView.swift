@@ -1,15 +1,37 @@
 import AppKit
 import CoreVideo
+import os.log
 import QuartzCore
 import RDPClientCore
 
 public final class RDPClientView: NSView {
     public weak var session: RDPEngineSession?
+    /// When true on a `.korean` connection, mirrors macOS Korean/non-Korean input-source flips
+    /// to the remote Windows session as a single Hangul toggle (design H1–H6).
+    public var inputSourceFollow = false {
+        didSet {
+            guard inputSourceFollow != oldValue else { return }
+            updateInputSourceFollowObservation()
+        }
+    }
     public var onRenderedFrame: ((CVPixelBuffer, CFTimeInterval) -> Void)? {
         didSet { frameTapDidChange?() }
     }
     // Lets the owning RDPConnectionView release output suppression the moment a tap attaches.
     var frameTapDidChange: (() -> Void)?
+
+    private static let inputSourceFollowLog = OSLog(subsystem: "com.cndf.rdp", category: "input-source-follow")
+    private var inputSourceFollower = RDPInputSourceFollower()
+    private var inputSourceReader: RDPInputSourceReading = RDPMacInputSourceReader()
+    private var inputSourceObserver = RDPMacInputSourceObserver()
+    private var inputSourceClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    private var isViewFocusedForInputSourceFollow: (() -> Bool)?
+    private var switchHotkeysOverride: [RDPSwitchHotkey]?
+    private var inputSourceSettleWorkItem: DispatchWorkItem?
+    private var lastObservedSourceID: String?
+    private var suppressedSwitchKeyCodes: Set<UInt16> = []
+    private var isRawRightOptionActive = false
+    private var isSuppressingRightOption = false
 
     private var trackingArea: NSTrackingArea?
     private var remoteFrameSize: CGSize = .zero
@@ -54,6 +76,7 @@ public final class RDPClientView: NSView {
 
     deinit {
         onRenderedFrame = nil
+        stopInputSourceFollow()
         removeFocusObservers()
     }
 
@@ -199,6 +222,7 @@ public final class RDPClientView: NSView {
         let accepted = super.becomeFirstResponder()
         if accepted {
             syncHostModifiers()
+            handleInputSourceFocusGained()
         }
         return accepted
     }
@@ -212,11 +236,32 @@ public final class RDPClientView: NSView {
     }
 
     public override func keyDown(with event: NSEvent) {
+        let preCheck = evaluateInputSourceChange(cause: .async, fromNotification: false)
+        if inputSourceFollow {
+            if suppressedSwitchKeyCodes.contains(event.keyCode) {
+                return
+            }
+            if preCheck.sourceChanged && isSwitchHotkeyCandidate(event) {
+                suppressedSwitchKeyCodes.insert(event.keyCode)
+                return
+            }
+        }
         // Han/Yeong and Hanja are toggles: one tap per press, auto-repeat ignored (design I11).
         if let profile = session?.keyboardProfile,
            let scancode = RDPKeyboardMapper.imeToggleScancode(forMacKeyCode: event.keyCode, profile: profile) {
             if !event.isARepeat {
-                inputExecutor()?.hostChord([scancode])
+                let isHangul = scancode == RDPKeyboardMapper.imeToggleScancodes(for: profile)?.hangul
+                if isHangul && isInputSourceFollowEligible && inputSourceFollower.isFocused {
+                    let now = inputSourceClock()
+                    if inputSourceFollower.shouldSuppressRawToggle(at: now) {
+                        return
+                    }
+                    inputSourceFollower.rawToggleBegan(at: now)
+                    inputExecutor()?.hostChord([scancode])
+                    inputSourceFollower.rawToggleEnded(at: now)
+                } else {
+                    inputExecutor()?.hostChord([scancode])
+                }
             }
             return
         }
@@ -232,6 +277,10 @@ public final class RDPClientView: NSView {
     }
 
     public override func keyUp(with event: NSEvent) {
+        _ = evaluateInputSourceChange(cause: .async, fromNotification: false)
+        if suppressedSwitchKeyCodes.remove(event.keyCode) != nil {
+            return
+        }
         if event.modifierFlags.contains(.command),
            RDPKeyboardMapper.commandShortcutScancode(for: event.keyCode) != nil {
             return
@@ -244,12 +293,40 @@ public final class RDPClientView: NSView {
     }
 
     public override func flagsChanged(with event: NSEvent) {
-        inputExecutor()?.hostModifiers(RDPKeyboardMapper.modifierScancodes(for: event.modifierFlags))
+        _ = evaluateInputSourceChange(cause: .async, fromNotification: false)
+        var scancodes = RDPKeyboardMapper.modifierScancodes(for: event.modifierFlags)
+        if isInputSourceFollowEligible && inputSourceFollower.isFocused {
+            let now = inputSourceClock()
+            let isRightOptionNow = RDPKeyboardMapper.isRightOptionOnly(event.modifierFlags)
+            if isRightOptionNow {
+                if !isRawRightOptionActive && !isSuppressingRightOption {
+                    if inputSourceFollower.shouldSuppressRawToggle(at: now) {
+                        isSuppressingRightOption = true
+                    } else {
+                        isRawRightOptionActive = true
+                        inputSourceFollower.rawToggleBegan(at: now)
+                    }
+                }
+                if isSuppressingRightOption {
+                    scancodes.removeAll { $0 == RDPKeyboardMapper.rightAlt }
+                }
+            } else {
+                if isRawRightOptionActive {
+                    isRawRightOptionActive = false
+                    inputSourceFollower.rawToggleEnded(at: now)
+                }
+                if isSuppressingRightOption {
+                    isSuppressingRightOption = false
+                }
+            }
+        }
+        inputExecutor()?.hostModifiers(scancodes)
     }
 
     /// Releases every key, modifier and button the local view holds, so nothing stays down on
     /// the server while key events go elsewhere (design D6). Share owners keep theirs.
     func releaseHostInput() {
+        handleInputSourceFocusLost()
         unicodeNumpadDown.removeAll()
         inputExecutor()?.hostReleaseAll()
     }
@@ -274,6 +351,11 @@ public final class RDPClientView: NSView {
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
                 guard let self, self.window?.firstResponder === self else { return }
                 self.syncHostModifiers()
+                self.handleInputSourceFocusGained()
+            },
+            center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.window?.isKeyWindow == true, self.window?.firstResponder === self else { return }
+                self.handleInputSourceFocusGained()
             }
         ]
     }
@@ -370,6 +452,7 @@ public final class RDPClientView: NSView {
             return 0
         }
         isRenderPipelineShutdown = true
+        stopInputSourceFollow()
         removeFocusObservers()
         pendingResizeWorkItem?.cancel()
         pendingResizeWorkItem = nil
@@ -650,5 +733,156 @@ public final class RDPClientView: NSView {
 
     private func fileURLs(from sender: NSDraggingInfo) -> [URL] {
         sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+    }
+
+    // MARK: - Input-source follow (design H1–H6)
+
+    func configureInputSourceFollowForTesting(
+        reader: RDPInputSourceReading,
+        observer: RDPMacInputSourceObserver,
+        clock: @escaping () -> TimeInterval,
+        isFocused: @escaping () -> Bool,
+        switchHotkeys: [RDPSwitchHotkey]? = nil
+    ) {
+        inputSourceObserver.stop()
+        inputSourceReader = reader
+        inputSourceObserver = observer
+        inputSourceClock = clock
+        isViewFocusedForInputSourceFollow = isFocused
+        switchHotkeysOverride = switchHotkeys
+        if inputSourceFollow {
+            updateInputSourceFollowObservation()
+        }
+    }
+
+    private var isInputSourceFollowEligible: Bool {
+        inputSourceFollow
+            && !isRenderPipelineShutdown
+            && session?.keyboardProfile == .korean
+            && session?.isConnected == true
+    }
+
+    private func isEffectivelyFocusedForInputSourceFollow() -> Bool {
+        if let override = isViewFocusedForInputSourceFollow {
+            return override()
+        }
+        return NSApp.isActive
+            && (window?.isKeyWindow ?? false)
+            && window?.firstResponder === self
+    }
+
+    private func updateInputSourceFollowObservation() {
+        if inputSourceFollow && !isRenderPipelineShutdown {
+            inputSourceObserver.start { [weak self] in
+                self?.evaluateInputSourceChange(cause: .async, fromNotification: true)
+            }
+            handleInputSourceFocusGained()
+        } else {
+            stopInputSourceFollow()
+        }
+    }
+
+    private func stopInputSourceFollow() {
+        inputSourceObserver.stop()
+        handleInputSourceFocusLost()
+    }
+
+    func handleInputSourceFocusGained() {
+        inputSourceSettleWorkItem?.cancel()
+        inputSourceSettleWorkItem = nil
+        guard isInputSourceFollowEligible, isEffectivelyFocusedForInputSourceFollow() else {
+            return
+        }
+        let now = inputSourceClock()
+        let language = inputSourceReader.currentLanguage()
+        lastObservedSourceID = inputSourceReader.currentSourceID()
+        inputSourceFollower.focusGained(at: now, language: language)
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.handleInputSourceSettleElapsed()
+        }
+        inputSourceSettleWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + inputSourceFollower.settleInterval, execute: workItem)
+    }
+
+    func handleInputSourceSettleElapsed() {
+        inputSourceSettleWorkItem?.cancel()
+        inputSourceSettleWorkItem = nil
+        guard isInputSourceFollowEligible,
+              isEffectivelyFocusedForInputSourceFollow(),
+              inputSourceFollower.isFocused else {
+            return
+        }
+        let now = inputSourceClock()
+        let language = inputSourceReader.currentLanguage()
+        lastObservedSourceID = inputSourceReader.currentSourceID()
+        inputSourceFollower.settleElapsed(at: now, language: language)
+    }
+
+    func handleInputSourceFocusLost() {
+        inputSourceSettleWorkItem?.cancel()
+        inputSourceSettleWorkItem = nil
+        suppressedSwitchKeyCodes.removeAll()
+        isRawRightOptionActive = false
+        isSuppressingRightOption = false
+        lastObservedSourceID = nil
+        inputSourceFollower.focusLost()
+    }
+
+    @discardableResult
+    private func evaluateInputSourceChange(
+        cause: RDPInputSourceObservationCause,
+        fromNotification: Bool
+    ) -> (decision: RDPInputSourceFollowDecision, sourceChanged: Bool) {
+        guard inputSourceFollow, !isRenderPipelineShutdown else {
+            return (.none(.unfocused), false)
+        }
+        guard isInputSourceFollowEligible, isEffectivelyFocusedForInputSourceFollow() else {
+            if inputSourceFollower.isFocused {
+                handleInputSourceFocusLost()
+            }
+            return (.none(.unfocused), false)
+        }
+        if !inputSourceFollower.isFocused {
+            handleInputSourceFocusGained()
+            return (.none(.settling), false)
+        }
+
+        let language = inputSourceReader.currentLanguage()
+        let sourceID = inputSourceReader.currentSourceID()
+        let sourceChanged: Bool
+        if let sourceID, let previousID = lastObservedSourceID {
+            sourceChanged = (sourceID != previousID)
+        } else {
+            sourceChanged = (language != inputSourceFollower.baseline)
+        }
+        lastObservedSourceID = sourceID
+
+        let decision = inputSourceFollower.observe(language, at: inputSourceClock(), cause: cause)
+        if fromNotification || sourceChanged || decision != .none(.unchanged) {
+            logInputSourceDecision(decision, language: language, cause: cause)
+        }
+        if case .sendToggle = decision,
+           let hangul = RDPKeyboardMapper.imeToggleScancodes(for: .korean)?.hangul {
+            inputExecutor()?.hostChord([hangul])
+        }
+        return (decision, sourceChanged)
+    }
+
+    private func isSwitchHotkeyCandidate(_ event: NSEvent) -> Bool {
+        let hotkeys = switchHotkeysOverride ?? RDPSymbolicHotKeys.readEnabledSwitchHotkeys()
+        return hotkeys.contains { $0.matches(keyCode: event.keyCode, modifierFlags: event.modifierFlags) }
+    }
+
+    private func logInputSourceDecision(
+        _ decision: RDPInputSourceFollowDecision,
+        language: RDPInputLanguage,
+        cause: RDPInputSourceObservationCause
+    ) {
+        let line = "RDP input-source follow: \(decision.reason.rawValue) lang=\(language.rawValue) cause=\(cause.rawValue) sent=\(decision.sentLogValue)"
+        if let session, let delegate = session.delegate {
+            delegate.rdpSession(session, didLog: line)
+        } else {
+            os_log("%{public}@", log: Self.inputSourceFollowLog, type: .info, line)
+        }
     }
 }
