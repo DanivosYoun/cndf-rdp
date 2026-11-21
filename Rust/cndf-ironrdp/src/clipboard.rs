@@ -256,7 +256,7 @@ mod real {
     use super::*;
     use ironrdp_client::rdp::RdpInputSender;
     use ironrdp_cliprdr::backend::{
-        ClipboardMessage as Message, CliprdrBackend, CliprdrBackendFactory,
+        ClipboardMessage as Message, CliprdrBackend, CliprdrBackendFactory, RequestedFormat,
     };
     use ironrdp_cliprdr::pdu::{
         ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId,
@@ -266,7 +266,7 @@ mod real {
     };
     use ironrdp_cliprdr::CliprdrInstance;
     use ironrdp_core::IntoOwned;
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::HashSet;
     use tokio::sync::oneshot;
 
     /// RANGE responses served at once, counted from acceptance until the session handles the frame.
@@ -480,8 +480,6 @@ mod real {
         negotiated: Option<Capabilities>,
         offer: Offer,
         advertised: Vec<Arc<LocalFile>>,
-        deferred_paste: Option<(ClipboardFormatId, bool)>,
-        pastes: VecDeque<bool>,
         requests: HashSet<u32>,
         /// RANGE responses accepted for the server and not yet handled by the session.
         range_responses: Vec<(oneshot::Receiver<()>, u64)>,
@@ -651,21 +649,30 @@ mod real {
                 CNDF_IRON_NOT_CONNECTED
             }
         }
-
-        fn paste(&self, state: &mut State, id: ClipboardFormatId, file: bool) {
-            if self.send(Message::SendInitiatePaste(id)) {
-                state.pastes.push_back(file);
-            }
-        }
     }
 
     impl CliprdrBackendFactory for Channel {
         fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
-            Box::new(CndfCliprdrBackend(self.clone()))
+            Box::new(CndfCliprdrBackend::new(self.clone()))
         }
     }
 
-    struct CndfCliprdrBackend(Channel);
+    struct CndfCliprdrBackend {
+        channel: Channel,
+        ready: bool,
+        deferred_paste: Option<ClipboardFormatId>,
+    }
+
+    impl CndfCliprdrBackend {
+        fn new(channel: Channel) -> Self {
+            Self {
+                channel,
+                ready: false,
+                deferred_paste: None,
+            }
+        }
+    }
+
     ironrdp_core::impl_as_any!(CndfCliprdrBackend);
 
     impl std::fmt::Debug for CndfCliprdrBackend {
@@ -676,25 +683,24 @@ mod real {
 
     impl Drop for CndfCliprdrBackend {
         fn drop(&mut self) {
-            let mut state = lock(&self.0.state);
+            let mut state = lock(&self.channel.state);
             state.ready = false;
             for stream in state.requests.drain() {
-                self.0
+                self.channel
                     .queue(move |connection| notify_range(connection, stream, None));
             }
         }
     }
 
-    fn choose_format(formats: &[ClipboardFormat]) -> Option<(ClipboardFormatId, bool)> {
+    fn choose_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
         formats.iter().find_map(|format| {
             if format
                 .name
                 .as_ref()
                 .is_some_and(|name| name.value() == "FileGroupDescriptorW")
+                || format.id == ClipboardFormatId::CF_UNICODETEXT
             {
-                Some((format.id, true))
-            } else if format.id == ClipboardFormatId::CF_UNICODETEXT {
-                Some((format.id, false))
+                Some(format.id)
             } else {
                 None
             }
@@ -737,15 +743,20 @@ mod real {
         }
 
         fn on_ready(&mut self) {
-            let mut state = lock(&self.0.state);
+            self.paste_on_ready();
+        }
+
+        fn paste_on_ready(&mut self) -> Option<ClipboardFormatId> {
+            self.ready = true;
+            let choice = self.deferred_paste.take();
+            let mut state = lock(&self.channel.state);
             state.ready = true;
-            // Offers can change while the initial format list is awaiting acknowledgment.
+            // Re-advertising the local offer takes priority over the deferred remote copy.
             if state.dirty_offer {
-                self.0.advertise(&mut state);
+                self.channel.advertise(&mut state);
+                return None;
             }
-            if let Some((id, file)) = state.deferred_paste.take() {
-                self.0.paste(&mut state, id, file);
-            }
+            choice
         }
 
         // CLIPRDR calls `initial_format_list` instead.
@@ -754,7 +765,7 @@ mod real {
         /// Returns the format list in the iteration of the server's Monitor Ready, so a repeated
         /// Monitor Ready queues nothing for the session.
         fn initial_format_list(&mut self) -> Option<Vec<ClipboardFormat>> {
-            let mut state = lock(&self.0.state);
+            let mut state = lock(&self.channel.state);
             state.dirty_offer = matches!(state.offer, Offer::Files(_));
             Some(if matches!(state.offer, Offer::Text(_)) {
                 vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
@@ -764,28 +775,24 @@ mod real {
         }
 
         fn on_process_negotiated_capabilities(&mut self, capabilities: Capabilities) {
-            lock(&self.0.state).negotiated = Some(capabilities);
+            lock(&self.channel.state).negotiated = Some(capabilities);
         }
 
         // CLIPRDR calls `paste_on_remote_copy` instead.
         fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
 
         /// Pastes in the iteration of the server's Format List, so a repeated copy queues nothing
-        /// for the session. Before the channel is ready the choice waits for `on_ready`.
+        /// for the session. Before the channel is ready the choice waits for `paste_on_ready`.
         fn paste_on_remote_copy(
             &mut self,
             formats: &[ClipboardFormat],
         ) -> Option<ClipboardFormatId> {
-            let mut state = lock(&self.0.state);
             let choice = choose_format(formats);
-            if !state.ready {
-                state.deferred_paste = choice;
+            if !self.ready {
+                self.deferred_paste = choice;
                 return None;
             }
-            let (id, file) = choice?;
-            // A paste CLIPRDR does not send is failed locally, which takes this entry back.
-            state.pastes.push_back(file);
-            Some(id)
+            choice
         }
 
         // CLIPRDR calls `respond_to_format_data_request` instead.
@@ -797,7 +804,7 @@ mod real {
             &mut self,
             request: FormatDataRequest,
         ) -> Option<OwnedFormatDataResponse> {
-            let state = lock(&self.0.state);
+            let state = lock(&self.channel.state);
             Some(
                 match &state.offer {
                     Offer::Text(text) if request.format == ClipboardFormatId::CF_UNICODETEXT => {
@@ -810,33 +817,38 @@ mod real {
         }
 
         fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-            let requested_file = lock(&self.0.state).pastes.pop_front();
+            self.on_format_data_answer(response, None);
+        }
+
+        fn on_format_data_answer(
+            &mut self,
+            response: FormatDataResponse<'_>,
+            requested: Option<RequestedFormat>,
+        ) {
             if response.is_error() {
-                lock(&self.0.jobs.refusals)
+                lock(&self.channel.jobs.refusals)
                     .record(Refusal::RemoteFailure, response.data().len() as u64);
                 return;
             }
-            if requested_file != Some(false) {
+            if requested != Some(RequestedFormat::Other) {
                 return;
             }
-            self.0
+            self.channel
                 .jobs
                 .offer_remote(Remote::Text(response.data().to_vec()));
         }
 
         /// A response CLIPRDR dropped for its size answers the oldest paste, which then fails.
         fn on_format_data_response_oversized(&mut self, declared_length: usize) {
-            lock(&self.0.state).pastes.pop_front();
-            lock(&self.0.jobs.refusals).record(Refusal::Oversized, declared_length as u64);
+            lock(&self.channel.jobs.refusals).record(Refusal::Oversized, declared_length as u64);
         }
 
         fn on_remote_file_list(&mut self, files: &[FileDescriptor], _: Option<u32>) {
-            lock(&self.0.state).pastes.pop_front();
             let files = files
                 .iter()
                 .map(|file| (remote_name(file), file.file_size.unwrap_or(0)))
                 .collect();
-            self.0.jobs.offer_remote(Remote::Files(files));
+            self.channel.jobs.offer_remote(Remote::Files(files));
         }
 
         // CLIPRDR calls `respond_to_file_contents_request` instead.
@@ -851,22 +863,22 @@ mod real {
         ) -> Option<FileContentsResponse<'static>> {
             let stream = request.stream_id;
             let length = request.requested_size;
-            let mut state = lock(&self.0.state);
+            let mut state = lock(&self.channel.state);
             let Some(file) = state.advertised.get(request.index as usize).cloned() else {
-                return Some(self.0.refuse(stream, Refusal::MissingFile, length));
+                return Some(self.channel.refuse(stream, Refusal::MissingFile, length));
             };
             if request.flags == FileContentsFlags::SIZE {
                 return Some(FileContentsResponse::new_size_response(stream, file.size));
             }
             let Some(read) = range_length(&file, request.position, length) else {
-                return Some(self.0.refuse(stream, Refusal::InvalidRange, length));
+                return Some(self.channel.refuse(stream, Refusal::InvalidRange, length));
             };
             let Some(completion) = state.reserve_range(u64::from(read)) else {
-                return Some(self.0.refuse(stream, Refusal::Budget, length));
+                return Some(self.channel.refuse(stream, Refusal::Budget, length));
             };
             drop(state);
-            let input = self.0.input.clone();
-            let queued = self.0.queue(move |connection| {
+            let input = self.channel.input.clone();
+            let queued = self.channel.queue(move |connection| {
                 // A stopping session takes no more reads; dropping the completion releases them.
                 if connection.stop.load(Ordering::Acquire) {
                     return;
@@ -895,9 +907,9 @@ mod real {
 
         fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
             let stream = response.stream_id();
-            if lock(&self.0.state).requests.remove(&stream) {
+            if lock(&self.channel.state).requests.remove(&stream) {
                 let data = (!response.is_error()).then(|| response.data().to_vec());
-                self.0
+                self.channel
                     .queue(move |connection| notify_range(connection, stream, data.as_deref()));
             }
         }
@@ -956,7 +968,7 @@ mod real {
             let (mut channel, jobs) = test_channel(input);
             let (messages, receive) = mpsc::channel();
             channel.messages = Some(messages);
-            let mut backend = CndfCliprdrBackend(channel.clone());
+            let mut backend = CndfCliprdrBackend::new(channel.clone());
 
             assert_eq!(backend.client_capabilities().bits(), 0x2e);
             assert_eq!(
@@ -980,15 +992,11 @@ mod real {
                 )]),
                 None
             );
-            backend.on_ready();
+            assert_eq!(backend.paste_on_ready(), None);
             assert!(
                 matches!(receive.try_recv().unwrap(), Message::SendInitiateCopy(formats)
                 if formats.len() == 1 && formats[0].id == ClipboardFormatId::CF_UNICODETEXT)
             );
-            assert!(matches!(
-                receive.try_recv().unwrap(),
-                Message::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
-            ));
             let response = backend.respond_to_format_data_request(FormatDataRequest {
                 format: ClipboardFormatId::CF_UNICODETEXT,
             });
@@ -1071,7 +1079,8 @@ mod real {
                     }),
                     CNDF_IRON_OK
                 );
-                let Message::SendFileContentsRequest(mut request) = receive.try_recv().unwrap() else {
+                let Message::SendFileContentsRequest(mut request) = receive.try_recv().unwrap()
+                else {
                     panic!("expected file contents request");
                 };
                 if stream_id == 1 {
@@ -1139,7 +1148,7 @@ mod real {
 
             let (input, _events) = RdpInputSender::channel(1);
             let (channel, jobs) = test_channel(input);
-            let mut backend = CndfCliprdrBackend(channel.clone());
+            let mut backend = CndfCliprdrBackend::new(channel.clone());
             backend.on_process_negotiated_capabilities(Capabilities::STREAM_FILECLIP_ENABLED);
             backend.on_ready();
             channel.submit(ClipboardCommand::Files(vec![LocalFile {
@@ -1979,7 +1988,6 @@ mod real {
             fragment.extend_from_slice(&pdu);
             assert!(svc.process(&fragment).unwrap().is_empty());
 
-            assert!(lock(&channel.state).pastes.is_empty());
             channel.jobs.flush(&connection);
             assert_eq!(delivered.texts, ["after"]);
             assert_eq!(
@@ -2039,7 +2047,158 @@ mod real {
             }
             assert_eq!(queued, 0);
             assert_eq!(requests, 64);
-            assert_eq!(lock(&channel.state).pastes.len(), 64);
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            for index in 1..=64 {
+                let text = index.to_string();
+                assert!(process(ClipboardPdu::FormatDataResponse(
+                    FormatDataResponse::new_unicode_string(&text),
+                ))
+                .is_empty());
+                channel.jobs.flush(&connection);
+                assert_eq!(delivered.texts.last(), Some(&text));
+            }
+            assert_eq!(delivered.texts.len(), 64);
+        }
+
+        fn process(cliprdr: &mut CliprdrClient, pdu: ClipboardPdu<'_>) -> Vec<SvcMessage> {
+            cliprdr
+                .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                .unwrap()
+        }
+
+        fn copy(cliprdr: &mut CliprdrClient, format: ClipboardFormat) -> Vec<SvcMessage> {
+            process(
+                cliprdr,
+                ClipboardPdu::FormatList(FormatList::new_unicode(&[format], true).unwrap()),
+            )
+        }
+
+        fn ready(cliprdr: &mut CliprdrClient) -> Vec<SvcMessage> {
+            process(
+                cliprdr,
+                ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+            )
+        }
+
+        fn client(channel: &Channel) -> CliprdrClient {
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            process(
+                &mut cliprdr,
+                ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    Capabilities::USE_LONG_FORMAT_NAMES,
+                )),
+            );
+            cliprdr
+        }
+
+        fn answer(cliprdr: &mut CliprdrClient, response: FormatDataResponse<'_>) {
+            process(cliprdr, ClipboardPdu::FormatDataResponse(response));
+        }
+
+        #[test]
+        fn ready_paste_precedes_the_next_remote_copy() {
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut cliprdr = client(&channel);
+
+            assert_eq!(
+                kinds(&copy(&mut cliprdr, text_format())),
+                ["FormatListResponse"]
+            );
+            assert_eq!(kinds(&ready(&mut cliprdr)), ["FormatDataRequest"]);
+            assert_eq!(
+                kinds(&copy(&mut cliprdr, file_format())),
+                ["FormatListResponse", "FormatDataRequest"]
+            );
+            assert!(ordered.try_recv().is_err());
+
+            answer(
+                &mut cliprdr,
+                FormatDataResponse::new_unicode_string("older"),
+            );
+            channel.jobs.flush(&connection);
+            assert_eq!(delivered.texts, ["older"]);
+            assert!(delivered.files.is_empty());
+            answer(&mut cliprdr, file_list("newer.txt", 1));
+            channel.jobs.flush(&connection);
+            assert_eq!(delivered.files, [vec![("newer.txt".to_owned(), 1)]]);
+        }
+
+        #[test]
+        fn locally_refused_paste_leaves_the_oldest_requests_pending() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut cliprdr = client(&channel);
+            ready(&mut cliprdr);
+            copy(&mut cliprdr, text_format());
+            copy(&mut cliprdr, file_format());
+            for _ in 0..62 {
+                copy(&mut cliprdr, text_format());
+            }
+            assert_eq!(
+                kinds(&copy(&mut cliprdr, text_format())),
+                ["FormatListResponse"]
+            );
+
+            answer(
+                &mut cliprdr,
+                FormatDataResponse::new_unicode_string("first"),
+            );
+            channel.jobs.flush(&connection);
+            assert_eq!(delivered.texts, ["first"]);
+            answer(&mut cliprdr, file_list("second.txt", 1));
+            channel.jobs.flush(&connection);
+            assert_eq!(delivered.files, [vec![("second.txt".to_owned(), 1)]]);
+        }
+
+        #[test]
+        fn malformed_file_list_is_not_delivered_as_text() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut cliprdr = client(&channel);
+            ready(&mut cliprdr);
+            copy(&mut cliprdr, file_format());
+            answer(&mut cliprdr, FormatDataResponse::new_unicode_string("x"));
+            assert!(lock(&channel.jobs.remote).is_none());
+        }
+
+        #[test]
+        fn unsolicited_format_data_is_discarded() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut cliprdr = client(&channel);
+            ready(&mut cliprdr);
+            answer(
+                &mut cliprdr,
+                FormatDataResponse::new_unicode_string("unsolicited"),
+            );
+            assert!(lock(&channel.jobs.remote).is_none());
+        }
+
+        #[test]
+        fn deferred_copy_and_ready_belong_to_the_cliprdr_instance() {
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut previous = client(&channel);
+            copy(&mut previous, text_format());
+            drop(previous);
+            let mut current = client(&channel);
+            assert!(ready(&mut current).is_empty());
+            assert!(ordered.try_recv().is_err());
+
+            let mut next = client(&channel);
+            assert_eq!(
+                kinds(&copy(&mut next, text_format())),
+                ["FormatListResponse"]
+            );
+            assert_eq!(kinds(&ready(&mut next)), ["FormatDataRequest"]);
+            assert!(ordered.try_recv().is_err());
         }
 
         // oracle: mutant clip worker that never delivers the held server data.
@@ -2103,14 +2262,8 @@ mod real {
             let text = ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT);
             let files = ClipboardFormat::new(ClipboardFormatId::new(0xc001))
                 .with_name(ClipboardFormatName::FILE_LIST);
-            assert_eq!(
-                choose_format(&[text.clone(), files.clone()]),
-                Some((text.id, false))
-            );
-            assert_eq!(
-                choose_format(&[files.clone(), text]),
-                Some((files.id, true))
-            );
+            assert_eq!(choose_format(&[text.clone(), files.clone()]), Some(text.id));
+            assert_eq!(choose_format(&[files.clone(), text]), Some(files.id));
         }
 
         #[test]
