@@ -65,6 +65,15 @@ struct RDPBridgeSession {
     size_t local_text_length;
     RDPBridgeLocalFile *local_files;
     size_t local_file_count;
+    // Format Data Request 짝 맞추기(설계 D-2, INV-P1). 채널 스레드에서만 읽고 쓴다.
+    // pending: 보냈지만 응답이 아직 안 온 요청 수. stale: 그중 마지막 서버 FL 이전에 보낸 것.
+    // request_format: 마지막으로 보낸 요청의 종류(FGD 또는 TEXT). FreeRDP 의
+    // lastRequestedFormatId 는 서버→클라 요청 기록용이라 쓰지 않는다.
+    uint32_t clip_requests_pending;
+    uint32_t clip_requests_stale;
+    UINT32 clip_request_format;
+    // 서버 CLIPRDR general capability flags. 서술자 직렬화의 huge 파일 판정에 쓴다.
+    UINT32 server_clip_flags;
     // TLS 1.2 자동 폴백 재시도: 첫 연결이 TLS connect 단계에서 실패하면(예: Entra
     // 하드닝 Azure VM의 TLS 1.3/SCHANNEL 비호환) 보관해 둔 옵션으로 인스턴스를 다시
     // 만들어 TLS 1.2를 강제한 뒤 한 번만 재시도한다. retry_options의 문자열은 소유
@@ -296,13 +305,20 @@ static UINT bridge_send_file_group_descriptor(
     }
 
     for (size_t index = 0; index < session->local_file_count; index++) {
+        // 이름 끝의 백슬래시는 디렉터리 표지다(설계 D-1, INV-D2). 표지는 떼고 DIRECTORY·크기 0 으로 쓴다.
+        const char *file_name = session->local_files[index].fileName;
+        const size_t name_length = (file_name != NULL) ? strlen(file_name) : 0;
+        const bool is_directory = (name_length > 0) && (file_name[name_length - 1] == '\\');
+        const UINT64 file_size = is_directory ? 0 : session->local_files[index].size;
         descriptors[index].dwFlags = FD_ATTRIBUTES | FD_FILESIZE | FD_UNICODE;
-        descriptors[index].dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
-        descriptors[index].nFileSizeHigh = (DWORD)(session->local_files[index].size >> 32);
-        descriptors[index].nFileSizeLow = (DWORD)(session->local_files[index].size & 0xFFFFFFFF);
+        descriptors[index].dwFileAttributes = is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+        descriptors[index].nFileSizeHigh = (DWORD)(file_size >> 32);
+        descriptors[index].nFileSizeLow = (DWORD)(file_size & 0xFFFFFFFF);
 
         size_t wchar_count = 0;
-        WCHAR *name = ConvertUtf8ToWCharAlloc(session->local_files[index].fileName, &wchar_count);
+        WCHAR *name = (file_name != NULL)
+            ? ConvertUtf8NToWCharAlloc(file_name, is_directory ? name_length - 1 : name_length, &wchar_count)
+            : NULL;
         if (name != NULL) {
             const size_t copy_count = (wchar_count < 259) ? wchar_count : 259;
             memcpy(descriptors[index].cFileName, name, copy_count * sizeof(WCHAR));
@@ -313,7 +329,10 @@ static UINT bridge_send_file_group_descriptor(
 
     BYTE *data = NULL;
     UINT32 data_length = 0;
-    UINT status = cliprdr_serialize_file_list(
+    // 2 GiB 이상 파일은 양쪽이 CB_HUGE_FILE_SUPPORT_ENABLED 를 광고했을 때만 직렬화된다.
+    // 우리는 항상 광고하므로(monitor_ready) 서버가 광고했는지로 정한다. FreeRDP 클라이언트와 같은 규칙.
+    UINT status = cliprdr_serialize_file_list_ex(
+        CB_STREAM_FILECLIP_ENABLED | (session->server_clip_flags & CB_HUGE_FILE_SUPPORT_ENABLED),
         descriptors,
         (UINT32)session->local_file_count,
         &data,
@@ -321,7 +340,12 @@ static UINT bridge_send_file_group_descriptor(
     free(descriptors);
     if (status != CHANNEL_RC_OK) {
         bridge_logf(session, "Clipboard local file descriptor serialization failed: %u.", status);
-        return status;
+        // 무응답이면 서버가 응답을 계속 기다린다. FAIL 로 답한다.
+        CLIPRDR_FORMAT_DATA_RESPONSE failure = { 0 };
+        failure.common.msgType = CB_FORMAT_DATA_RESPONSE;
+        failure.common.msgFlags = CB_RESPONSE_FAIL;
+        failure.common.dataLen = 0;
+        return cliprdr->ClientFormatDataResponse(cliprdr, &failure);
     }
 
     CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
@@ -377,15 +401,30 @@ static UINT bridge_cliprdr_server_format_data_request(
 static UINT bridge_cliprdr_server_format_data_response(
     CliprdrClientContext *cliprdr,
     const CLIPRDR_FORMAT_DATA_RESPONSE *response) {
-    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL) ||
-        (response->common.msgFlags != CB_RESPONSE_OK) || (response->requestedFormatData == NULL) ||
-        (response->common.dataLen == 0)) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL)) {
         return CHANNEL_RC_OK;
     }
 
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
-    if (cliprdr->lastRequestedFormatId != CF_UNICODETEXT) {
-        if (cliprdr->lastRequestedFormatId == RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW &&
+    // 응답 하나마다 요청 하나를 센다(OK·FAIL 모두, INV-P1). 그래서 FAIL 필터보다 먼저 한다.
+    if (session->clip_requests_pending == 0) {
+        bridge_log(session, "Clipboard dropped unsolicited remote format data response.");
+        return CHANNEL_RC_OK;
+    }
+    session->clip_requests_pending--;
+    if (session->clip_requests_stale > 0) {
+        session->clip_requests_stale--;
+        bridge_log(session, "Clipboard dropped stale remote format data response.");
+        return CHANNEL_RC_OK;
+    }
+
+    if ((response->common.msgFlags != CB_RESPONSE_OK) || (response->requestedFormatData == NULL) ||
+        (response->common.dataLen == 0)) {
+        return CHANNEL_RC_OK;
+    }
+
+    if (session->clip_request_format != CF_UNICODETEXT) {
+        if (session->clip_request_format == RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW &&
             session->callbacks.remoteFileList != NULL) {
             bridge_logf(session, "Clipboard received remote file descriptor list: bytes=%u.", response->common.dataLen);
             session->callbacks.remoteFileList(
@@ -435,6 +474,7 @@ static UINT bridge_cliprdr_server_capabilities(
             (capability->capabilitySetLength >= CB_CAPSTYPE_GENERAL_LEN)) {
             const CLIPRDR_GENERAL_CAPABILITY_SET *general =
                 (const CLIPRDR_GENERAL_CAPABILITY_SET *)capability;
+            session->server_clip_flags = general->generalFlags;
             bridge_logf(
                 session,
                 "Clipboard server capabilities: version=%u flags=0x%08x.",
@@ -453,6 +493,10 @@ static UINT bridge_cliprdr_monitor_ready(
     }
 
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    // 채널 초기화: 이전 채널에서 보낸 요청의 응답은 오지 않는다.
+    session->clip_requests_pending = 0;
+    session->clip_requests_stale = 0;
+    session->clip_request_format = 0;
     CLIPRDR_GENERAL_CAPABILITY_SET general = { 0 };
     CLIPRDR_CAPABILITIES capabilities = { 0 };
     general.capabilitySetType = CB_CAPSTYPE_GENERAL;
@@ -488,6 +532,8 @@ static UINT bridge_cliprdr_server_format_list(
     cliprdr->ClientFormatListResponse(cliprdr, &list_response);
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
     bridge_logf(session, "Clipboard remote format list received: count=%u.", format_list->numFormats);
+    // 이 FL 이전에 보낸 요청의 응답은 Swift 로 보내지 않는다(설계 D-2).
+    session->clip_requests_stale = session->clip_requests_pending;
 
     for (UINT32 index = 0; index < format_list->numFormats; index++) {
         bridge_logf(
@@ -501,21 +547,40 @@ static UINT bridge_cliprdr_server_format_list(
             CLIPRDR_FORMAT_DATA_REQUEST request = { 0 };
             request.common.msgType = CB_FORMAT_DATA_REQUEST;
             request.requestedFormatId = format_list->formats[index].formatId;
-            cliprdr->lastRequestedFormatId = RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW;
             bridge_logf(session, "Clipboard requesting remote file descriptor format: id=%u.", request.requestedFormatId);
-            return cliprdr->ClientFormatDataRequest(cliprdr, &request);
+            const UINT status = cliprdr->ClientFormatDataRequest(cliprdr, &request);
+            if (status == CHANNEL_RC_OK) {
+                session->clip_requests_pending++;
+                session->clip_request_format = RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW;
+            }
+            return status;
         }
         if (format_list->formats[index].formatId == CF_UNICODETEXT) {
             CLIPRDR_FORMAT_DATA_REQUEST request = { 0 };
             request.common.msgType = CB_FORMAT_DATA_REQUEST;
             request.requestedFormatId = CF_UNICODETEXT;
-            cliprdr->lastRequestedFormatId = CF_UNICODETEXT;
             bridge_log(session, "Clipboard requesting remote text format.");
-            return cliprdr->ClientFormatDataRequest(cliprdr, &request);
+            const UINT status = cliprdr->ClientFormatDataRequest(cliprdr, &request);
+            if (status == CHANNEL_RC_OK) {
+                session->clip_requests_pending++;
+                session->clip_request_format = CF_UNICODETEXT;
+            }
+            return status;
         }
     }
 
     return CHANNEL_RC_OK;
+}
+
+// 서버의 로컬 파일 요청에 답할 수 없을 때 FAIL 로 답한다. 무응답이면 서버가 계속 기다린다.
+static UINT bridge_send_file_contents_failure(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_FILE_CONTENTS_REQUEST *request) {
+    CLIPRDR_FILE_CONTENTS_RESPONSE response = { 0 };
+    response.common.msgType = CB_FILECONTENTS_RESPONSE;
+    response.common.msgFlags = CB_RESPONSE_FAIL;
+    response.streamId = request->streamId;
+    return cliprdr->ClientFileContentsResponse(cliprdr, &response);
 }
 
 static UINT bridge_cliprdr_server_file_contents_request(
@@ -528,7 +593,7 @@ static UINT bridge_cliprdr_server_file_contents_request(
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
     if (request->listIndex >= session->local_file_count) {
         bridge_logf(session, "Clipboard local file request rejected: listIndex=%u count=%zu.", request->listIndex, session->local_file_count);
-        return CHANNEL_RC_OK;
+        return bridge_send_file_contents_failure(cliprdr, request);
     }
 
     const RDPBridgeLocalFile *file = &session->local_files[request->listIndex];
@@ -546,12 +611,13 @@ static UINT bridge_cliprdr_server_file_contents_request(
         FILE *handle = fopen(file->path, "rb");
         if (handle == NULL) {
             bridge_logf(session, "Clipboard local file open failed: %s.", file->path);
-            return CHANNEL_RC_OK;
+            return bridge_send_file_contents_failure(cliprdr, request);
         }
         const UINT64 offset = ((UINT64)request->nPositionHigh << 32) | request->nPositionLow;
         if (fseeko(handle, (off_t)offset, SEEK_SET) != 0) {
             fclose(handle);
-            return CHANNEL_RC_OK;
+            bridge_logf(session, "Clipboard local file seek failed: index=%u.", request->listIndex);
+            return bridge_send_file_contents_failure(cliprdr, request);
         }
         response_size = request->cbRequested;
         buffer = (BYTE *)malloc(response_size);
@@ -569,7 +635,8 @@ static UINT bridge_cliprdr_server_file_contents_request(
             request->cbRequested,
             response_size);
     } else {
-        return CHANNEL_RC_OK;
+        bridge_logf(session, "Clipboard local file request has no SIZE or RANGE flag: index=%u.", request->listIndex);
+        return bridge_send_file_contents_failure(cliprdr, request);
     }
 
     CLIPRDR_FILE_CONTENTS_RESPONSE response = { 0 };
@@ -589,20 +656,26 @@ static UINT bridge_cliprdr_server_file_contents_request(
 static UINT bridge_cliprdr_server_file_contents_response(
     CliprdrClientContext *cliprdr,
     const CLIPRDR_FILE_CONTENTS_RESPONSE *response) {
-    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL) ||
-        (response->common.msgFlags != CB_RESPONSE_OK) || (response->requestedData == NULL)) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (response == NULL)) {
         return CHANNEL_RC_OK;
     }
 
+    // 규약(설계 D-3, INV-P2): 모든 응답을 Swift 로 보낸다. payload NULL = FAIL,
+    // OK 는 0바이트여도 NULL 이 아닌 포인터를 준다.
+    static const BYTE empty_contents[1] = { 0 };
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
-    if (session->callbacks.remoteFileContents != NULL) {
-        bridge_logf(session, "Clipboard received remote file contents: stream=%u bytes=%u.", response->streamId, response->cbRequested);
-        session->callbacks.remoteFileContents(
-            response->streamId,
-            response->requestedData,
-            response->cbRequested,
-            session->callbacks.context);
+    if (session->callbacks.remoteFileContents == NULL) {
+        return CHANNEL_RC_OK;
     }
+    if (response->common.msgFlags != CB_RESPONSE_OK) {
+        bridge_logf(session, "Clipboard remote file contents failed: stream=%u flags=0x%04x.", response->streamId, response->common.msgFlags);
+        session->callbacks.remoteFileContents(response->streamId, NULL, 0, session->callbacks.context);
+        return CHANNEL_RC_OK;
+    }
+    const BYTE *payload = (response->requestedData != NULL) ? response->requestedData : empty_contents;
+    const UINT32 length = (response->requestedData != NULL) ? response->cbRequested : 0;
+    bridge_logf(session, "Clipboard received remote file contents: stream=%u bytes=%u.", response->streamId, length);
+    session->callbacks.remoteFileContents(response->streamId, payload, length, session->callbacks.context);
     return CHANNEL_RC_OK;
 }
 

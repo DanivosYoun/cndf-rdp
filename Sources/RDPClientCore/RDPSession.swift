@@ -156,7 +156,8 @@ public final class RDPSession {
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
             // Advance before cancel: a woken materialization must already see it is stale (INV-L2).
-            _ = session.remoteClipboardFreshness.advance()
+            // Both stay on the cliprdr channel thread so a blocked main cannot hold a range wait (D-4).
+            let freshness = session.remoteClipboardFreshness.advance()
             session.remoteFileDownloadManager?.cancelOutstanding()
             let data: Data
             if length == 0 {
@@ -170,8 +171,16 @@ public final class RDPSession {
                 stats.remoteClipboardTextsReceived += 1
                 stats.lastActivityAt = Date()
             }
-            session.clipboardCoordinator?.receiveRemoteText(text)
-            session.delegate?.rdpSession(session, didReceiveRemoteText: text)
+            // The pasteboard, coordinator and delegate are main-thread only (INV-T1, design D-4).
+            DispatchQueue.main.async { [weak session] in
+                guard let session else { return }
+                if session.remoteClipboardFreshness.isNewest(freshness) {
+                    session.withSessionLock {
+                        session.clipboardCoordinator?.receiveRemoteText(text)
+                    }
+                }
+                session.delegate?.rdpSession(session, didReceiveRemoteText: text)
+            }
         }
         callbacks.remoteFileList = { bytes, length, context in
             guard let bytes, let context else { return }
@@ -188,20 +197,21 @@ public final class RDPSession {
                 stats.remoteFileBytesReceived += files.reduce(UInt64(0)) { $0 + $1.byteCount }
                 stats.lastActivityAt = Date()
             }
-            session.delegate?.rdpSession(session, didReceiveRemoteFiles: files)
+            DispatchQueue.main.async { [weak session] in
+                guard let session else { return }
+                session.delegate?.rdpSession(session, didReceiveRemoteFiles: files)
+            }
             session.materializeRemoteFiles(decoded, freshness: freshness)
         }
         callbacks.remoteFileContents = { streamId, bytes, length, context in
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
-            let data: Data
-            if length == 0 {
-                data = Data()
-            } else {
-                guard let bytes else { return }
-                data = Data(bytes: bytes, count: length)
+            // Bridge contract (design D-3, INV-P2): a NULL payload is a FileContents FAIL.
+            guard let bytes else {
+                session.remoteFileDownloadManager?.fail(streamId: streamId)
+                return
             }
-            session.remoteFileDownloadManager?.receive(streamId: streamId, data: data)
+            session.remoteFileDownloadManager?.receive(streamId: streamId, data: Data(bytes: bytes, count: length))
         }
         callbacks.frame = { bytes, width, height, stride, context in
             guard let bytes, let context else { return }

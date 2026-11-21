@@ -94,6 +94,60 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertEqual(stagedNames, [])
     }
 
+    // MARK: Chunk length (design D-5, INV-C1)
+
+    /// A manager whose range replies come from `replies` in order.
+    private func scriptedManager(_ replies: [Data]) -> (RDPRemoteFileDownloadManager, () -> [UInt32]) {
+        let lock = NSLock()
+        var queue = replies
+        var lengths: [UInt32] = []
+        let manager = RDPRemoteFileDownloadManager(staging: staging) { _, _, _, _ in }
+        manager.requestRange = { [weak manager] stream, _, _, length in
+            lock.lock()
+            lengths.append(length)
+            let reply = queue.isEmpty ? Data() : queue.removeFirst()
+            lock.unlock()
+            manager?.receive(streamId: stream, data: reply)
+        }
+        return (manager, { lock.lock(); defer { lock.unlock() }; return lengths })
+    }
+
+    // T-C1
+    func testEmptyChunkFailsTheListAndLeavesNothing() throws {
+        let (manager, _) = scriptedManager([Data()])
+        XCTAssertThrowsError(try manager.materialize([RDPFileListEntry(fileName: "a.txt", byteCount: 3, localURL: nil)])) {
+            XCTAssertEqual($0 as? RDPRemoteFileDownloadManager.ChunkError, .truncated)
+        }
+        XCTAssertEqual(stagedNames, [])
+    }
+
+    // T-C2
+    func testEmptyChunkAfterAShortChunkFailsTheList() throws {
+        let (manager, lengths) = scriptedManager([Data("ab".utf8), Data()])
+        XCTAssertThrowsError(try manager.materialize([RDPFileListEntry(fileName: "a.txt", byteCount: 3, localURL: nil)])) {
+            XCTAssertEqual($0 as? RDPRemoteFileDownloadManager.ChunkError, .truncated)
+        }
+        XCTAssertEqual(lengths(), [3, 1])
+        XCTAssertEqual(stagedNames, [])
+    }
+
+    // T-C3
+    func testShortNonEmptyChunksAreAccepted() throws {
+        let (manager, lengths) = scriptedManager([Data("a".utf8), Data("b".utf8), Data("c".utf8)])
+        let urls = try manager.materialize([RDPFileListEntry(fileName: "a.txt", byteCount: 3, localURL: nil)])
+        XCTAssertEqual(lengths(), [3, 2, 1])
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(urls.first)), Data("abc".utf8))
+    }
+
+    // T-C4
+    func testOverlongChunkFailsTheListAndWritesNothing() throws {
+        let (manager, _) = scriptedManager([Data("abcd".utf8)])
+        XCTAssertThrowsError(try manager.materialize([RDPFileListEntry(fileName: "a.txt", byteCount: 3, localURL: nil)])) {
+            XCTAssertEqual($0 as? RDPRemoteFileDownloadManager.ChunkError, .overlong)
+        }
+        XCTAssertEqual(stagedNames, [])
+    }
+
     // MARK: FreeRDP session
 
     private func freeRDPSession(_ server: RangeServer) throws -> (RDPSession, FakePasteboard, FakeSink, LogRecorder) {
@@ -171,6 +225,65 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertTrue(waitUntil { recorder.count(prefix: "Remote file materialization superseded") == 1 })
         XCTAssertEqual(pasteboard.text, "T")
         XCTAssertEqual(stagedNames, [])
+    }
+
+    // T-F1 (design D-3): a NULL FileContents payload is a FAIL and ends the wait at once.
+    func testFreeRDPFileContentsFailEndsTheWaitWithoutTruncation() throws {
+        let server = RangeServer()
+        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
+        sendFreeRDPList([("a.txt", 3)], to: session)
+        XCTAssertTrue(waitUntil { server.requests.count == 1 })
+        let stream = try XCTUnwrap(server.requests.first).stream
+        session.callbacks.remoteFileContents?(stream, nil, 0, session.callbacks.context)
+        XCTAssertTrue(waitUntil(timeout: 1) { recorder.count(prefix: "Remote file materialization failed:") == 1 })
+        XCTAssertEqual(recorder.count(prefix: "Remote file materialization failed: truncated"), 0)
+        XCTAssertEqual(stagedNames, [])
+        XCTAssertNil(pasteboard.fileURLs)
+    }
+
+    private func sendFreeRDPText(_ text: String, to session: RDPSession) {
+        Array(text.utf8).withUnsafeBufferPointer {
+            session.callbacks.remoteText?($0.baseAddress, $0.count, session.callbacks.context)
+        }
+    }
+
+    // T-T1 (design D-4, INV-T1): remote text from the channel thread is written on main.
+    func testFreeRDPRemoteTextFromChannelThreadWritesOnMain() throws {
+        let (session, pasteboard, _, _) = try freeRDPSession(RangeServer())
+        DispatchQueue.global().async { self.sendFreeRDPText("T", to: session) }
+        XCTAssertTrue(waitUntil { pasteboard.text == "T" })
+        XCTAssertEqual(pasteboard.textWritesOffMain, 0)
+    }
+
+    // T-T2: cancel stays on the channel thread, so a blocked main does not hold the range wait.
+    func testFreeRDPRemoteTextCancelsTheRangeWhileMainIsBlocked() throws {
+        let server = RangeServer()
+        let (session, _, _, _) = try freeRDPSession(server)
+        let manager = try XCTUnwrap(session.remoteFileDownloadManager)
+        let failed = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            do {
+                _ = try manager.materialize([RDPFileListEntry(fileName: "a.txt", byteCount: 3, localURL: nil)])
+            } catch {
+                failed.signal()
+            }
+        }
+        XCTAssertTrue(waitUntil { server.requests.count == 1 })
+        DispatchQueue.global().async { self.sendFreeRDPText("T", to: session) }
+        // Main is held here; the wait has to fail without main running.
+        XCTAssertEqual(failed.wait(timeout: .now() + 2), .success)
+    }
+
+    // T-T3: two texts back to back from the channel thread leave the second on the pasteboard.
+    func testFreeRDPTwoRemoteTextsLeaveTheSecond() throws {
+        let (session, pasteboard, _, _) = try freeRDPSession(RangeServer())
+        DispatchQueue.global().async {
+            self.sendFreeRDPText("T1", to: session)
+            self.sendFreeRDPText("T2", to: session)
+        }
+        XCTAssertTrue(waitUntil { pasteboard.text == "T2" })
+        _ = waitUntil(timeout: 0.2) { false }
+        XCTAssertEqual(pasteboard.text, "T2")
     }
 
     // S3 (FreeRDP): disconnect while a range waits ends it at once and leaves nothing staged.
@@ -418,6 +531,9 @@ private final class FakePasteboard: PasteboardClient {
     private let lock = NSLock()
     private var count = 0
     private var payload: ClipboardPayload?
+    private var offMainTextWrites = 0
+
+    var textWritesOffMain: Int { lock.lock(); defer { lock.unlock() }; return offMainTextWrites }
 
     var changeCount: Int { lock.lock(); defer { lock.unlock() }; return count }
     var text: String? { if case .text(let text)? = readPayload() { return text }; return nil }
@@ -425,7 +541,13 @@ private final class FakePasteboard: PasteboardClient {
 
     func copyLocally(_ text: String) { writeText(text) }
     func readPayload() -> ClipboardPayload? { lock.lock(); defer { lock.unlock() }; return payload }
-    func writeText(_ text: String) { lock.lock(); payload = .text(text); count += 1; lock.unlock() }
+    func writeText(_ text: String) {
+        lock.lock()
+        payload = .text(text)
+        count += 1
+        if !Thread.isMainThread { offMainTextWrites += 1 }
+        lock.unlock()
+    }
     func writeFileURLs(_ urls: [URL]) { lock.lock(); payload = .fileURLs(urls); count += 1; lock.unlock() }
 }
 
