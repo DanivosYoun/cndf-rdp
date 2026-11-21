@@ -326,7 +326,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=21\0"
+            " ironrdp=15b4a03ff552 patches=22\0"
         );
         version.as_ptr().cast()
     })
