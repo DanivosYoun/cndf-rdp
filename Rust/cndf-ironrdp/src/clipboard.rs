@@ -184,7 +184,8 @@ pub(super) fn run_stub(connection: &Connection, commands: Receiver<ClipboardComm
     }
 }
 
-const MAX_FILE_RANGE_LENGTH: u32 = 64 * 1024 * 1024;
+/// The largest RANGE served, 64 times the 256 KiB Windows requests.
+const MAX_FILE_RANGE_LENGTH: u32 = 16 * 1024 * 1024;
 
 fn read_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
     if length > MAX_FILE_RANGE_LENGTH || offset.checked_add(u64::from(length))? > file.size {
@@ -264,6 +265,29 @@ mod real {
     };
     use ironrdp_core::IntoOwned;
     use std::collections::{HashSet, VecDeque};
+    use tokio::sync::oneshot;
+
+    /// RANGE responses served at once, counted from acceptance until the session handles the frame.
+    const MAX_RANGE_RESPONSES_IN_FLIGHT: usize = 16;
+    /// RANGE bytes reserved over the same span: two of the largest requests.
+    const MAX_RANGE_BYTES_IN_FLIGHT: u64 = 2 * MAX_FILE_RANGE_LENGTH as u64;
+
+    fn pending(completion: &mut oneshot::Receiver<()>) -> bool {
+        matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    /// Bytes the RANGE read allocates: the requested length clipped at end of file, or nothing.
+    fn range_length(file: &LocalFile, offset: u64, length: u32) -> u64 {
+        if length > MAX_FILE_RANGE_LENGTH {
+            return 0;
+        }
+        file.size
+            .checked_sub(offset)
+            .map_or(0, |available| u64::from(length).min(available))
+    }
 
     fn read_file_contents_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
         if length > MAX_FILE_RANGE_LENGTH {
@@ -318,6 +342,25 @@ mod real {
         deferred_paste: Option<(ClipboardFormatId, bool)>,
         pastes: VecDeque<bool>,
         requests: HashSet<u32>,
+        /// RANGE responses accepted for the server and not yet handled by the session.
+        range_responses: Vec<(oneshot::Receiver<()>, u64)>,
+    }
+
+    impl State {
+        /// Reserves `bytes` for one RANGE response, or returns `None` if the budget is spent.
+        fn reserve_range(&mut self, bytes: u64) -> Option<oneshot::Sender<()>> {
+            self.range_responses
+                .retain_mut(|(completion, _)| pending(completion));
+            let reserved: u64 = self.range_responses.iter().map(|(_, bytes)| bytes).sum();
+            if self.range_responses.len() >= MAX_RANGE_RESPONSES_IN_FLIGHT
+                || reserved + bytes > MAX_RANGE_BYTES_IN_FLIGHT
+            {
+                return None;
+            }
+            let (completion, handled) = oneshot::channel();
+            self.range_responses.push((handled, bytes));
+            Some(completion)
+        }
     }
 
     #[derive(Clone)]
@@ -628,23 +671,39 @@ mod real {
         }
 
         fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-            let file = lock(&self.0.state)
-                .advertised
-                .get(request.index as usize)
-                .cloned();
+            let mut state = lock(&self.0.state);
+            let file = state.advertised.get(request.index as usize).cloned();
             let stream = request.stream_id;
             if let Some(file) = file
                 .as_ref()
                 .filter(|_| request.flags == FileContentsFlags::SIZE)
             {
+                drop(state);
                 self.0.send(Message::SendFileContentsResponse(
                     FileContentsResponse::new_size_response(stream, file.size),
                 ));
                 return;
             }
+            let length = request.requested_size;
+            let bytes = file
+                .as_deref()
+                .map_or(0, |file| range_length(file, request.position, length));
+            let completion = state.reserve_range(bytes);
+            drop(state);
+            let Some(completion) = completion else {
+                self.0.send(Message::SendFileContentsResponse(
+                    FileContentsResponse::new_error(stream),
+                ));
+                self.0.queue(move |connection| {
+                    connection.clip_log(
+                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                        &format!("Clipboard RANGE failed reason=budget length={length}"),
+                    );
+                });
+                return;
+            };
             let input = self.0.input.clone();
             self.0.queue(move |connection| {
-                let length = request.requested_size;
                 let data = file.ok_or("missing-file").and_then(|file| {
                     read_file_contents_range(&file, request.position, length).ok_or("range-read")
                 });
@@ -658,7 +717,11 @@ mod real {
                         FileContentsResponse::new_error(stream)
                     }
                 };
-                let _ = input.send_clipboard(Message::SendFileContentsResponse(response));
+                // The session drops or signals the completion once it has handled the frame.
+                let _ = input.send_clipboard_with_completion(
+                    Message::SendFileContentsResponse(response),
+                    completion,
+                );
             });
         }
 
@@ -930,6 +993,199 @@ mod real {
                     "Clipboard RANGE failed reason=missing-file length=8",
                 ]
             );
+        }
+
+        fn range_connection(logs: &mut Vec<String>) -> Connection {
+            extern "C" fn record_log(
+                _: u64,
+                _: CNDFIronLogLevel,
+                bytes: *const u8,
+                length: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+                unsafe { &mut *context.cast::<Vec<String>>() }
+                    .push(String::from_utf8_lossy(bytes).into_owned());
+            }
+            Connection {
+                generation: 1,
+                connected: AtomicBool::new(true),
+                stop: AtomicBool::new(false),
+                input: Mutex::default(),
+                clipboard: Mutex::default(),
+                log_level: CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                callbacks: Arc::new(Callbacks {
+                    table: CNDFIronCallbacks {
+                        log: Some(record_log),
+                        context: (logs as *mut Vec<String>).cast(),
+                        ..unsafe { std::mem::zeroed() }
+                    },
+                    gate: Mutex::default(),
+                    closed: AtomicBool::new(false),
+                }),
+                statistics: Arc::default(),
+            }
+        }
+
+        /// Removes the fixture even when an assertion fails.
+        struct Fixture(std::path::PathBuf);
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        /// A file the backend offers, sparse so reads cost no disk space.
+        fn offered_sparse_file(
+            name: &str,
+            size: u64,
+        ) -> (
+            Fixture,
+            Channel,
+            CndfCliprdrBackend,
+            mpsc::Receiver<Job>,
+            tokio::sync::mpsc::UnboundedReceiver<ironrdp_client::rdp::RdpInputEvent>,
+        ) {
+            let path =
+                std::env::temp_dir().join(format!("cndf-iron-{name}-{}", std::process::id()));
+            let file = std::fs::File::create_new(&path).unwrap();
+            let fixture = Fixture(path.clone());
+            file.set_len(size).unwrap();
+            drop(file);
+            let (input, _events, ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (work, jobs) = mpsc::channel();
+            let channel = Channel::new(input, work);
+            let mut backend = CndfCliprdrBackend(channel.clone());
+            backend.on_process_negotiated_capabilities(Capabilities::STREAM_FILECLIP_ENABLED);
+            backend.on_ready();
+            channel.submit(ClipboardCommand::Files(vec![LocalFile {
+                path: path.to_str().unwrap().to_owned(),
+                name: name.into(),
+                size,
+            }]));
+            (fixture, channel, backend, jobs, ordered)
+        }
+
+        fn range(stream_id: u32, position: u64, requested_size: u32) -> FileContentsRequest {
+            FileContentsRequest {
+                stream_id,
+                index: 0,
+                flags: FileContentsFlags::RANGE,
+                position,
+                requested_size,
+                data_id: None,
+            }
+        }
+
+        /// Data responses still queued, as a session that cannot write would hold them.
+        type Held = Vec<(u32, usize, oneshot::Sender<()>)>;
+
+        fn drain(
+            ordered: &mut tokio::sync::mpsc::UnboundedReceiver<ironrdp_client::rdp::RdpInputEvent>,
+            held: &mut Held,
+        ) -> Vec<u32> {
+            use ironrdp_client::rdp::RdpInputEvent;
+            let mut failed = Vec::new();
+            while let Ok(event) = ordered.try_recv() {
+                match event {
+                    RdpInputEvent::ClipboardWithCompletion(
+                        Message::SendFileContentsResponse(response),
+                        completion,
+                    ) if !response.is_error() => {
+                        held.push((response.stream_id(), response.data().len(), completion));
+                    }
+                    RdpInputEvent::Clipboard(Message::SendFileContentsResponse(response))
+                        if response.is_error() =>
+                    {
+                        failed.push(response.stream_id());
+                    }
+                    RdpInputEvent::Clipboard(Message::SendInitiateFileCopy(_)) => {}
+                    other => panic!("unexpected clipboard event {other:?}"),
+                }
+            }
+            failed
+        }
+
+        // oracle: mutant releasing a reservation when the RANGE is read or queued instead of when
+        // the session handles its frame, or skipping the byte or count limit.
+        #[test]
+        fn range_responses_stay_within_budget_while_the_session_cannot_write() {
+            const MIB: u32 = 1024 * 1024;
+            let mut logs = Vec::new();
+            let connection = range_connection(&mut logs);
+            let (_fixture, _channel, mut backend, jobs, mut ordered) =
+                offered_sparse_file("range-budget", 1 << 30);
+            let mut held = Held::new();
+
+            // Count limit: 100 small requests in one burst.
+            for stream_id in 0..100 {
+                backend.on_file_contents_request(range(
+                    stream_id,
+                    u64::from(stream_id) * u64::from(MIB),
+                    MIB,
+                ));
+            }
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            let failed = drain(&mut ordered, &mut held);
+            assert_eq!(held.len(), MAX_RANGE_RESPONSES_IN_FLIGHT);
+            assert_eq!(failed, (16..100).collect::<Vec<_>>());
+
+            // Nothing more is served until the session writes a held frame.
+            backend.on_file_contents_request(range(100, 0, MIB));
+            assert_eq!(drain(&mut ordered, &mut held), [100]);
+            let (_, _, written) = held.remove(0);
+            let _ = written.send(());
+            backend.on_file_contents_request(range(101, 0, MIB));
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            assert!(drain(&mut ordered, &mut held).is_empty());
+            assert_eq!(held.len(), MAX_RANGE_RESPONSES_IN_FLIGHT);
+
+            // Byte limit: the largest requests fit twice.
+            for (_, _, completion) in held.drain(..) {
+                let _ = completion.send(());
+            }
+            for stream_id in 200..204 {
+                backend.on_file_contents_request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH));
+            }
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            assert_eq!(drain(&mut ordered, &mut held), [202, 203]);
+            let queued: usize = held.iter().map(|(_, bytes, _)| bytes).sum();
+            assert_eq!(queued as u64, MAX_RANGE_BYTES_IN_FLIGHT);
+            assert!(logs.iter().all(|line| !line.contains('/')));
+            assert_eq!(
+                logs.iter()
+                    .filter(|line| line.contains("reason=budget"))
+                    .count(),
+                84 + 1 + 2
+            );
+        }
+
+        // oracle: mutant keeping a reservation whose frame or job the session or clip thread dropped.
+        #[test]
+        fn dropped_responses_and_jobs_release_their_reservations() {
+            let mut logs = Vec::new();
+            let connection = range_connection(&mut logs);
+            let (_fixture, channel, mut backend, jobs, mut ordered) =
+                offered_sparse_file("range-release", 1 << 30);
+            let mut held = Held::new();
+            for stream_id in 0..2 {
+                backend.on_file_contents_request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH));
+            }
+            // One response reaches the queue and is discarded there; the other job never runs.
+            jobs.try_recv().unwrap()(&connection);
+            drain(&mut ordered, &mut held);
+            assert_eq!(held.len(), 1);
+            held.clear();
+            drop(jobs);
+            let mut state = lock(&channel.state);
+            assert!(state.reserve_range(MAX_RANGE_BYTES_IN_FLIGHT).is_some());
         }
 
         #[test]
