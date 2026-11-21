@@ -17,6 +17,12 @@ struct HarnessRun: Decodable {
     /// Name of the environment variable holding the password (never put secrets in JSON).
     var passwordEnv: String?
     var domain: String?
+    var enableClipboard: Bool?
+    /// Share a fresh directory named Home for this iteration.
+    var shareHome: Bool?
+    /// RDPAudioPlaybackMode raw value, default 0 (off).
+    var audioMode: UInt32?
+    var fixturePort: UInt16?
     /// "auto" or "compat" (RDPGraphicsMode raw values).
     var graphicsMode: String?
     /// RDPConnectionOptions.networkAutoDetect (app default false). Default false.
@@ -37,7 +43,7 @@ struct HarnessRun: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case id, host, port, username, passwordEnv, domain, graphicsMode, networkAutoDetect, window, steps, expect
-        case engine, expectByEngine
+        case engine, expectByEngine, enableClipboard, shareHome, audioMode, fixturePort
         case promptAnswer
         case repeatCount = "repeat"
     }

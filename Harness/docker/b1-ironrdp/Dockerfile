@@ -9,8 +9,10 @@ RUN git init -q /src && cd /src \
  && git fetch -q --depth 1 origin "${IRONRDP_COMMIT}" \
  && git checkout -q --detach FETCH_HEAD
 WORKDIR /src
+COPY m3-channel-probe.patch /m3-channel-probe.patch
+RUN git apply /m3-channel-probe.patch
 RUN cargo build --locked --release -p ironrdp --example server \
-      --features cliprdr,connector,rdpsnd,server \
+      --features cliprdr,connector,core,dvc,pdu,rdpsnd,server \
  && cp target/release/examples/server /ironrdp-server
 
 FROM debian:bookworm-slim

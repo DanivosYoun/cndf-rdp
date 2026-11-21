@@ -68,3 +68,23 @@ Mac Studio, macOS 27.0.1):
 The `previous` stage (TLS >= 1.0, SECLEVEL 1) fails against both legacy servers; only the
 `legacy` stage (SECLEVEL 0) connects. FreeRDP's first frame takes ~17 s on every profile
 against xrdp here (also at `default` on TLS 1.2), IronRDP ~0.55 s; cause not investigated.
+
+### M3 channel checks
+
+Run `HARNESS_BATCH=<batch8> Scripts/run-engine-harness.sh m3-b1` on the Docker host
+after integrating the M3 Swift adapter. The optional second argument selects one engine
+(`freerdp` or `ironrdp`). B1 starts afresh for each engine. The output directory contains
+the client result, the server log and `b1-channels.json` per engine. The server records
+static channel names from GCC and the audio bits from Client Info. For the two audio
+DVCs it records replies to actual server Create requests. An absent reply is incomplete
+evidence. The script diffs the two sets of observations when running both engines.
+
+The [Linux baseline](baselines/2026-11-21-freerdp-linux/m3-b1-channels.json) ran the fork's
+unchanged FreeRDP C bridge against FreeRDP 3.33.1 in a Linux container, with WinPR verbose
+assertions disabled as in the macOS build. It establishes the observed advertising and
+DVC responses for that build. It does not measure macOS playback or Windows behavior.
+
+`HARNESS_BATCH=<batch8> Scripts/run-engine-harness.sh m3-b3` checks whether the xrdp
+session can read a fixture via the redirected Home drive and write a file back. This
+mode requires access to `/dev/fuse` and uses a fresh B3 container per engine. Its fixture
+accepts only the harness token and provides fixed drive and xclip operations.

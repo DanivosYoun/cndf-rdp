@@ -39,6 +39,8 @@ LABEL="roster.batch=${HARNESS_BATCH}"
 B1_IMAGE="cndf-harness-b1-ironrdp:${HARNESS_BATCH}"
 B2_IMAGE="cndf-harness-b2-freerdp-shadow:${HARNESS_BATCH}"
 B3_IMAGE="danielguerra/ubuntu-xrdp@sha256:1a00da32f4e486f2f5fd8f656fc23bb235987c219153a587894469cad300b12d"
+B3_M3_IMAGE="cndf-harness-b3-xrdp:${HARNESS_BATCH}"
+PORT_B3_FIXTURE=33898
 B4_IMAGE="cndf-harness-b4-legacy-tls:${HARNESS_BATCH}"
 PORT_B1=33891 PORT_B1_CHAIN=33892 PORT_B2=33893 PORT_B3=33894
 PORT_B4_TLS10=33895 PORT_B4_TLS11=33896 PORT_B4_TLS12=33897
@@ -67,6 +69,9 @@ secrets() {
       echo "HARNESS_B3_PASS=$(openssl rand -hex 12)"
     } > "${WORK}/secrets.env"
     chmod 600 "${WORK}/secrets.env"
+  fi
+  if ! grep -q '^HARNESS_B3_FIXTURE_TOKEN=' "${WORK}/secrets.env"; then
+    printf 'HARNESS_B3_FIXTURE_TOKEN=%s\n' "$(openssl rand -hex 24)" >> "${WORK}/secrets.env"
   fi
   [[ -f "${c}/a.pem" ]] && return
   local subj
@@ -98,6 +103,7 @@ start_b1() {
   pass="$(sed -n 's/^HARNESS_B1_PASS=//p' "${WORK}/secrets.env")"
   docker rm -fv "$(name b1)" >/dev/null 2>&1 || true
   docker run -d --label "${LABEL}" --name "$(name b1)" -p "${BIND_IP}:${PORT_B1}:3389" \
+    -e IRONRDP_LOG=info -e NO_COLOR=1 \
     -v "${WORK}/certs:/certs:ro" "${B1_IMAGE}" \
     --sec hybrid --user harness --pass "${pass}" --cert "/certs/${cert}.pem" --key "/certs/${cert}-key.pem" >/dev/null
   wait_port "${PORT_B1}"
@@ -164,6 +170,11 @@ mac_build() {
   rsync -a --delete --mkpath --exclude .git --exclude .build --exclude Vendor \
     --rsync-path=/opt/homebrew/bin/rsync "${ROOT_DIR}/" "${MAC}:${MAC_DIR}/cndf-rdp/"
   mac "set -euo pipefail; export ${MAC_PATH}; M=\$HOME/${MAC_DIR}
+    lock=\$HOME/xcode-work/.swift.lock
+    shlock -f \"\$lock\" -p \$\$ || { echo 'Mac Swift build lock is occupied' >&2; exit 1; }
+    trap 'rm -f \"\$lock\"' EXIT
+    mkdir -p \"\$M/tmp\"
+    export TMPDIR=\$M/tmp
     cd \$M/cndf-rdp
     [[ -f Vendor/FreeRDP/install/lib/libfreerdp3.dylib ]] || bash Scripts/build-freerdp.sh > \$M/freerdp-build.log 2>&1
     [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh --features legacy-tls > \$M/ironrdp-build.log 2>&1
@@ -181,6 +192,7 @@ run_scenario() {
   set +e
   mac "set -a; source \$HOME/${MAC_DIR}/secrets.env; set +a; M=\$HOME/${MAC_DIR}
     mkdir -p \$M/home \$M/results \$M/work
+    rm -f \$M/results/${base}.json
     HOME=\$M/home \$M/cndf-rdp/.build/release/rdp-engine-harness \
       --scenario \$M/scenarios/${base}.json --out \$M/results/${base}.json --engine ${ENGINE} \
       --trust-suite cndf.rdp-engine-harness.${HARNESS_BATCH} --work-dir \$M/work $*" \
@@ -276,6 +288,74 @@ legacy_tls_scenarios() {
   log "results in ${WORK}/results"
 }
 
+m3_channels() {
+  local engine="$1"
+  local scenario="${ROOT_DIR}/Harness/docker/scenarios/m3-b1-channels.json"
+  mkdir -p "${WORK}/results/${engine}"
+  # Start a fresh B1 per engine so its records contain only this scenario's connections.
+  start_b1 a
+  ENGINE="$engine" run_scenario "$scenario" --reset-trust 1 --drop-trust 1
+  docker logs "$(name b1)" > "${WORK}/results/${engine}/b1-server.log" 2>&1
+  mv "${WORK}/results"/m3-b1-channels.* "${WORK}/results/${engine}/"
+  python3 "${ROOT_DIR}/Harness/docker/b1-ironrdp/channel-results.py" \
+    "$scenario" "${WORK}/results/${engine}/b1-server.log" > "${WORK}/results/${engine}/b1-channels.json"
+}
+
+m3_b1() {
+  local requested_engine="${1:-both}"
+  case "$requested_engine" in
+    both|freerdp|ironrdp) ;;
+    *) echo "expected both, freerdp or ironrdp" >&2; return 2 ;;
+  esac
+  local avail
+  avail="$(free -g | awk '/^Mem:/ {print $7}')"
+  (( avail >= 20 )) || { log "less than 20G available"; return 1; }
+  docker build --label "${LABEL}" -t "${B1_IMAGE}" "${ROOT_DIR}/Harness/docker/b1-ironrdp"
+  secrets
+  mac_build
+  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
+  tunnel_up "${PORT_B1}"
+  if [[ "$requested_engine" != ironrdp ]]; then m3_channels freerdp; fi
+  if [[ "$requested_engine" != freerdp ]]; then m3_channels ironrdp; fi
+  if [[ "$requested_engine" == both ]]; then
+    diff -u "${WORK}/results/freerdp/b1-channels.json" "${WORK}/results/ironrdp/b1-channels.json"
+  fi
+}
+
+m3_b3() {
+  local requested_engine="${1:-both}" engine avail
+  case "$requested_engine" in
+    both|freerdp|ironrdp) ;;
+    *) echo "expected both, freerdp or ironrdp" >&2; return 2 ;;
+  esac
+  avail="$(free -g | awk '/^Mem:/ {print $7}')"
+  (( avail >= 20 )) || { log "less than 20G available"; return 1; }
+  [[ -c /dev/fuse ]] || { log "B3 drive requires /dev/fuse"; return 1; }
+  docker build --label "${LABEL}" -t "${B3_M3_IMAGE}" "${ROOT_DIR}/Harness/docker/b3-xrdp"
+  secrets
+  # shellcheck disable=SC1091
+  source "${WORK}/secrets.env"
+  mac_build
+  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
+  tunnel_up "${PORT_B3}" "${PORT_B3_FIXTURE}"
+  printf '999 harness %s sudo\n' "$(openssl passwd -6 "${HARNESS_B3_PASS}")" > "${WORK}/users.list"
+  chmod 644 "${WORK}/users.list"
+  for engine in freerdp ironrdp; do
+    [[ "$requested_engine" == both || "$requested_engine" == "$engine" ]] || continue
+    docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
+    docker run -d --label "${LABEL}" --name "$(name b3)" --device /dev/fuse --cap-add SYS_ADMIN \
+      -p "${BIND_IP}:${PORT_B3}:3389" -p "${BIND_IP}:${PORT_B3_FIXTURE}:8080" \
+      -e HARNESS_B3_FIXTURE_TOKEN="${HARNESS_B3_FIXTURE_TOKEN}" \
+      -v "${WORK}/users.list:/etc/users.list:ro" "${B3_M3_IMAGE}" >/dev/null
+    wait_port "${PORT_B3}"
+    docker exec -d "$(name b3)" python3 /opt/harness-fixture.py
+    wait_port "${PORT_B3_FIXTURE}"
+    mkdir -p "${WORK}/results/${engine}"
+    ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/m3-b3-home.json" --reset-trust 1 --drop-trust 1
+    mv "${WORK}/results"/m3-b3-home.* "${WORK}/results/${engine}/"
+  done
+}
+
 down() {
   local n
   for n in b1 b1chain b2 b3 b4tls10 b4tls11 b4tls12; do
@@ -297,6 +377,14 @@ case "${1:-}" in
   mac-build) mac_build ;;
   scenarios) scenarios ;;
   down) down ;;
+  m3-b3)
+    trap down EXIT
+    m3_b3 "${2:-both}"
+    ;;
+  m3-b1)
+    trap down EXIT
+    m3_b1 "${2:-both}"
+    ;;
   legacy-tls)
     trap down EXIT
     legacy_tls_up
@@ -311,7 +399,7 @@ case "${1:-}" in
     scenarios
     ;;
   *)
-    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls" >&2
+    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls|m3-b1|m3-b3 [both|freerdp|ironrdp]" >&2
     exit 2
     ;;
 esac

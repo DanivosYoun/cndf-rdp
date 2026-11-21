@@ -314,6 +314,32 @@ private func waitUntil(_ timeout: TimeInterval, _ condition: () -> Bool) -> Bool
     return condition()
 }
 
+/// Leave the main run loop active: xclip and FUSE may need a response from this client.
+private func fixtureRequest(port: UInt16, path: String, body: Data?, timeout: TimeInterval) -> Data? {
+    guard let token = ProcessInfo.processInfo.environment["HARNESS_B3_FIXTURE_TOKEN"],
+          let url = URL(string: "http://127.0.0.1:\(port)/\(path)") else { return nil }
+    var request = URLRequest(url: url, timeoutInterval: timeout)
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    if let body {
+        request.httpMethod = "POST"
+        request.httpBody = body
+    }
+    var responseBody: Data?
+    var completed = false
+    let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+        DispatchQueue.main.async {
+            if (response as? HTTPURLResponse)?.statusCode == 200 { responseBody = data }
+            completed = true
+        }
+    }
+    task.resume()
+    guard waitUntil(timeout, { completed }) else {
+        task.cancel()
+        return nil
+    }
+    return responseBody
+}
+
 private func milliseconds(_ seconds: CFTimeInterval) -> Double {
     (seconds * 1000 * 10).rounded() / 10
 }
@@ -352,13 +378,37 @@ private func runIteration(
     let password = run.passwordEnv.flatMap { ProcessInfo.processInfo.environment[$0] }
     let logURL = workDirectory.appendingPathComponent("\(run.id)-\(iteration).session.log")
     try? FileManager.default.removeItem(at: logURL)
+    let driveURL = run.shareHome == true
+        ? workDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        : nil
+    if let driveURL {
+        do {
+            try FileManager.default.createDirectory(at: driveURL, withIntermediateDirectories: false)
+        } catch {
+            result.failure = "driveFixtureFailed"
+            result.failureDetail = String(describing: error)
+            return result
+        }
+    }
+    defer {
+        if let driveURL { try? FileManager.default.removeItem(at: driveURL) }
+    }
+    let audioMode = RDPAudioPlaybackMode(rawValue: run.audioMode ?? 0)
+    guard let audioMode else {
+        result.failure = "invalidAudioMode"
+        return result
+    }
     let options = RDPConnectionOptions(
         host: run.host,
         port: run.port,
         username: run.username,
         securePassword: password.map(RDPSecureString.init),
         domain: run.domain,
-        enableClipboard: false,
+        enableClipboard: run.enableClipboard ?? false,
+        enableDriveRedirection: driveURL != nil,
+        redirectedFolderPath: driveURL?.path,
+        redirectedFolderName: driveURL.map { _ in "Home" },
+        audioPlaybackMode: audioMode,
         logFileURL: logURL,
         logLevel: .info,
         networkAutoDetect: run.networkAutoDetect ?? false,
@@ -516,6 +566,26 @@ private func runIteration(
                 drainRunLoop((step.intervalMs ?? 50) / 1000)
             }
             result.steps.append("scroll:\(unit)x\(max(deltas.count, deltasX.count)) \(seen.joined())")
+        case "driveExpect":
+            guard let driveURL, let fixturePort = run.fixturePort else {
+                result.steps.append("driveExpect:failed")
+                aborted = true
+                continue
+            }
+            let readFile = driveURL.appendingPathComponent("k3-read.txt")
+            let writeFile = driveURL.appendingPathComponent("k3-write.txt")
+            let seed = Data("k3-read".utf8)
+            do {
+                try seed.write(to: readFile)
+                let readBack = fixtureRequest(port: fixturePort, path: "drive", body: Data(), timeout: step.timeout ?? 10)
+                let writeBack = try? Data(contentsOf: writeFile)
+                let ok = readBack == seed && writeBack == Data("k3-write".utf8)
+                result.steps.append("driveExpect:\(ok ? "ok" : "failed")")
+                aborted = !ok
+            } catch {
+                result.steps.append("driveExpect:failed")
+                aborted = true
+            }
         case "shutdown":
             result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {
@@ -633,6 +703,9 @@ func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?)
     }
     if expect?.failure != iteration.failure {
         failures.append("\(prefix) failure=\(iteration.failure ?? "nil"), expected \(expect?.failure ?? "nil")")
+    }
+    for step in iteration.steps where step.hasSuffix(":failed") || step.hasSuffix(":unknown") {
+        failures.append("\(prefix) \(step)")
     }
     guard let expect else { return failures }
     if let connected = expect.connected, connected != iteration.connected {

@@ -1,0 +1,77 @@
+diff --git a/crates/ironrdp-acceptor/src/connection.rs b/crates/ironrdp-acceptor/src/connection.rs
+index 36648cc4..7a43f1ce 100644
+--- a/crates/ironrdp-acceptor/src/connection.rs
++++ b/crates/ironrdp-acceptor/src/connection.rs
+@@ -1320,6 +1320,10 @@ impl Sequence for Acceptor {
+                 debug!(message = ?settings_initial, "Received");
+ 
+                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
++                let channel_names: Vec<_> = gcc_blocks.network.iter().flat_map(|network| {
++                    network.channels.iter().filter_map(|channel| channel.name.as_str())
++                }).collect();
++                tracing::info!(?channel_names, "K3 static channels");
+                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                 self.early_capability_flags = early_capability.unwrap_or(gcc::ClientEarlyCapabilityFlags::empty());
+                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
+@@ -1523,6 +1527,7 @@ impl Sequence for Acceptor {
+                 let data = data.0;
+                 let client_info: rdp::ClientInfoPdu =
+                     decode(data.user_data.as_ref()).map_err(ConnectorError::decode)?;
++                tracing::info!(flags = client_info.client_info.flags.bits(), "K3 Client Info");
+                 self.client_info_flags = Some(client_info.client_info.flags);
+                 self.performance_flags = client_info
+                     .client_info
+diff --git a/crates/ironrdp/examples/server.rs b/crates/ironrdp/examples/server.rs
+index 5054f19e..8af5b530 100644
+--- a/crates/ironrdp/examples/server.rs
++++ b/crates/ironrdp/examples/server.rs
+@@ -25,6 +25,41 @@ use tokio::sync::mpsc::UnboundedSender;
+ use tokio::time::{self, Duration, sleep};
+ use tracing::{debug, info, warn};
+ 
++struct AudioChannelProbe(&'static str);
++
++ironrdp::core::impl_as_any!(AudioChannelProbe);
++
++impl ironrdp::dvc::DvcProcessor for AudioChannelProbe {
++    fn channel_name(&self) -> &str {
++        self.0
++    }
++
++    fn start(&mut self, _id: u32) -> ironrdp::pdu::PduResult<Vec<ironrdp::dvc::DvcMessage>> {
++        info!(name = self.0, accepted = true, "K3 audio DVC");
++        Ok(Vec::new())
++    }
++
++    fn process(&mut self, _id: u32, _payload: &[u8]) -> ironrdp::pdu::PduResult<Vec<ironrdp::dvc::DvcMessage>> {
++        Ok(Vec::new())
++    }
++}
++
++impl ironrdp::dvc::DvcServerProcessor for AudioChannelProbe {
++    fn creation_failed(&mut self, _id: u32, _status: ironrdp::dvc::pdu::CreationStatus) {
++        info!(name = self.0, accepted = false, "K3 audio DVC");
++    }
++}
++
++struct AudioChannelProbeFactory;
++
++impl ironrdp::server::DynamicChannelFactory for AudioChannelProbeFactory {
++    fn attach(&self, channels: ironrdp::dvc::DrdynvcServer) -> ironrdp::dvc::DrdynvcServer {
++        channels
++            .with_dynamic_channel(AudioChannelProbe("AUDIO_PLAYBACK_DVC"))
++            .with_dynamic_channel(AudioChannelProbe("AUDIO_PLAYBACK_LOSSY_DVC"))
++    }
++}
++
+ const HELP: &str = "\
+ USAGE:
+   cargo run --example=server -- [--bind-addr <SOCKET ADDRESS>] [--cert <CERTIFICATE>] [--key <CERTIFICATE KEY>] [--user USERNAME] [--pass PASSWORD] [--sec tls|hybrid]
+@@ -425,6 +460,7 @@ async fn run(
+         .with_display_handler(handler.clone())
+         .with_cliprdr_factory(Some(cliprdr))
+         .with_sound_factory(Some(sound))
++        .with_dynamic_channel_factory(Box::new(AudioChannelProbeFactory))
+         .build();
+ 
+     server.set_credentials(Some(Credentials {

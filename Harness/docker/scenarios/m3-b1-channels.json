@@ -1,0 +1,179 @@
+{
+  "name": "m3-b1-channels",
+  "runs": [
+    {
+      "id": "b1-audio-off-folder-off",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 0,
+      "shareHome": false,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    },
+    {
+      "id": "b1-audio-off-folder-on",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 0,
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    },
+    {
+      "id": "b1-audio-local-folder-off",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 1,
+      "shareHome": false,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    },
+    {
+      "id": "b1-audio-local-folder-on",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 1,
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    },
+    {
+      "id": "b1-audio-remote-folder-off",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 2,
+      "shareHome": false,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    },
+    {
+      "id": "b1-audio-remote-folder-on",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 2,
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    }
+  ]
+}
