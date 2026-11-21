@@ -96,10 +96,11 @@ public final class RDPSession {
     private var lastRemotePointer: RDPRemotePointer?
     private let staging: FileTransferStaging
     private let resizeCoordinator: DisplayResizeCoordinator
-    private var clipboardCoordinator: ClipboardCoordinator?
+    // Internal so tests can use a test pasteboard, range requester and callbacks.
+    var clipboardCoordinator: ClipboardCoordinator?
     private var remoteClipboardSink: RemoteClipboardSink?
-    private var remoteFileDownloadManager: RDPRemoteFileDownloadManager?
-    private var callbacks: RDPBridgeCallbacks
+    var remoteFileDownloadManager: RDPRemoteFileDownloadManager?
+    var callbacks: RDPBridgeCallbacks
     private var logFileURL: URL?
     private let logLock = NSLock()
     private let sessionLock = NSRecursiveLock()
@@ -147,11 +148,16 @@ public final class RDPSession {
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
             session.lastRemotePointer = nil
+            // Waiting range requests get no reply after a disconnect (INV-L4).
+            session.remoteFileDownloadManager?.cancelOutstanding()
             session.delegate?.rdpSession(session, didDisconnectWith: RDPDisconnectReason(kind: kind, code: code))
         }
         callbacks.remoteText = { bytes, length, context in
             guard let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            // Advance before cancel: a woken materialization must already see it is stale (INV-L2).
+            _ = session.remoteClipboardFreshness.advance()
+            session.remoteFileDownloadManager?.cancelOutstanding()
             let data: Data
             if length == 0 {
                 data = Data()
@@ -170,6 +176,8 @@ public final class RDPSession {
         callbacks.remoteFileList = { bytes, length, context in
             guard let bytes, let context else { return }
             let session = Unmanaged<RDPSession>.fromOpaque(context).takeUnretainedValue()
+            let freshness = session.remoteClipboardFreshness.advance()
+            session.remoteFileDownloadManager?.cancelOutstanding()
             let data = Data(bytes: bytes, count: length)
             let decoded = (try? RDPFileListPayload.decode(data))
                 ?? (try? WindowsFileGroupDescriptor.decode(data))
@@ -181,7 +189,7 @@ public final class RDPSession {
                 stats.lastActivityAt = Date()
             }
             session.delegate?.rdpSession(session, didReceiveRemoteFiles: files)
-            session.materializeRemoteFiles(decoded)
+            session.materializeRemoteFiles(decoded, freshness: freshness)
         }
         callbacks.remoteFileContents = { streamId, bytes, length, context in
             guard let context else { return }
@@ -414,6 +422,7 @@ public final class RDPSession {
     }
 
     public func disconnect() throws {
+        remoteFileDownloadManager?.cancelOutstanding()
         try withSessionLock {
             guard let bridgeSession else {
                 throw RDPSessionError.unableToCreateBridgeSession
@@ -657,30 +666,76 @@ public final class RDPSession {
         return try body()
     }
 
-    private func materializeRemoteFiles(_ entries: [RDPFileListEntry]) {
-        guard !entries.isEmpty, let remoteFileDownloadManager else {
-            return
-        }
+    private struct RemoteFileMaterialization {
+        let entries: [RDPFileListEntry]
+        let manager: RDPRemoteFileDownloadManager
+        let freshness: UInt64
+        /// The pasteboard change count when the job was queued (design D3).
+        let changeCount: Int?
+    }
 
-        DispatchQueue.global(qos: .utility).async { [weak self, weak remoteFileDownloadManager] in
-            guard let self, let remoteFileDownloadManager else { return }
-            do {
-                let urls = try remoteFileDownloadManager.materialize(entries)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.clipboardCoordinator?.receiveRemoteFiles(urls)
-                    let fileNames = urls
-                        .map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
-                        .joined(separator: ", ")
-                    self.delegate?.rdpSession(
-                        self,
-                        didLog: "Remote files materialized to local pasteboard: \(fileNames)."
-                    )
+    // Same types and rules as IronRDPSession (design D2): one materialization runs, the newest
+    // waiting list replaces an older one, and results are written only while still newest.
+    private let remoteFileMaterializations = IronRDPRemoteFileMaterializationQueue<RemoteFileMaterialization>()
+    // Internal so tests can read it.
+    let remoteClipboardFreshness = IronRDPRemoteClipboardFreshness()
+    // Internal so tests can hold a materialization.
+    var materializeRemoteFileList: (RDPRemoteFileDownloadManager, [RDPFileListEntry], () -> Bool) throws -> [URL] = {
+        try $0.materialize($1, shouldContinue: $2)
+    }
+
+    private func materializeRemoteFiles(_ entries: [RDPFileListEntry], freshness: UInt64) {
+        guard !entries.isEmpty else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.remoteClipboardFreshness.isNewest(freshness),
+                  let manager = self.remoteFileDownloadManager else { return }
+            let job = RemoteFileMaterialization(
+                entries: entries,
+                manager: manager,
+                freshness: freshness,
+                changeCount: self.clipboardCoordinator?.pasteboardChangeCount
+            )
+            guard self.remoteFileMaterializations.submit(job) else { return }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                while let job = self?.remoteFileMaterializations.next() {
+                    let freshness = job.freshness
+                    guard self?.remoteClipboardFreshness.isNewest(freshness) == true,
+                          let materialize = self?.materializeRemoteFileList else { continue }
+                    let manager = job.manager
+                    do {
+                        let urls = try materialize(manager, job.entries) { [weak self] in
+                            self?.remoteClipboardFreshness.isNewest(freshness) == true
+                        }
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else {
+                                manager.discard(urls)
+                                return
+                            }
+                            self.deliverMaterializedFiles(urls, of: job)
+                        }
+                    } catch {
+                        if let self {
+                            self.delegate?.rdpSession(self, didLog: "Remote file materialization failed: \(error)")
+                        }
+                    }
                 }
-            } catch {
-                self.delegate?.rdpSession(self, didLog: "Remote file materialization failed: \(error)")
             }
         }
+    }
+
+    private func deliverMaterializedFiles(_ urls: [URL], of job: RemoteFileMaterialization) {
+        guard remoteClipboardFreshness.isNewest(job.freshness) else {
+            job.manager.discard(urls)
+            delegate?.rdpSession(self, didLog: "Remote file materialization superseded by a newer server clipboard.")
+            return
+        }
+        guard let clipboardCoordinator, let changeCount = job.changeCount,
+              clipboardCoordinator.receiveRemoteFiles(urls, ifUnchangedSince: changeCount) else {
+            job.manager.discard(urls)
+            delegate?.rdpSession(self, didLog: "Remote file materialization discarded: the local pasteboard changed.")
+            return
+        }
+        delegate?.rdpSession(self, didLog: "Remote files materialized to local pasteboard: \(urls.count) item(s).")
     }
 }
 

@@ -25,6 +25,49 @@ final class ClipboardCoordinatorTests: XCTestCase {
         XCTAssertEqual(pasteboard.payload, .text("remote"))
         XCTAssertTrue(sink.sentText.isEmpty)
     }
+
+    // S4 core (design D3): a local copy made while remote files materialized wins, even when a
+    // poll already ran after it.
+    func testRemoteFilesAreNotWrittenOverALocalCopyMadeAfterTheJobWasQueued() throws {
+        let pasteboard = MockPasteboard(payload: nil)
+        let sink = MockRemoteSink()
+        let coordinator = ClipboardCoordinator(pasteboard: pasteboard, remoteSink: sink)
+        let queuedAt = coordinator.pasteboardChangeCount
+
+        pasteboard.payload = .text("local")
+        pasteboard.bump()
+        try coordinator.pollLocalPasteboard()
+
+        let remote = [URL(fileURLWithPath: "/tmp/remote.txt")]
+        XCTAssertFalse(coordinator.receiveRemoteFiles(remote, ifUnchangedSince: queuedAt))
+        XCTAssertEqual(pasteboard.payload, .text("local"))
+        XCTAssertEqual(sink.sentText, ["local"])
+    }
+
+    func testRefusedRemoteFilesLeaveTheLocalChangeForTheNextPoll() throws {
+        let pasteboard = MockPasteboard(payload: nil)
+        let sink = MockRemoteSink()
+        let coordinator = ClipboardCoordinator(pasteboard: pasteboard, remoteSink: sink)
+        let queuedAt = coordinator.pasteboardChangeCount
+
+        pasteboard.payload = .text("local")
+        pasteboard.bump()
+        XCTAssertFalse(coordinator.receiveRemoteFiles([URL(fileURLWithPath: "/tmp/r")], ifUnchangedSince: queuedAt))
+        try coordinator.pollLocalPasteboard()
+        XCTAssertEqual(sink.sentText, ["local"])
+    }
+
+    func testRemoteFilesAreWrittenWhenThePasteboardIsUnchanged() throws {
+        let pasteboard = MockPasteboard(payload: nil)
+        let sink = MockRemoteSink()
+        let coordinator = ClipboardCoordinator(pasteboard: pasteboard, remoteSink: sink)
+        let remote = [URL(fileURLWithPath: "/tmp/remote.txt")]
+
+        XCTAssertTrue(coordinator.receiveRemoteFiles(remote, ifUnchangedSince: coordinator.pasteboardChangeCount))
+        try coordinator.pollLocalPasteboard()
+        XCTAssertEqual(pasteboard.payload, .fileURLs(remote))
+        XCTAssertTrue(sink.sentFiles.isEmpty)
+    }
 }
 
 private final class MockPasteboard: PasteboardClient {

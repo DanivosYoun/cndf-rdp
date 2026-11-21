@@ -40,4 +40,21 @@ public final class ClipboardCoordinator {
         pasteboard.writeFileURLs(urls)
         lastObservedChangeCount = pasteboard.changeCount
     }
+
+    /// The pasteboard's change count now. A remote file job takes it when it is queued.
+    public var pasteboardChangeCount: Int {
+        pasteboard.changeCount
+    }
+
+    /// Writes remote files only if the pasteboard has not changed since `changeCount` (design D3,
+    /// INV-B1). When it has, nothing is written and the local change stays unobserved, so the
+    /// next poll still offers it to the server.
+    @discardableResult
+    public func receiveRemoteFiles(_ urls: [URL], ifUnchangedSince changeCount: Int) -> Bool {
+        guard pasteboard.changeCount == changeCount else {
+            return false
+        }
+        receiveRemoteFiles(urls)
+        return true
+    }
 }
