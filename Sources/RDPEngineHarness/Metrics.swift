@@ -118,6 +118,13 @@ struct IterationResult: Encodable {
     /// The session log was checked for the password string (M1 condition 5 style check).
     var passwordFoundInSessionLog: Bool?
     var steps: [String] = []
+    /// One line per resize step: requested and last seen remote frame size, still connected.
+    var resizeLog: [String] = []
+    /// clipboardExpectLocalFiles: name, byte count and SHA-256 of each pasteboard file URL
+    /// (directories are listed with their entry count instead).
+    var localFiles: [[String: String]] = []
+    /// clipboardWaitLocalPrefix: the pasteboard text that matched.
+    var localTexts: [String] = []
 }
 
 struct RunResult: Encodable {
