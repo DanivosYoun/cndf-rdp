@@ -487,6 +487,15 @@ final class RDPInputExecutor: @unchecked Sendable {
         }
     }
 
+    /// Releases everything the host holds by the `close` rules, as one transaction; the executor
+    /// stays in use. Share owners' records are left alone (design D6, I7).
+    func hostReleaseAll() {
+        submitHost { [self] in
+            guard let inputs = held[.host] else { return }
+            release(.host, inputs)
+        }
+    }
+
     private func submitHost(_ body: @escaping () -> Void) {
         schedule { [self] in
             executingOwner = .host
@@ -685,20 +694,24 @@ final class RDPInputExecutor: @unchecked Sendable {
             held[owner] = nil
             return recordCloseResult(failures[owner].map { .failed($0) } ?? (sender.isConnected ? .released : .failed(.connectionLost)))
         }
-        let ran = sender.perform { [self] in
-            for entry in inputs.buttons where held[owner]?.holds(entry.button) ?? false {
-                releaseButton(owner, entry.button, at: lastPointer ?? entry.location)
-            }
-            for key in inputs.keys where held[owner]?.holds(key) ?? false {
-                releaseKey(owner, key)
-            }
-            for key in inputs.modifiers.reversed() where held[owner]?.holds(key) ?? false {
-                releaseKey(owner, key)
-            }
-        }
+        let ran = sender.perform { [self] in release(owner, inputs) }
         if held[owner] == nil {
             return recordCloseResult(failures[owner].map { .failed($0) } ?? .released)
         }
         return recordCloseResult(.failed(ran && sender.isConnected ? .sendFailed : .connectionLost))
+    }
+
+    /// Buttons and ordinary keys first, then modifiers in reverse press order, at the last
+    /// pointer position actually sent.
+    private func release(_ owner: RDPInputOwner, _ inputs: RDPHeldInputs) {
+        for entry in inputs.buttons where held[owner]?.holds(entry.button) ?? false {
+            releaseButton(owner, entry.button, at: lastPointer ?? entry.location)
+        }
+        for key in inputs.keys where held[owner]?.holds(key) ?? false {
+            releaseKey(owner, key)
+        }
+        for key in inputs.modifiers.reversed() where held[owner]?.holds(key) ?? false {
+            releaseKey(owner, key)
+        }
     }
 }
