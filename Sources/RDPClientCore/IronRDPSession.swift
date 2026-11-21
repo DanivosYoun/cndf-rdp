@@ -47,6 +47,8 @@ public final class IronRDPSession: RDPEngineSession {
     private let logLock = NSLock()
     private let statisticsLock = NSLock()
     private var statisticsStorage = MutableRDPConnectionStatistics()
+    private let keyboardProfileLock = NSLock()
+    private var keyboardProfileStorage = RDPKeyboardProfile.standard
     private let staging: FileTransferStaging
     private var clipboardCoordinator: ClipboardCoordinator?
     private var remoteClipboardSink: IronRDPClipboardSink?
@@ -212,6 +214,13 @@ public final class IronRDPSession: RDPEngineSession {
 
     public var engine: RDPEngineKind { .ironRDP }
     public var supportsClipboard: Bool { engine.supportsClipboard }
+
+    public var keyboardProfile: RDPKeyboardProfile {
+        keyboardProfileLock.lock()
+        defer { keyboardProfileLock.unlock() }
+        return keyboardProfileStorage
+    }
+
     public var supportsOutputSuppression: Bool { false }
 
     public var isConnected: Bool {
@@ -283,6 +292,10 @@ public final class IronRDPSession: RDPEngineSession {
             emitLog("RDP engine=ironrdp version=\(Self.engineVersion)")
 
             emitLog(options.channelLogMessage)
+            emitLog(options.keyboardLogMessage)
+            keyboardProfileLock.lock()
+            keyboardProfileStorage = options.keyboardProfile
+            keyboardProfileLock.unlock()
 
             let connection = inputConnectionGeneration &+ 1
             let sink = IronRDPClipboardSink(staging: staging) { [weak self] command in
@@ -323,7 +336,11 @@ public final class IronRDPSession: RDPEngineSession {
                                         clipboard: options.enableClipboard,
                                         drive_path: drivePath,
                                         drive_name: driveName,
-                                        audio_mode: CNDFIronAudioMode(rawValue: options.audioPlaybackMode.rawValue)
+                                        audio_mode: CNDFIronAudioMode(rawValue: options.audioPlaybackMode.rawValue),
+                                        keyboard_layout: options.keyboardProfile.keyboardLayout,
+                                        keyboard_type: options.keyboardProfile.keyboardType,
+                                        keyboard_subtype: options.keyboardProfile.keyboardSubType,
+                                        keyboard_function_keys: options.keyboardProfile.keyboardFunctionKey
                                     )
                                     return cndf_iron_connect(nativeSession, &nativeOptions, passwordPointer, passwordLength, &generation)
                                 }

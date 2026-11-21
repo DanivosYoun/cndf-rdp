@@ -20,6 +20,7 @@ public final class RDPClientView: NSView {
     private var isRenderPipelineShutdown = false
     private let frameColorSpace = CGColorSpaceCreateDeviceRGB()
     private let injectedInputQueue = DispatchQueue(label: "rdp.client-view.injected-input", qos: .userInteractive)
+    private var focusObservers: [NSObjectProtocol] = []
     private static let disabledLayerActions: [String: CAAction] = [
         "backgroundColor": NSNull(),
         "bounds": NSNull(),
@@ -53,6 +54,7 @@ public final class RDPClientView: NSView {
 
     deinit {
         onRenderedFrame = nil
+        removeFocusObservers()
     }
 
     private func configure() {
@@ -69,6 +71,7 @@ public final class RDPClientView: NSView {
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         updateFrameLayerScale()
+        observeFocus()
         guard let window else {
             return
         }
@@ -192,7 +195,31 @@ public final class RDPClientView: NSView {
         return UInt16(scalar.value)
     }
 
+    public override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            syncHostModifiers()
+        }
+        return accepted
+    }
+
+    public override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            releaseHostInput()
+        }
+        return resigned
+    }
+
     public override func keyDown(with event: NSEvent) {
+        // Han/Yeong and Hanja are toggles: one tap per press, auto-repeat ignored (design I11).
+        if let profile = session?.keyboardProfile,
+           let scancode = RDPKeyboardMapper.imeToggleScancode(forMacKeyCode: event.keyCode, profile: profile) {
+            if !event.isARepeat {
+                inputExecutor()?.hostChord([scancode])
+            }
+            return
+        }
         if sendCommandShortcutIfNeeded(event) {
             return
         }
@@ -217,12 +244,43 @@ public final class RDPClientView: NSView {
     }
 
     public override func flagsChanged(with event: NSEvent) {
-        let mappings: [(NSEvent.ModifierFlags, UInt16)] = [
-            (.shift, RDPKeyboardMapper.leftShift),
-            (.control, RDPKeyboardMapper.leftControl),
-            (.option, RDPKeyboardMapper.leftAlt)
+        inputExecutor()?.hostModifiers(RDPKeyboardMapper.modifierScancodes(for: event.modifierFlags))
+    }
+
+    /// Releases every key, modifier and button the local view holds, so nothing stays down on
+    /// the server while key events go elsewhere (design D6). Share owners keep theirs.
+    func releaseHostInput() {
+        unicodeNumpadDown.removeAll()
+        inputExecutor()?.hostReleaseAll()
+    }
+
+    private func syncHostModifiers() {
+        inputExecutor()?.hostModifiers(RDPKeyboardMapper.modifierScancodes(for: NSEvent.modifierFlags))
+    }
+
+    private func observeFocus() {
+        removeFocusObservers()
+        guard let window else {
+            return
+        }
+        let center = NotificationCenter.default
+        focusObservers = [
+            center.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                self?.releaseHostInput()
+            },
+            center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.releaseHostInput()
+            },
+            center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+                guard let self, self.window?.firstResponder === self else { return }
+                self.syncHostModifiers()
+            }
         ]
-        inputExecutor()?.hostModifiers(mappings.compactMap { event.modifierFlags.contains($0.0) ? $0.1 : nil })
+    }
+
+    private func removeFocusObservers() {
+        focusObservers.forEach(NotificationCenter.default.removeObserver)
+        focusObservers = []
     }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -312,6 +370,7 @@ public final class RDPClientView: NSView {
             return 0
         }
         isRenderPipelineShutdown = true
+        removeFocusObservers()
         pendingResizeWorkItem?.cancel()
         pendingResizeWorkItem = nil
         unregisterDraggedTypes()

@@ -1,0 +1,43 @@
+diff --git a/crates/ironrdp-session/src/x224/mod.rs b/crates/ironrdp-session/src/x224/mod.rs
+--- a/crates/ironrdp-session/src/x224/mod.rs
++++ b/crates/ironrdp-session/src/x224/mod.rs
+@@ -464,6 +464,11 @@
+                 debug!("Got Keyboard Indicators PDU: {data:?}");
+                 Ok(Vec::new())
+             }
++            // RDP 5.0-7.1 servers send this when the client advertises an IME keyboard (type 8).
++            ShareDataPdu::SetKeyboardImeStatus(data) => {
++                debug!("Got Keyboard IME Status PDU: {data:?}");
++                Ok(Vec::new())
++            }
+             ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+                 ProtocolIndependentCode::None,
+             ))) => {
+@@ -961,6 +966,27 @@
+     }
+ 
+     #[test]
++    fn processor_ignores_keyboard_ime_status() {
++        let mut bulk_decompressor = None;
++        let outputs = Processor::process_share_data(
++            ShareDataCtx {
++                initiator_id: 0,
++                channel_id: 0,
++                share_id: 0,
++                pdu_source: 0,
++                compression_flags: CompressionFlags::empty(),
++                compression_type: CompressionType::K64,
++                // unitId 0, imeState IME_STATE_OPEN, imeConvMode IME_CMODE_NATIVE
++                pdu: ShareDataPdu::SetKeyboardImeStatus(vec![0, 0, 1, 0, 0, 0, 1, 0, 0, 0]),
++            },
++            &mut bulk_decompressor,
++        )
++        .expect("keyboard IME status PDU should not end the session");
++
++        assert!(outputs.is_empty());
++    }
++
++    #[test]
+     fn processor_rejects_invalid_auto_reconnect_status() {
+         let mut bulk_decompressor = None;
+ 

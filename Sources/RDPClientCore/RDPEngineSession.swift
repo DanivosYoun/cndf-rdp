@@ -14,6 +14,9 @@ public protocol RDPEngineSession: AnyObject {
     /// Keeps an input transaction on its original connection across reconnect races.
     func withInputConnection(generation: UInt64, _ body: () throws -> Void) throws
     var statistics: RDPConnectionStatistics { get }
+    /// The keyboard profile of the latest `connect`; `.standard` before the first. Read on the
+    /// main thread for each key event, so it never waits for a connect in progress.
+    var keyboardProfile: RDPKeyboardProfile { get }
 
     func connect(_ options: RDPConnectionOptions, initialPointSize: CGSize, scale: Double) throws
     func reconnect() throws

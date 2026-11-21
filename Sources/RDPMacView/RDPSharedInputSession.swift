@@ -43,12 +43,15 @@ public final class RDPSharedInputSession: @unchecked Sendable {
     private let executor: RDPInputExecutor?
     private let owner: RDPInputOwner
     private let connectionLifetime: AnyObject?
+    /// The keyboard profile of the connection this handle is bound to; `.standard` without one.
+    public let keyboardProfile: RDPKeyboardProfile
 
     init(executor: RDPInputExecutor, owner: RDPInputOwner) {
         self.executor = executor
         self.owner = owner
         self.state = .prepared
         self.connectionLifetime = executor.connectionLifetime
+        self.keyboardProfile = executor.keyboardProfile
     }
 
     private init() {
@@ -56,6 +59,7 @@ public final class RDPSharedInputSession: @unchecked Sendable {
         self.owner = .shared(0)
         self.state = .closed(.failed(.connectionLost))
         self.connectionLifetime = nil
+        self.keyboardProfile = .standard
     }
 
     /// A handle for a view without a usable connection: never active, always connection lost.
@@ -253,10 +257,12 @@ final class RDPInputExecutorRegistry {
             // A request may have captured its generation before a reconnect. It must not
             // replace the newer connection's ownership record or failure block.
             if binding.generation > generation {
-                return RDPInputExecutor(sender: makeSender(session, generation), schedule: schedule)
+                return RDPInputExecutor(sender: makeSender(session, generation),
+                                        keyboardProfile: session.keyboardProfile, schedule: schedule)
             }
         }
-        let executor = RDPInputExecutor(sender: makeSender(session, generation), schedule: schedule)
+        let executor = RDPInputExecutor(sender: makeSender(session, generation),
+                                        keyboardProfile: session.keyboardProfile, schedule: schedule)
         bindings.setObject(Binding(generation: generation, executor: executor), forKey: session)
         return executor
     }
@@ -361,9 +367,16 @@ final class RDPInputExecutor: @unchecked Sendable {
 
     private var held: [RDPInputOwner: RDPHeldInputs] = [:]
     private var lastPointer: RDPPointerLocation?
+    /// The profile of the connection this executor was made for (`RDPEngineSession.keyboardProfile`).
+    let keyboardProfile: RDPKeyboardProfile
 
-    init(sender: RDPInputSending, schedule: @escaping (@escaping () -> Void) -> Void) {
+    init(
+        sender: RDPInputSending,
+        keyboardProfile: RDPKeyboardProfile = .standard,
+        schedule: @escaping (@escaping () -> Void) -> Void
+    ) {
         self.sender = sender
+        self.keyboardProfile = keyboardProfile
         self.schedule = schedule
     }
 
@@ -484,6 +497,15 @@ final class RDPInputExecutor: @unchecked Sendable {
     func hostChord(_ scanCodes: [UInt16]) {
         submitHost { [self] in
             chord(.host, scanCodes)
+        }
+    }
+
+    /// Releases everything the host holds by the `close` rules, as one transaction; the executor
+    /// stays in use. Share owners' records are left alone (design D6, I7).
+    func hostReleaseAll() {
+        submitHost { [self] in
+            guard let inputs = held[.host] else { return }
+            release(.host, inputs)
         }
     }
 
@@ -685,20 +707,24 @@ final class RDPInputExecutor: @unchecked Sendable {
             held[owner] = nil
             return recordCloseResult(failures[owner].map { .failed($0) } ?? (sender.isConnected ? .released : .failed(.connectionLost)))
         }
-        let ran = sender.perform { [self] in
-            for entry in inputs.buttons where held[owner]?.holds(entry.button) ?? false {
-                releaseButton(owner, entry.button, at: lastPointer ?? entry.location)
-            }
-            for key in inputs.keys where held[owner]?.holds(key) ?? false {
-                releaseKey(owner, key)
-            }
-            for key in inputs.modifiers.reversed() where held[owner]?.holds(key) ?? false {
-                releaseKey(owner, key)
-            }
-        }
+        let ran = sender.perform { [self] in release(owner, inputs) }
         if held[owner] == nil {
             return recordCloseResult(failures[owner].map { .failed($0) } ?? .released)
         }
         return recordCloseResult(.failed(ran && sender.isConnected ? .sendFailed : .connectionLost))
+    }
+
+    /// Buttons and ordinary keys first, then modifiers in reverse press order, at the last
+    /// pointer position actually sent.
+    private func release(_ owner: RDPInputOwner, _ inputs: RDPHeldInputs) {
+        for entry in inputs.buttons where held[owner]?.holds(entry.button) ?? false {
+            releaseButton(owner, entry.button, at: lastPointer ?? entry.location)
+        }
+        for key in inputs.keys where held[owner]?.holds(key) ?? false {
+            releaseKey(owner, key)
+        }
+        for key in inputs.modifiers.reversed() where held[owner]?.holds(key) ?? false {
+            releaseKey(owner, key)
+        }
     }
 }

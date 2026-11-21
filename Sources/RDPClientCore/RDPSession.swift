@@ -106,6 +106,8 @@ public final class RDPSession {
     private var inputConnectionGeneration: UInt64 = 0
     private let statisticsLock = NSLock()
     private var statisticsStorage = MutableRDPConnectionStatistics()
+    private let keyboardProfileLock = NSLock()
+    private var keyboardProfileStorage = RDPKeyboardProfile.standard
     private var lastConnectionOptions: RDPConnectionOptions?
 
     public init(
@@ -340,6 +342,10 @@ public final class RDPSession {
             // Same first line as IronRDPSession, so a session log names its engine (design D4).
             emitLog("RDP engine=freerdp version=\(RDPMacInfo.freerdpVersion)")
             emitLog(options.channelLogMessage)
+            emitLog(options.keyboardLogMessage)
+            keyboardProfileLock.lock()
+            keyboardProfileStorage = options.keyboardProfile
+            keyboardProfileLock.unlock()
             let previousClipboardCoordinator = clipboardCoordinator
             if options.pasteboardName != lastConnectionOptions?.pasteboardName, let remoteClipboardSink {
                 clipboardCoordinator = ClipboardCoordinator(pasteboard: options.clipboardPasteboard, remoteSink: remoteClipboardSink)
@@ -372,7 +378,11 @@ public final class RDPSession {
                                                 desktopHeight: bridgeDesktopSize?.pixelHeight ?? 0,
                                                 desktopScale: bridgeDesktopSize?.scale ?? 1.0,
                                                 networkAutoDetect: options.networkAutoDetect,
-                                                compatibilityGraphics: options.graphicsMode == .compatibility
+                                                compatibilityGraphics: options.graphicsMode == .compatibility,
+                                                keyboardLayout: options.keyboardProfile.keyboardLayout,
+                                                keyboardType: options.keyboardProfile.keyboardType,
+                                                keyboardSubType: options.keyboardProfile.keyboardSubType,
+                                                keyboardFunctionKey: options.keyboardProfile.keyboardFunctionKey
                                             )
                                             return rdp_bridge_connect(bridgeSession, &bridgeOptions)
                                         }
@@ -677,6 +687,12 @@ public final class RDPSession {
 extension RDPSession: RDPEngineSession {
     public var engine: RDPEngineKind { .freeRDP }
     public var supportsClipboard: Bool { engine.supportsClipboard }
+
+    public var keyboardProfile: RDPKeyboardProfile {
+        keyboardProfileLock.lock()
+        defer { keyboardProfileLock.unlock() }
+        return keyboardProfileStorage
+    }
 }
 
 private extension RDPPointerButton {

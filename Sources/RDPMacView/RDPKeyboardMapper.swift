@@ -1,4 +1,5 @@
 import AppKit
+import RDPClientCore
 
 public enum RDPKeyboardMapper {
     public static let extended: UInt16 = 0x0100
@@ -7,6 +8,27 @@ public enum RDPKeyboardMapper {
     public static let leftControl: UInt16 = 0x1D
     public static let leftAlt: UInt16 = 0x38
     public static let leftWindows: UInt16 = extended | 0x5B
+    public static let rightControl: UInt16 = extended | 0x1D
+    public static let rightAlt: UInt16 = extended | 0x38
+
+    // Device-dependent modifier bits of `NSEvent.ModifierFlags.rawValue` (IOLLEvent.h).
+    private static let deviceLeftControl: UInt = 0x0000_0001
+    private static let deviceRightControl: UInt = 0x0000_2000
+    private static let deviceLeftAlt: UInt = 0x0000_0020
+    private static let deviceRightAlt: UInt = 0x0000_0040
+
+    /// A Korean IME key the server's keyboard driver turns into VK_HANGUL or VK_HANJA.
+    public enum IMEToggle: Sendable {
+        case hangul
+        case hanja
+    }
+
+    /// Mac key codes sent as an IME key tap instead of a scancode (design D3). This is the one
+    /// table of switch keys: a row added here becomes a tap on every profile that has IME keys.
+    private static let imeToggleKeyCodes: [UInt16: IMEToggle] = [
+        104: .hangul, // PC Korean keyboard Han/Yeong
+        102: .hanja   // PC Korean keyboard Hanja
+    ]
 
     private static let keyMap: [UInt16: UInt16] = [
         0: 0x1E, 1: 0x1F, 2: 0x20, 3: 0x21, 4: 0x23, 5: 0x22, 6: 0x2C, 7: 0x2D,
@@ -36,5 +58,62 @@ public enum RDPKeyboardMapper {
 
     public static func commandShortcutScancode(for macKeyCode: UInt16) -> UInt16? {
         commandShortcutMap[macKeyCode]
+    }
+
+    /// The Han/Yeong and Hanja scancodes of `profile`, or nil when it has none. The only place
+    /// that picks them, so a different Korean keyboard subtype changes this function alone.
+    public static func imeToggleScancodes(for profile: RDPKeyboardProfile) -> (hangul: UInt16, hanja: UInt16)? {
+        switch profile {
+        case .standard: return nil
+        case .korean: return (rightAlt, rightControl)
+        }
+    }
+
+    /// True for the Mac key codes in the IME switch-key table, whatever the profile. Their
+    /// auto-repeat is never sent (design I11).
+    public static func isIMEToggleKey(_ macKeyCode: UInt16) -> Bool {
+        imeToggleKeyCodes[macKeyCode] != nil
+    }
+
+    /// The scancode to tap for `macKeyCode` on `profile`, or nil when it is not an IME key there.
+    public static func imeToggleScancode(forMacKeyCode macKeyCode: UInt16, profile: RDPKeyboardProfile) -> UInt16? {
+        guard let toggle = imeToggleKeyCodes[macKeyCode], let scancodes = imeToggleScancodes(for: profile) else {
+            return nil
+        }
+        switch toggle {
+        case .hangul: return scancodes.hangul
+        case .hanja: return scancodes.hanja
+        }
+    }
+
+    /// True when Option is held by the right key alone. Flags without device bits, as in a
+    /// synthetic event, count as the left key.
+    public static func isRightOptionOnly(_ flags: NSEvent.ModifierFlags) -> Bool {
+        flags.contains(.option) && rightOnly(flags, right: deviceRightAlt, left: deviceLeftAlt)
+    }
+
+    /// True when Control is held by the right key alone, by the same rule as Option.
+    public static func isRightControlOnly(_ flags: NSEvent.ModifierFlags) -> Bool {
+        flags.contains(.control) && rightOnly(flags, right: deviceRightControl, left: deviceLeftControl)
+    }
+
+    /// The held Shift, Control and Option as scancodes, in that order. Control and Option use the
+    /// right-hand scancode only when the right key alone is down (design D3).
+    public static func modifierScancodes(for flags: NSEvent.ModifierFlags) -> [UInt16] {
+        var scancodes: [UInt16] = []
+        if flags.contains(.shift) {
+            scancodes.append(leftShift)
+        }
+        if flags.contains(.control) {
+            scancodes.append(isRightControlOnly(flags) ? rightControl : leftControl)
+        }
+        if flags.contains(.option) {
+            scancodes.append(isRightOptionOnly(flags) ? rightAlt : leftAlt)
+        }
+        return scancodes
+    }
+
+    private static func rightOnly(_ flags: NSEvent.ModifierFlags, right: UInt, left: UInt) -> Bool {
+        flags.rawValue & right != 0 && flags.rawValue & left == 0
     }
 }

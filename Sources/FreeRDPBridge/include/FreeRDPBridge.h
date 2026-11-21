@@ -166,6 +166,11 @@ typedef struct RDPBridgeConnectionOptions {
     // bandwidth. Leaves ConnectionType, perf flags, Heartbeat and Multitransport alone.
     bool networkAutoDetect;
     bool compatibilityGraphics;
+    // GCC Client Core Data keyboard fields, written as given (RDPKeyboardProfile).
+    uint32_t keyboardLayout;
+    uint32_t keyboardType;
+    uint32_t keyboardSubType;
+    uint32_t keyboardFunctionKey;
 } RDPBridgeConnectionOptions;
 
 typedef struct RDPBridgeLocalFile {
@@ -209,6 +214,17 @@ typedef struct RDPBridgeGraphicsSettings {
 
 // Inspect the effective FreeRDP settings without opening a connection.
 bool rdp_bridge_graphics_settings_for_mode(bool compatibility, RDPBridgeGraphicsSettings *out);
+
+typedef struct RDPBridgeKeyboardSettings {
+    uint32_t keyboardLayout;
+    uint32_t keyboardType;
+    uint32_t keyboardSubType;
+    uint32_t keyboardFunctionKey;
+} RDPBridgeKeyboardSettings;
+
+// Reports the keyboard fields `options` leave in fresh client settings. Exposed for unit tests.
+bool rdp_bridge_keyboard_settings_for_options(const RDPBridgeConnectionOptions *options,
+                                              RDPBridgeKeyboardSettings *out);
 
 // Converts RDP pointer XOR/AND masks to what the pointer callback delivers (top-down,
 // straight-alpha BGRA, stride width * 4). `bgra` must hold width * height * 4 bytes.

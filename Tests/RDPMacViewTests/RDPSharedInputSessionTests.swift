@@ -701,6 +701,47 @@ final class RDPSharedInputSessionTests: XCTestCase {
         XCTAssertEqual(result, .released)
     }
 
+    func testHostReleaseAllReleasesHostInputAndLeavesTheShareRecord() async {
+        let h = Harness()
+        let session = h.activeSession()
+        h.submit(session, .key(scanCode: keyB, pressed: true, modifiers: [shift]))
+        h.queue.runAll()
+        h.executor.hostModifiers([control, 0x138])
+        h.executor.hostKey(scanCode: keyA, pressed: true)
+        h.executor.hostKey(scanCode: keyB, pressed: true)
+        h.executor.hostMouse(x: 2, y: 3, button: .left, flags: [.move, .down])
+        h.executor.hostModifiers([control, 0x138, shift])
+        h.queue.runAll()
+        h.sender.events.removeAll()
+
+        h.executor.hostReleaseAll()
+        XCTAssertEqual(h.queue.pendingCount, 1)
+        h.queue.runAll()
+
+        // Buttons, then keys, then modifiers in reverse; the share still holds B and Shift.
+        XCTAssertEqual(h.sender.events, [
+            .button(.left, 2, 3, pressed: false),
+            up(keyA),
+            up(0x138),
+            up(control)
+        ])
+
+        h.sender.events.removeAll()
+        h.executor.hostReleaseAll()
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [])
+
+        let result = await h.close(session)
+        XCTAssertEqual(h.sender.events, [up(keyB), up(shift)])
+        XCTAssertEqual(result, .released)
+
+        // The executor stays in use after a host release.
+        h.sender.events.removeAll()
+        h.executor.hostChord([0x138])
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(0x138), up(0x138)])
+    }
+
     func testHostKeyFlagExtendedStaysADistinctKey() async {
         let h = Harness()
         let session = h.activeSession()

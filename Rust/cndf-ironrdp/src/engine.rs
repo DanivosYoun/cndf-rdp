@@ -214,6 +214,7 @@ fn run(
         .with_graphics_pipeline(options.graphics)
         .with_certificate_validation(ironrdp_tls::CertificateValidation::Strict)
         .with_certificate_chain_validation_callback(trust);
+    builder = with_keyboard(builder, options.keyboard);
     drop(options.password);
     if let Some(domain) = options.domain {
         builder = builder.with_domain(domain);
@@ -313,6 +314,14 @@ fn run(
     // DNS uses Tokio's blocking pool. Cancel the session without waiting for an
     // OS resolver that is already working on a request.
     runtime.shutdown_background();
+}
+
+fn with_keyboard(builder: ConfigBuilder, keyboard: Keyboard) -> ConfigBuilder {
+    builder
+        .with_keyboard_layout(keyboard.layout)
+        .with_keyboard_type(ironrdp_pdu::gcc::KeyboardType(keyboard.kind))
+        .with_keyboard_subtype(keyboard.subtype)
+        .with_keyboard_functional_keys_count(keyboard.function_keys)
 }
 
 async fn run_attempt(
@@ -643,6 +652,33 @@ mod tests {
         let message = unsafe { std::slice::from_raw_parts(bytes, len) };
         let messages = unsafe { &mut *context.cast::<Vec<String>>() };
         messages.push(String::from_utf8_lossy(message).into_owned());
+    }
+
+    #[test]
+    fn keyboard_fields_reach_the_connector_config() {
+        let config = with_keyboard(
+            ConfigBuilder::new()
+                .with_destination(Destination::from_parts("localhost", 3389))
+                .with_client_build(420)
+                .with_client_dir("")
+                .with_platform(ironrdp_pdu::rdp::capability_sets::MajorPlatformType::OSX)
+                .with_client_name("test")
+                .with_username("user")
+                .with_password("password"),
+            Keyboard {
+                layout: 0x412,
+                kind: 8,
+                subtype: 3,
+                function_keys: 12,
+            },
+        )
+        .build()
+        .unwrap();
+        let connector = config.connector();
+        assert_eq!(connector.keyboard_layout, 0x412);
+        assert_eq!(connector.keyboard_type, ironrdp_pdu::gcc::KeyboardType::KOREAN);
+        assert_eq!(connector.keyboard_subtype, 3);
+        assert_eq!(connector.keyboard_functional_keys_count, 12);
     }
 
     #[test]
