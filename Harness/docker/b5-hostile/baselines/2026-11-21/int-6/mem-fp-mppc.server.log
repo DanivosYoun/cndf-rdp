@@ -1,0 +1,11 @@
+b5 listening 0.0.0.0:3389 attack=FpMppc warmup=1 bytes=134217728 count=0 partial=0
+b5 accepted 192.168.131.240:43746
+b5 192.168.131.240:43746 error=[read frame by hint] custom error
+b5 accepted 192.168.131.240:43754
+b5 connection=1 active user=1002 cliprdr=None rdpsnd=None drdynvc=Some(1004)
+b5 connection=1 warmup
+b5 connection=1 closed client_bytes=32
+b5 accepted 192.168.131.240:36664
+b5 connection=2 active user=1002 cliprdr=None rdpsnd=None drdynvc=Some(1004)
+b5 connection=2 attack=FpMppc done wire=98559 reassembled=135184000 after_bitmap_sent=true
+b5 connection=2 closed client_bytes=32

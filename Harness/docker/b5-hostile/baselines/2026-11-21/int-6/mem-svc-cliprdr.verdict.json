@@ -1,0 +1,39 @@
+{
+  "scenario": "mem-svc-cliprdr",
+  "attack": "svc-cliprdr",
+  "args": {
+    "bytes": 268435456
+  },
+  "warmupFootprintMaxBytes": 26166040,
+  "attackFootprintMaxBytes": 32228168,
+  "growthBytes": 6062128,
+  "growthMiB": 5.8,
+  "limitBytes": 134217728,
+  "limitMiB": 128.0,
+  "wireBytes": 268821350,
+  "serverAttackLine": "b5 connection=2 attack=SvcCliprdr done wire=268821350 channel=1004 message=268435456 after_bitmap_sent=true",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": null,
+  "attackFramesReceived": 2,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:60.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "connected",
+  "logPattern": "/crates/ironrdp-cliprdr/src/lib.rs:",
+  "logLines": [
+    "2026-11-21T13:14:45Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-cliprdr/src/lib.rs:2238"
+  ],
+  "checks": {
+    "budget": true,
+    "warmup": true,
+    "outcome": true,
+    "log": true
+  },
+  "passed": true
+}

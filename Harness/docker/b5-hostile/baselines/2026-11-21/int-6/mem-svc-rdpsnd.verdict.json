@@ -1,0 +1,36 @@
+{
+  "scenario": "mem-svc-rdpsnd",
+  "attack": "svc-rdpsnd",
+  "args": {
+    "bytes": 268435456
+  },
+  "warmupFootprintMaxBytes": 26100480,
+  "attackFootprintMaxBytes": 29704984,
+  "growthBytes": 3604504,
+  "growthMiB": 3.4,
+  "limitBytes": 69206016,
+  "limitMiB": 66.0,
+  "wireBytes": 5399751,
+  "serverAttackLine": "b5 connection=2 attack=SvcRdpsnd stopped wire=5399751 error=Broken pipe (os error 32)",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": "error",
+  "attackFramesReceived": 1,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:60.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "ended",
+  "logPattern": null,
+  "logLines": [],
+  "checks": {
+    "budget": true,
+    "warmup": true,
+    "outcome": true
+  },
+  "passed": true
+}

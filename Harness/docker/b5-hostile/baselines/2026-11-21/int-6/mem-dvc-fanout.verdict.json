@@ -1,0 +1,37 @@
+{
+  "scenario": "mem-dvc-fanout",
+  "attack": "dvc-fanout",
+  "args": {
+    "count": 4000,
+    "partial": 60000
+  },
+  "warmupFootprintMaxBytes": 26231576,
+  "attackFootprintMaxBytes": 29868848,
+  "growthBytes": 3637272,
+  "growthMiB": 3.5,
+  "limitBytes": 71303168,
+  "limitMiB": 68.0,
+  "wireBytes": 5083933,
+  "serverAttackLine": "b5 connection=2 attack=DvcFanout stopped wire=5083933 error=Broken pipe (os error 32)",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": "error",
+  "attackFramesReceived": 1,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:60.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "ended",
+  "logPattern": null,
+  "logLines": [],
+  "checks": {
+    "budget": true,
+    "warmup": true,
+    "outcome": true
+  },
+  "passed": true
+}

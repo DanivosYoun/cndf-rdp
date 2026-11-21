@@ -1,0 +1,14 @@
+2026-11-21T13:11:52Z RDP engine=ironrdp version=cndf-ironrdp 0.1.0 ironrdp=15b4a03ff552 patches=26
+2026-11-21T13:11:52Z RDP channels clipboard=off folder=on audio=off
+2026-11-21T13:11:52Z RDP keyboard profile=standard layout=0x0 type=4 subtype=0 fn=12
+2026-11-21T13:11:52Z Starting IronRDP connection
+2026-11-21T13:11:52Z GCC display requested: 1280x800 DesktopScaleFactor=100 DeviceScaleFactor=100.
+2026-11-21T13:11:52Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:23
+2026-11-21T13:11:52Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:1606
+2026-11-21T13:11:53Z RDP tls profile=modern version=TLSv1.3 cipher=TLS13_AES_256_GCM_SHA384 engine=ironrdp
+2026-11-21T13:11:53Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:2399
+2026-11-21T13:11:53Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/license_exchange.rs:296
+2026-11-21T13:11:53Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:165
+2026-11-21T13:11:53Z IronRDP connected.
+2026-11-21T13:11:55Z IronRDP session terminated: [payload error] PDU error: [ironrdp_dvc::client::DynamicVirtualChannel::process::{{closure}}] decode error
+2026-11-21T13:11:55Z IronRDP disconnected.

@@ -1,0 +1,14 @@
+2026-11-21T13:13:09Z RDP engine=ironrdp version=cndf-ironrdp 0.1.0 ironrdp=15b4a03ff552 patches=26
+2026-11-21T13:13:09Z RDP channels clipboard=off folder=off audio=off
+2026-11-21T13:13:09Z RDP keyboard profile=standard layout=0x0 type=4 subtype=0 fn=12
+2026-11-21T13:13:09Z Starting IronRDP connection
+2026-11-21T13:13:09Z GCC display requested: 1280x800 DesktopScaleFactor=100 DeviceScaleFactor=100.
+2026-11-21T13:13:09Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:23
+2026-11-21T13:13:09Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:1606
+2026-11-21T13:13:09Z RDP tls profile=modern version=TLSv1.3 cipher=TLS13_AES_256_GCM_SHA384 engine=ironrdp
+2026-11-21T13:13:09Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:2399
+2026-11-21T13:13:09Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/license_exchange.rs:296
+2026-11-21T13:13:09Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:165
+2026-11-21T13:13:09Z IronRDP connected.
+2026-11-21T13:13:11Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-session/src/fast_path.rs:1026
+2026-11-21T13:13:29Z IronRDP disconnected.

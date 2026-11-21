@@ -1,0 +1,15 @@
+2026-11-21T13:14:28Z RDP engine=ironrdp version=cndf-ironrdp 0.1.0 ironrdp=15b4a03ff552 patches=26
+2026-11-21T13:14:28Z RDP channels clipboard=on folder=off audio=off
+2026-11-21T13:14:28Z RDP keyboard profile=standard layout=0x0 type=4 subtype=0 fn=12
+2026-11-21T13:14:28Z Starting IronRDP connection
+2026-11-21T13:14:28Z GCC display requested: 1280x800 DesktopScaleFactor=100 DeviceScaleFactor=100.
+2026-11-21T13:14:28Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:23
+2026-11-21T13:14:28Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:1606
+2026-11-21T13:14:28Z RDP tls profile=modern version=TLSv1.3 cipher=TLS13_AES_256_GCM_SHA384 engine=ironrdp
+2026-11-21T13:14:28Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:2399
+2026-11-21T13:14:28Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/license_exchange.rs:296
+2026-11-21T13:14:28Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:165
+2026-11-21T13:14:28Z IronRDP connected.
+2026-11-21T13:14:45Z event /Users/danivosy/xcode-work/int-6-17a1b345/hostile/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-cliprdr/src/lib.rs:2238
+2026-11-21T13:14:45Z Clipboard remote data dropped reason=oversized count=1 max_length=268435456
+2026-11-21T13:15:29Z IronRDP disconnected.

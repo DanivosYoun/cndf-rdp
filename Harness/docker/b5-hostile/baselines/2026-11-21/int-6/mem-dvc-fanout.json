@@ -1,0 +1,185 @@
+{
+  "engine" : "ironrdp",
+  "finishedAt" : "2026-11-21T22:12:54+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : false,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 439.6,
+        "min" : 439.6,
+        "p50" : 439.6,
+        "p95" : 439.6
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 485,
+        "min" : 485,
+        "p50" : 485,
+        "p95" : 485
+      },
+      "host" : "127.0.0.1",
+      "id" : "warmup",
+      "iterations" : [
+        {
+          "audioWavesReceived" : 0,
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 439.6,
+          "connected" : true,
+          "cpuSystemMs" : 263.06,
+          "cpuUserMs" : 163.25900000000001,
+          "durationMs" : 9756,
+          "firstFrameMs" : 485,
+          "firstFrameSize" : [
+            1024,
+            768
+          ],
+          "frameBytesReceived" : 3145728,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 1,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 24025691,
+          "physFootprintMaxBytes" : 26231576,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 256,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 260.2,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:8.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 3145728,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "32a3ca9d78918f5223691845ade067a2691e84bba829b5d7ea7d9738d4426324",
+              "32a3ca9d78918f5223691845ade067a2691e84bba829b5d7ea7d9738d4426324"
+            ]
+          ],
+          "trustStringDigests" : [
+            "4310b5297c79666bf59541442df526a67d9790cbe27316f3938185992443d7ef"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33899,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 260.2,
+        "min" : 260.2,
+        "p50" : 260.2,
+        "p95" : 260.2
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 430.5,
+        "min" : 430.5,
+        "p50" : 430.5,
+        "p95" : 430.5
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+        "iteration 1: unexpected disconnect before shutdown: error"
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 474.1,
+        "min" : 474.1,
+        "p50" : 474.1,
+        "p95" : 474.1
+      },
+      "host" : "127.0.0.1",
+      "id" : "attack",
+      "iterations" : [
+        {
+          "audioWavesReceived" : 0,
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 430.5,
+          "connected" : true,
+          "cpuSystemMs" : 1203.0079999999998,
+          "cpuUserMs" : 344.134,
+          "disconnectBeforeShutdown" : "error",
+          "disconnectReason" : "error",
+          "durationMs" : 61477.7,
+          "firstFrameMs" : 474.1,
+          "firstFrameSize" : [
+            1024,
+            768
+          ],
+          "frameBytesReceived" : 3145728,
+          "framesDisplayedWithTap" : 1,
+          "framesReceived" : 1,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 29566913,
+          "physFootprintMaxBytes" : 29868848,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 0,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 1.8,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "waitFirstFrame:ok",
+            "idle:60.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 3145728,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "32a3ca9d78918f5223691845ade067a2691e84bba829b5d7ea7d9738d4426324",
+              "32a3ca9d78918f5223691845ade067a2691e84bba829b5d7ea7d9738d4426324"
+            ]
+          ],
+          "trustStringDigests" : [
+            "4310b5297c79666bf59541442df526a67d9790cbe27316f3938185992443d7ef"
+          ]
+        }
+      ],
+      "passed" : false,
+      "port" : 33899,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 1.8,
+        "min" : 1.8,
+        "p50" : 1.8,
+        "p95" : 1.8
+      }
+    }
+  ],
+  "scenario" : "mem-dvc-fanout",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-21T22:11:42+09:00"
+}
