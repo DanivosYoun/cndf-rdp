@@ -1,0 +1,201 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 2a7ac48..eead4f5 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -6427,11 +6427,9 @@ fn process_clipboard_message(
+                 .initiate_paste(format)
+                 .map_err(|e| ironrdp_session::custom_err!("CLIPRDR", e))?,
+         ),
+-        ClipboardMessage::SendFileContentsRequest(request) => Some(
+-            cliprdr_client
+-                .request_file_contents(request)
+-                .map_err(|e| ironrdp_session::custom_err!("CLIPRDR", e))?,
+-        ),
++        ClipboardMessage::SendFileContentsRequest(request) => cliprdr_client
++            .request_file_contents_for_session(request)
++            .map_err(|e| ironrdp_session::custom_err!("CLIPRDR", e))?,
+         ClipboardMessage::SendFileContentsResponse(response) => Some(
+             cliprdr_client
+                 .submit_file_contents(response)
+diff --git a/crates/ironrdp-cliprdr/src/lib.rs b/crates/ironrdp-cliprdr/src/lib.rs
+index 083ace4..edd6472 100644
+--- a/crates/ironrdp-cliprdr/src/lib.rs
++++ b/crates/ironrdp-cliprdr/src/lib.rs
+@@ -62,6 +62,8 @@ pub(crate) struct FileTransferState {
+     /// Flags from the request (SIZE or RANGE)
+     /// Used for SIZE/RANGE response validation
+     pub flags: FileContentsFlags,
++    /// Maximum byte count for a RANGE response.
++    pub requested_size: u32,
+     /// When this request was sent (milliseconds from backend clock).
+     /// Used for stale request cleanup.
+     pub sent_at_ms: u64,
+@@ -431,8 +433,8 @@ const MAX_PENDING_FORMAT_DATA_REQUESTS: usize = 64;
+ /// A rejected request is a per-request failure, not a channel failure. The
+ /// backend is notified with an error response so it can release whatever is
+ /// waiting on that stream id -- the same treatment `FormatListResponse::Fail`
+-/// already gives pending requests -- and the error is still returned for
+-/// callers that surface it.
++/// already gives pending requests. The session dispatcher handles this outcome
++/// without sending a PDU or terminating the session.
+ macro_rules! reject_file_contents_request {
+     ($self:ident, $stream_id:expr, $description:expr) => {{
+         let description = $description;
+@@ -444,10 +446,7 @@ macro_rules! reject_file_contents_request {
+         $self
+             .backend
+             .on_file_contents_response(FileContentsResponse::new_error($stream_id));
+-        return Err(ironrdp_pdu::PduError::new(
+-            "request_file_contents",
+-            ironrdp_pdu::PduErrorKind::Other { description },
+-        ));
++        return Ok(Err(description));
+     }};
+ }
+ 
+@@ -1449,7 +1448,26 @@ impl<R: Role> Cliprdr<R> {
+     /// The streamId is tracked to validate the corresponding FileContentsResponse.
+     ///
+     /// [2.2.5.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeclip/cbc851d3-4e68-45f4-9292-26872a9209f2
+-    pub fn request_file_contents(&mut self, mut request: FileContentsRequest) -> PduResult<CliprdrSvcMessages<R>> {
++    pub fn request_file_contents(&mut self, request: FileContentsRequest) -> PduResult<CliprdrSvcMessages<R>> {
++        self.prepare_file_contents_request(request)?.map_err(|description| {
++            ironrdp_pdu::PduError::new("request_file_contents", ironrdp_pdu::PduErrorKind::Other { description })
++        })
++    }
++
++    /// Queues a file contents request. A request rejected by validation is
++    /// reported to the backend as a failed stream and returns no channel messages.
++    /// An unusable channel state still returns an error.
++    pub fn request_file_contents_for_session(
++        &mut self,
++        request: FileContentsRequest,
++    ) -> PduResult<Option<CliprdrSvcMessages<R>>> {
++        Ok(self.prepare_file_contents_request(request)?.ok())
++    }
++
++    fn prepare_file_contents_request(
++        &mut self,
++        mut request: FileContentsRequest,
++    ) -> PduResult<Result<CliprdrSvcMessages<R>, &'static str>> {
+         if let Err(error) = self.require_ready("request_file_contents") {
+             self.backend
+                 .on_file_contents_response(FileContentsResponse::new_error(request.stream_id));
+@@ -1592,6 +1610,7 @@ impl<R: Role> Cliprdr<R> {
+             FileTransferState {
+                 file_index: validated_file_index,
+                 flags: request.flags,
++                requested_size: request.requested_size,
+                 sent_at_ms: self.backend.now_ms(),
+                 clip_data_id: request.data_id,
+             },
+@@ -1605,7 +1624,7 @@ impl<R: Role> Cliprdr<R> {
+         );
+ 
+         let pdu = ClipboardPdu::FileContentsRequest(request);
+-        Ok(vec![into_cliprdr_message(pdu)].into())
++        Ok(Ok(vec![into_cliprdr_message(pdu)].into()))
+     }
+ 
+     /// [2.2.5.2] CLIPRDR_FILELIST - Initiates file copy operation
+@@ -2130,6 +2149,12 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
+                         );
+                         self.backend
+                             .on_file_contents_response(FileContentsResponse::new_error(stream_id));
++                    } else if transfer_state.flags.contains(FileContentsFlags::RANGE)
++                        && u64::from(transfer_state.requested_size) < response.data().len() as u64
++                    {
++                        warn!(stream_id, "FileContentsResponse exceeds the requested range length");
++                        self.backend
++                            .on_file_contents_response(FileContentsResponse::new_error(stream_id));
+                     } else {
+                         // Forward valid response to backend
+                         self.backend.on_file_contents_response(response);
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/file_contents_state_machine.rs b/crates/ironrdp-testsuite-core/tests/clipboard/file_contents_state_machine.rs
+index e56c2bc..6d58299 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/file_contents_state_machine.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/file_contents_state_machine.rs
+@@ -166,6 +166,7 @@ fn response_validation() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::SIZE,
++            requested_size: 8,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -230,6 +231,7 @@ fn error_response_clears_tracking() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::SIZE,
++            requested_size: 8,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -264,6 +266,7 @@ fn malformed_size_response_converted_to_error() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::SIZE,
++            requested_size: 8,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -306,6 +309,7 @@ fn error_response_data_sanitized() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::RANGE,
++            requested_size: 1024,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/upload_and_cleanup.rs b/crates/ironrdp-testsuite-core/tests/clipboard/upload_and_cleanup.rs
+index b989d82..c4ddc03 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/upload_and_cleanup.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/upload_and_cleanup.rs
+@@ -151,6 +151,7 @@ fn format_list_preserves_in_flight_file_contents_requests() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::SIZE,
++            requested_size: 8,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -210,6 +211,7 @@ fn format_list_response_fail_notifies_backend_for_pending_requests() {
+             FileTransferState {
+                 file_index: 0,
+                 flags: FileContentsFlags::RANGE,
++                requested_size: 1024,
+                 sent_at_ms: 0,
+                 clip_data_id: None,
+             },
+@@ -269,6 +271,7 @@ fn stale_request_cleanup_after_timeout() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::SIZE,
++            requested_size: 8,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -278,6 +281,7 @@ fn stale_request_cleanup_after_timeout() {
+         FileTransferState {
+             file_index: 1,
+             flags: FileContentsFlags::RANGE,
++            requested_size: 1024,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -318,6 +322,7 @@ fn stale_request_cleanup_spares_recent_requests() {
+         FileTransferState {
+             file_index: 0,
+             flags: FileContentsFlags::SIZE,
++            requested_size: 8,
+             sent_at_ms: 0,
+             clip_data_id: None,
+         },
+@@ -331,6 +336,7 @@ fn stale_request_cleanup_spares_recent_requests() {
+         FileTransferState {
+             file_index: 1,
+             flags: FileContentsFlags::RANGE,
++            requested_size: 1024,
+             sent_at_ms: 150,
+             clip_data_id: None,
+         },

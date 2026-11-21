@@ -184,6 +184,7 @@ fn run(
         .with_client_dir("")
         .with_platform(ironrdp_pdu::rdp::capability_sets::MajorPlatformType::OSX)
         .with_client_name(channels::client_name())
+        // RDPDR carries a static Noop rdpsnd companion when local playback is off.
         .with_rdpdr(channels::rdpdr_enabled(
             options.channels.drive.is_some(),
             options.channels.audio,
@@ -221,6 +222,10 @@ fn run(
         let _ = output.blocking_send(Output::Failure(errors::CONFIGURATION));
         return;
     };
+    let audio_statistics = Arc::clone(&connection.statistics);
+    let config = config.with_audio_wave_observer(Arc::new(move || {
+        lock(&audio_statistics).audio_waves_received += 1;
+    }));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();

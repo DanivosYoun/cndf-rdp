@@ -23,18 +23,10 @@ pub(super) enum ClipboardCommand {
 #[no_mangle]
 pub extern "C" fn cndf_iron_capabilities() -> u32 {
     ffi(0, || {
-        #[cfg(feature = "stub")]
-        return CNDF_IRON_CAP_CLIPBOARD
+        CNDF_IRON_CAP_CLIPBOARD
             | CNDF_IRON_CAP_DRIVE
             | CNDF_IRON_CAP_AUDIO_LOCAL
-            | CNDF_IRON_CAP_AUDIO_REMOTE;
-        #[cfg(not(feature = "stub"))]
-        {
-            // Upstream range validation also aborts the active session.
-            // The native playback backend has no wave observation hook.
-            // RDPDR also advertises Noop RDPSND, even when playback is off.
-            CNDF_IRON_CAP_AUDIO_REMOTE
-        }
+            | CNDF_IRON_CAP_AUDIO_REMOTE
     })
 }
 
@@ -650,8 +642,8 @@ mod real {
         use ironrdp_cliprdr::pdu::ClipboardFormatName;
 
         #[test]
-        fn real_capabilities_expose_only_completed_channels() {
-            assert_eq!(cndf_iron_capabilities(), CNDF_IRON_CAP_AUDIO_REMOTE);
+        fn real_capabilities_expose_all_channels() {
+            assert_eq!(cndf_iron_capabilities(), 0xf);
         }
 
         #[test]
@@ -711,6 +703,100 @@ mod real {
                 matches!(receive.try_recv().unwrap(), Message::SendInitiateFileCopy(files)
                 if files.len() == 1 && files[0].file_size == Some(7))
             );
+        }
+
+        #[test]
+        fn rejected_ranges_leave_clipboard_ready_for_the_next_request() {
+            use ironrdp_cliprdr::pdu::{ClipboardPdu, FormatListResponse};
+            use ironrdp_cliprdr::CliprdrClient;
+            use ironrdp_svc::SvcProcessor as _;
+
+            type Responses = Vec<(u32, Option<Vec<u8>>)>;
+            extern "C" fn record_range(
+                _: u64,
+                stream_id: u32,
+                ok: bool,
+                bytes: *const u8,
+                length: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let data = ok.then(|| unsafe { std::slice::from_raw_parts(bytes, length).to_vec() });
+                unsafe { &mut *context.cast::<Responses>() }.push((stream_id, data));
+            }
+
+            let mut responses = Responses::new();
+            let table = CNDFIronCallbacks {
+                remote_file_contents: Some(record_range),
+                context: (&mut responses as *mut Responses).cast(),
+                // Every other field is an optional callback.
+                ..unsafe { std::mem::zeroed() }
+            };
+            let connection = Connection {
+                generation: 1,
+                connected: AtomicBool::new(true),
+                stop: AtomicBool::new(false),
+                input: Mutex::default(),
+                clipboard: Mutex::default(),
+                log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
+                callbacks: Arc::new(Callbacks {
+                    table,
+                    gate: Mutex::default(),
+                    closed: AtomicBool::new(false),
+                }),
+                statistics: Arc::default(),
+            };
+
+            let (input, _events) = RdpInputSender::channel(1);
+            let (work, jobs) = mpsc::channel();
+            let (messages, receive) = mpsc::channel();
+            let mut channel = Channel::new(input, work);
+            channel.messages = Some(messages);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            let ready = ClipboardPdu::FormatListResponse(FormatListResponse::Ok);
+            cliprdr
+                .process(&ironrdp_core::encode_vec(&ready).unwrap())
+                .unwrap();
+
+            for stream_id in 1..=3 {
+                assert_eq!(
+                    channel.submit(ClipboardCommand::Range {
+                        stream_id,
+                        list_index: 0,
+                        offset: 0,
+                        length: 1,
+                    }),
+                    CNDF_IRON_OK
+                );
+                let Message::SendFileContentsRequest(mut request) = receive.try_recv().unwrap() else {
+                    panic!("expected file contents request");
+                };
+                if stream_id == 1 {
+                    // The local caller can submit the request, but CLIPRDR rejects a negative index.
+                    request.index = -1;
+                    assert!(cliprdr
+                        .request_file_contents_for_session(request)
+                        .unwrap()
+                        .is_none());
+                } else {
+                    assert!(cliprdr
+                        .request_file_contents_for_session(request)
+                        .unwrap()
+                        .is_some());
+                    let bytes = if stream_id == 2 { vec![1, 2] } else { vec![3] };
+                    let response = ClipboardPdu::FileContentsResponse(
+                        FileContentsResponse::new_data_response(stream_id, bytes),
+                    );
+                    cliprdr
+                        .process(&ironrdp_core::encode_vec(&response).unwrap())
+                        .unwrap();
+                }
+                assert!(cliprdr.is_ready());
+                assert!(!lock(&channel.state).requests.contains(&stream_id));
+                jobs.try_recv().unwrap()(&connection);
+                assert!(jobs.try_recv().is_err());
+            }
+            assert_eq!(responses, [(1, None), (2, None), (3, Some(vec![3]))]);
+            assert!(cliprdr.process(&[]).is_err());
         }
 
         #[test]
