@@ -59,6 +59,7 @@ struct RDPBridgeSession {
     CONNECTION_STATE furthest_state;
     BOOL certificate_rejected;
     DispClientContext *disp;
+    pcDispCaps prev_disp_caps;
     CliprdrClientContext *cliprdr;
     char *local_text;
     size_t local_text_length;
@@ -703,6 +704,30 @@ static void bridge_log_graphics_summary(RDPBridgeSession *session) {
         used > 0 ? summary : " none");
 }
 
+static UINT bridge_disp_caps(
+    DispClientContext *context,
+    UINT32 max_num_monitors,
+    UINT32 max_monitor_area_factor_a,
+    UINT32 max_monitor_area_factor_b) {
+    RDPBridgeSession *session = (context != NULL) ? (RDPBridgeSession *)context->custom : NULL;
+    pcDispCaps previous = NULL;
+    if (session != NULL) {
+        previous = session->prev_disp_caps;
+        unsigned long long max_area = (unsigned long long)max_num_monitors *
+                                      (unsigned long long)max_monitor_area_factor_a *
+                                      (unsigned long long)max_monitor_area_factor_b;
+        bridge_logf(
+            session,
+            "Display control capabilities received: maxMonitors=%u maxArea=%llu.",
+            max_num_monitors,
+            max_area);
+    }
+    if (previous != NULL) {
+        return previous(context, max_num_monitors, max_monitor_area_factor_a, max_monitor_area_factor_b);
+    }
+    return CHANNEL_RC_OK;
+}
+
 static void bridge_channel_connected(void *context, const ChannelConnectedEventArgs *event) {
     freerdp_client_OnChannelConnectedEventHandler(context, event);
 
@@ -729,6 +754,10 @@ static void bridge_channel_connected(void *context, const ChannelConnectedEventA
         (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0)) {
         session->disp = (DispClientContext *)event->pInterface;
         session->disp->custom = session;
+        session->prev_disp_caps = (session->disp->DisplayControlCaps != bridge_disp_caps)
+            ? session->disp->DisplayControlCaps
+            : NULL;
+        session->disp->DisplayControlCaps = bridge_disp_caps;
         bridge_log(session, "Display control channel connected.");
         return;
     }
@@ -785,6 +814,8 @@ static void bridge_channel_disconnected(void *context, const ChannelDisconnected
     if ((strcmp(event->name, DISP_CHANNEL_NAME) == 0) ||
         (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0)) {
         session->disp = NULL;
+        session->prev_disp_caps = NULL;
+        bridge_log(session, "Display control channel closed.");
     } else if (strcmp(event->name, CLIPRDR_CHANNEL_NAME) == 0) {
         session->cliprdr = NULL;
     }
@@ -1826,6 +1857,7 @@ static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_t
     bridge_clear_local_files(session);
     bridge_free_retry_options(session);
     session->disp = NULL;
+    session->prev_disp_caps = NULL;
     session->cliprdr = NULL;
     session->connected = false;
     return RDPBridgeStatusOK;

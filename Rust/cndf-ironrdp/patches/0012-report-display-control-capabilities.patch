@@ -1,0 +1,29 @@
+diff --git a/crates/ironrdp-displaycontrol/src/client.rs b/crates/ironrdp-displaycontrol/src/client.rs
+index 3ac0136..56e95c5 100644
+--- a/crates/ironrdp-displaycontrol/src/client.rs
++++ b/crates/ironrdp-displaycontrol/src/client.rs
+@@ -142,12 +142,23 @@ impl DvcProcessor for DisplayControlClient {
+         };
+         debug!("Received {:?}", caps);
+         self.capabilities = Some(caps);
++        tracing::info!(
++            target: "cndf_rdp_display",
++            "Display control capabilities received: maxMonitors={} maxArea={}.",
++            caps.max_num_monitors(),
++            caps.max_monitor_area(),
++        );
+         (self.on_capabilities_received)(caps)
+     }
+ 
+     fn close(&mut self, _channel_id: u32) {
+         // A server can open the channel again; it is ready once it sends caps.
+-        self.capabilities = None;
++        if self.capabilities.take().is_some() {
++            tracing::info!(
++                target: "cndf_rdp_display",
++                "Display control channel closed."
++            );
++        }
+     }
+ }
+ 

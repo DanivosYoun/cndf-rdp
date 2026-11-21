@@ -90,6 +90,11 @@ struct HarnessExpectation: Decodable {
     var disconnect: String?
     /// Upper bound for view.shutdown() wall time.
     var maxShutdownMs: Int?
-    /// The final resize applies and leaves the session connected without reconnecting.
+    /// The resize step leaves the session connected without reconnecting, and checks the final
+    /// frame size when Display Control opened on the server (N/A otherwise).
     var resizeKeepsSession: Bool?
+    /// Overrides the final frame size check under `resizeKeepsSession`. Set `false` for test
+    /// servers that open Display Control without applying monitor layouts (e.g. IronRDP B1
+    /// examples/server); nil checks whenever Display Control opened.
+    var resizeAppliesFrameSize: Bool?
 }
