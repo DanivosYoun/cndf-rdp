@@ -32,7 +32,8 @@ pub extern "C" fn cndf_iron_capabilities() -> u32 {
         {
             // Upstream range validation also aborts the active session.
             // The native playback backend has no wave observation hook.
-            CNDF_IRON_CAP_DRIVE | CNDF_IRON_CAP_AUDIO_REMOTE
+            // RDPDR also advertises Noop RDPSND, even when playback is off.
+            CNDF_IRON_CAP_AUDIO_REMOTE
         }
     })
 }
@@ -647,6 +648,11 @@ mod real {
     mod tests {
         use super::*;
         use ironrdp_cliprdr::pdu::ClipboardFormatName;
+
+        #[test]
+        fn real_capabilities_expose_only_completed_channels() {
+            assert_eq!(cndf_iron_capabilities(), CNDF_IRON_CAP_AUDIO_REMOTE);
+        }
 
         #[test]
         fn clipboard_defers_offers_until_ready_and_gates_file_streaming() {

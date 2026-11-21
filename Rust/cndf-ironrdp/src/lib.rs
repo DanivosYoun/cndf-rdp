@@ -369,6 +369,9 @@ pub unsafe extern "C" fn cndf_iron_connect(
             mode => mode,
         };
         channel_options.clipboard &= capabilities & CNDF_IRON_CAP_CLIPBOARD != 0;
+        if capabilities & CNDF_IRON_CAP_DRIVE == 0 {
+            channel_options.drive = None;
+        }
         if ptr::addr_of!((*options).log_level).cast::<u32>().read() > 6
             || ptr::addr_of!((*options).graphics_pipeline)
                 .cast::<u8>()
