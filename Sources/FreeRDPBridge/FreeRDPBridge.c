@@ -2069,11 +2069,6 @@ RDPBridgeStatus rdp_bridge_update_desktop_size(RDPBridgeSession *session, uint32
     session->desktop_width = width;
     session->desktop_height = height;
     session->desktop_scale = scale;
-    if (session->instance != NULL) {
-        rdpSettings *settings = session->instance->context->settings;
-        freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, width);
-        freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height);
-    }
 
     if ((session->disp != NULL) && (session->disp->SendMonitorLayout != NULL)) {
         DISPLAY_CONTROL_MONITOR_LAYOUT monitor = { 0 };
