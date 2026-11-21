@@ -295,58 +295,145 @@ mod real {
 
     pub(crate) type Job = Box<dyn FnOnce(&Connection) + Send>;
 
-    /// Why a RANGE was answered with a failure on the session thread.
+    /// Why a server request was answered with a failure, or server clipboard data was dropped.
     #[derive(Clone, Copy)]
     enum Refusal {
         Budget,
         MissingFile,
         InvalidRange,
+        RemoteFailure,
+        MalformedText,
+        Superseded,
+        Oversized,
     }
 
-    const REFUSALS: [(Refusal, &str); 3] = [
-        (Refusal::Budget, "budget"),
-        (Refusal::MissingFile, "missing-file"),
-        (Refusal::InvalidRange, "invalid-range"),
+    const REFUSALS: [(Refusal, &str); 7] = [
+        (Refusal::Budget, "Clipboard RANGE failed reason=budget"),
+        (
+            Refusal::MissingFile,
+            "Clipboard RANGE failed reason=missing-file",
+        ),
+        (
+            Refusal::InvalidRange,
+            "Clipboard RANGE failed reason=invalid-range",
+        ),
+        (
+            Refusal::RemoteFailure,
+            "Clipboard format data rejected reason=remote-failure",
+        ),
+        (
+            Refusal::MalformedText,
+            "Clipboard format data rejected reason=malformed-utf16",
+        ),
+        (
+            Refusal::Superseded,
+            "Clipboard remote data dropped reason=superseded",
+        ),
+        (
+            Refusal::Oversized,
+            "Clipboard remote data dropped reason=oversized",
+        ),
     ];
 
-    /// RANGE failures not yet logged: a count and the longest requested length per reason.
+    /// Failures not yet logged: a count and the longest length per reason.
     ///
-    /// INVARIANT: Fixed size, so a request flood adds no queued work or log record.
+    /// INVARIANT: Fixed size, so a request or response flood adds no queued work or log record.
     #[derive(Default)]
-    struct Refusals([(u64, u32); REFUSALS.len()]);
+    struct Refusals([(u64, u64); REFUSALS.len()]);
 
     impl Refusals {
-        fn record(&mut self, refusal: Refusal, length: u32) {
+        fn record(&mut self, refusal: Refusal, length: u64) {
             let (count, longest) = &mut self.0[refusal as usize];
             *count += 1;
             *longest = (*longest).max(length);
         }
     }
 
-    /// The clip worker's inputs: its job queue and the RANGE failures it logs.
+    /// The most bytes of server clipboard data held for the app: 8 Mi UTF-16 units of text.
+    const MAX_REMOTE_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Server clipboard data the clip worker has not handed to the app yet.
+    enum Remote {
+        /// UTF-16LE as received.
+        Text(Vec<u8>),
+        Files(Vec<(String, u64)>),
+    }
+
+    impl Remote {
+        /// The bytes counted against `MAX_REMOTE_CLIPBOARD_BYTES`.
+        fn bytes(&self) -> usize {
+            match self {
+                Self::Text(data) => data.len(),
+                Self::Files(files) => files
+                    .iter()
+                    .map(|(name, _)| name.len() + std::mem::size_of::<(String, u64)>())
+                    .sum(),
+            }
+        }
+    }
+
+    /// The clip worker's inputs: its job queue, the newest server clipboard data, and the failures
+    /// it logs.
     #[derive(Clone)]
     pub(crate) struct ClipJobs {
         work: mpsc::Sender<Job>,
+        /// INVARIANT: One slot, so a response flood holds at most `MAX_REMOTE_CLIPBOARD_BYTES`.
+        remote: Arc<Mutex<Option<Remote>>>,
         refusals: Arc<Mutex<Refusals>>,
     }
 
     impl ClipJobs {
         fn new() -> (Self, mpsc::Receiver<Job>) {
             let (work, jobs) = mpsc::channel::<Job>();
-            let refusals = Arc::default();
-            (Self { work, refusals }, jobs)
+            let inputs = Self {
+                work,
+                remote: Arc::default(),
+                refusals: Arc::default(),
+            };
+            (inputs, jobs)
         }
 
-        /// Logs the RANGE failures recorded since the previous call.
+        /// Replaces the data the clip worker has not delivered: a clipboard means only its newest
+        /// value, so data over the limit drops the older value too.
+        fn offer_remote(&self, remote: Remote) {
+            let bytes = remote.bytes();
+            let mut pending = lock(&self.remote);
+            let mut refusals = lock(&self.refusals);
+            if let Some(superseded) = pending.take() {
+                refusals.record(Refusal::Superseded, superseded.bytes() as u64);
+            }
+            if bytes > MAX_REMOTE_CLIPBOARD_BYTES {
+                refusals.record(Refusal::Oversized, bytes as u64);
+            } else {
+                *pending = Some(remote);
+            }
+        }
+
+        /// The clip worker's work between jobs: delivers the newest server data, then logs.
+        fn flush(&self, connection: &Connection) {
+            let remote = lock(&self.remote).take();
+            match remote {
+                Some(Remote::Text(data)) => match decode_text(&data) {
+                    Some(text) => notify_text(connection, &text),
+                    None => lock(&self.refusals).record(Refusal::MalformedText, data.len() as u64),
+                },
+                Some(Remote::Files(files)) => notify_files(
+                    connection,
+                    files.iter().map(|(name, size)| (name.as_str(), *size)),
+                ),
+                None => {}
+            }
+            self.log_refusals(connection);
+        }
+
+        /// Logs the failures recorded since the previous call.
         fn log_refusals(&self, connection: &Connection) {
             let refusals = std::mem::take(&mut *lock(&self.refusals));
-            for ((_, reason), (count, longest)) in REFUSALS.iter().zip(refusals.0) {
+            for ((_, message), (count, longest)) in REFUSALS.iter().zip(refusals.0) {
                 if count != 0 {
                     connection.clip_log(
                         CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
-                        &format!(
-                            "Clipboard RANGE failed reason={reason} count={count} max_length={longest}"
-                        ),
+                        &format!("{message} count={count} max_length={longest}"),
                     );
                 }
             }
@@ -359,7 +446,7 @@ mod real {
             connection: Arc<Connection>,
         ) -> std::io::Result<(ClipJobs, JoinHandle<()>)> {
             let (jobs, recv) = ClipJobs::new();
-            let logs = jobs.clone();
+            let pending = jobs.clone();
             let worker = thread::Builder::new()
                 .name(format!("cndf-iron-{}-clip", connection.generation))
                 .spawn(move || {
@@ -370,7 +457,7 @@ mod real {
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
-                            logs.log_refusals(&connection);
+                            pending.flush(&connection);
                         }
                     })
                 })?;
@@ -456,7 +543,7 @@ mod real {
             refusal: Refusal,
             length: u32,
         ) -> FileContentsResponse<'static> {
-            lock(&self.jobs.refusals).record(refusal, length);
+            lock(&self.jobs.refusals).record(refusal, u64::from(length));
             FileContentsResponse::new_error(stream)
         }
 
@@ -710,39 +797,25 @@ mod real {
         fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
             let requested_file = lock(&self.0.state).pastes.pop_front();
             if response.is_error() {
-                self.0.queue(|connection| {
-                    connection.clip_log(
-                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
-                        "Clipboard format data rejected reason=remote-failure",
-                    );
-                });
+                lock(&self.0.jobs.refusals)
+                    .record(Refusal::RemoteFailure, response.data().len() as u64);
                 return;
             }
             if requested_file != Some(false) {
                 return;
             }
-            let bytes = response.data().to_vec();
-            self.0.queue(move |connection| match decode_text(&bytes) {
-                Some(text) => notify_text(connection, &text),
-                None => connection.clip_log(
-                    CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
-                    "Discarded malformed clipboard UTF-16",
-                ),
-            });
+            self.0
+                .jobs
+                .offer_remote(Remote::Text(response.data().to_vec()));
         }
 
         fn on_remote_file_list(&mut self, files: &[FileDescriptor], _: Option<u32>) {
             lock(&self.0.state).pastes.pop_front();
-            let files: Vec<_> = files
+            let files = files
                 .iter()
                 .map(|file| (remote_name(file), file.file_size.unwrap_or(0)))
                 .collect();
-            self.0.queue(move |connection| {
-                notify_files(
-                    connection,
-                    files.iter().map(|(name, size)| (name.as_str(), *size)),
-                );
-            });
+            self.0.jobs.offer_remote(Remote::Files(files));
         }
 
         // CLIPRDR calls `respond_to_file_contents_request` instead.
@@ -818,7 +891,7 @@ mod real {
         use ironrdp_client::rdp::RdpInputEvent;
         use ironrdp_cliprdr::pdu::{
             Capabilities as ChannelCapabilities, ClipboardFormatName, ClipboardPdu,
-            ClipboardProtocolVersion, FormatListResponse,
+            ClipboardProtocolVersion, FormatList, FormatListResponse, PackedFileList,
         };
         use ironrdp_cliprdr::CliprdrClient;
         use ironrdp_svc::{SvcMessage, SvcProcessor as _};
@@ -1057,13 +1130,13 @@ mod real {
             while let Ok(job) = jobs.try_recv() {
                 job(&connection);
             }
-            channel.jobs.log_refusals(&connection);
+            channel.jobs.flush(&connection);
             assert_eq!(
                 logs,
                 [
                     "Clipboard file offer rejected descriptors count=1",
-                    "Clipboard format data rejected reason=remote-failure",
                     "Clipboard RANGE failed reason=missing-file count=1 max_length=8",
+                    "Clipboard format data rejected reason=remote-failure count=1 max_length=0",
                 ]
             );
         }
@@ -1244,6 +1317,128 @@ mod real {
             fn refused(&self, refusal: Refusal) -> u64 {
                 lock(&self.channel.jobs.refusals).0[refusal as usize].0
             }
+
+            /// The server copies one format, the app pastes it, and the server answers `response`.
+            fn remote_paste(&mut self, format: ClipboardFormat, response: OwnedFormatDataResponse) {
+                let copy =
+                    ClipboardPdu::FormatList(FormatList::new_unicode(&[format], true).unwrap());
+                self.cliprdr
+                    .process(&ironrdp_core::encode_vec(&copy).unwrap())
+                    .unwrap();
+                let Ok(RdpInputEvent::Clipboard(Message::SendInitiatePaste(id))) =
+                    self.ordered.try_recv()
+                else {
+                    panic!("expected a paste");
+                };
+                self.cliprdr.initiate_paste(id).unwrap();
+                let pdu = ClipboardPdu::FormatDataResponse(response);
+                assert!(self
+                    .cliprdr
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap()
+                    .is_empty());
+            }
+
+            /// The bytes of server clipboard data held for the clip worker.
+            fn held_remote(&self) -> Option<usize> {
+                lock(&self.channel.jobs.remote).as_ref().map(Remote::bytes)
+            }
+        }
+
+        /// What the clip worker handed to the app.
+        #[derive(Default)]
+        struct Delivered {
+            texts: Vec<String>,
+            files: Vec<Vec<(String, u64)>>,
+            logs: Vec<String>,
+        }
+
+        fn delivering_connection(delivered: &mut Delivered) -> Connection {
+            extern "C" fn text(
+                _: u64,
+                bytes: *const u8,
+                length: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+                unsafe { &mut *context.cast::<Delivered>() }
+                    .texts
+                    .push(String::from_utf8(bytes.to_vec()).unwrap());
+            }
+            extern "C" fn files(
+                _: u64,
+                files: *const CNDFIronRemoteFile,
+                count: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let files = unsafe { std::slice::from_raw_parts(files, count) }
+                    .iter()
+                    .map(|file| {
+                        let name =
+                            unsafe { std::slice::from_raw_parts(file.name_utf8, file.name_length) };
+                        (String::from_utf8(name.to_vec()).unwrap(), file.size)
+                    })
+                    .collect();
+                unsafe { &mut *context.cast::<Delivered>() }
+                    .files
+                    .push(files);
+            }
+            extern "C" fn log(
+                _: u64,
+                _: CNDFIronLogLevel,
+                bytes: *const u8,
+                length: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+                unsafe { &mut *context.cast::<Delivered>() }
+                    .logs
+                    .push(String::from_utf8_lossy(bytes).into_owned());
+            }
+            Connection {
+                generation: 1,
+                connected: AtomicBool::new(true),
+                stop: AtomicBool::new(false),
+                input: Mutex::default(),
+                clipboard: Mutex::default(),
+                log_level: CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                callbacks: Arc::new(Callbacks {
+                    table: CNDFIronCallbacks {
+                        remote_text: Some(text),
+                        remote_file_list: Some(files),
+                        log: Some(log),
+                        context: (delivered as *mut Delivered).cast(),
+                        ..unsafe { std::mem::zeroed() }
+                    },
+                    gate: Mutex::default(),
+                    closed: AtomicBool::new(false),
+                }),
+                statistics: Arc::default(),
+            }
+        }
+
+        fn text_format() -> ClipboardFormat {
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)
+        }
+
+        fn file_format() -> ClipboardFormat {
+            ClipboardFormat::new(ClipboardFormatId::new(0xc0ff))
+                .with_name(ClipboardFormatName::FILE_LIST)
+        }
+
+        /// NUL-terminated UTF-16LE, as Windows sends CF_UNICODETEXT.
+        fn utf16(text: &str) -> Vec<u8> {
+            text.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        }
+
+        fn file_list(name: &str, size: u64) -> OwnedFormatDataResponse {
+            FormatDataResponse::new_file_list(&PackedFileList {
+                files: vec![FileDescriptor::new(name).with_file_size(size)],
+            })
+            .unwrap()
         }
 
         fn answers(output: Vec<SvcMessage>) -> Vec<(u32, Option<usize>)> {
@@ -1592,6 +1787,151 @@ mod real {
             );
             assert!(ordered.try_recv().is_err());
             assert!(jobs.try_recv().is_err());
+        }
+
+        // oracle: mutant queuing each server text or file list for the clip worker, holding more
+        // than the newest, or delivering it twice.
+        #[test]
+        fn remote_clipboard_data_keeps_only_the_newest_while_the_clip_worker_is_blocked() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut offered = Offered::new(Vec::new());
+            let text = |copy: u64| utf16(&format!("text {copy} ").repeat(1024));
+            for copy in 0..64 {
+                if copy % 2 == 0 {
+                    offered.remote_paste(text_format(), FormatDataResponse::new_data(text(copy)));
+                } else {
+                    offered
+                        .remote_paste(file_format(), file_list(&format!("file {copy}.txt"), copy));
+                }
+                // The clip worker is blocked: no work is queued for it and one value is held.
+                assert!(
+                    offered.jobs.try_recv().is_err(),
+                    "copy {copy} queued clip work"
+                );
+                assert!(offered
+                    .held_remote()
+                    .is_some_and(|bytes| bytes <= MAX_REMOTE_CLIPBOARD_BYTES));
+            }
+
+            offered.channel.jobs.flush(&connection);
+            offered.channel.jobs.flush(&connection);
+            assert!(delivered.texts.is_empty());
+            assert_eq!(delivered.files, [vec![("file 63.txt".to_owned(), 63)]]);
+            assert_eq!(
+                delivered.logs,
+                [format!(
+                    "Clipboard remote data dropped reason=superseded count=63 max_length={}",
+                    text(62).len()
+                )]
+            );
+            assert_eq!(offered.held_remote(), None);
+        }
+
+        // oracle: mutant holding server data over the limit, or delivering the older data it
+        // replaced.
+        #[test]
+        fn oversized_remote_clipboard_data_is_dropped_with_the_data_it_replaced() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut offered = Offered::new(Vec::new());
+            offered.remote_paste(text_format(), FormatDataResponse::new_data(utf16("older")));
+            let oversized = vec![b'A'; MAX_REMOTE_CLIPBOARD_BYTES + 2];
+            offered.remote_paste(text_format(), FormatDataResponse::new_data(oversized));
+            assert!(offered.jobs.try_recv().is_err());
+            assert_eq!(offered.held_remote(), None);
+
+            offered.channel.jobs.flush(&connection);
+            assert!(delivered.texts.is_empty());
+            assert_eq!(
+                delivered.logs,
+                [
+                    "Clipboard remote data dropped reason=superseded count=1 max_length=12"
+                        .to_owned(),
+                    format!(
+                        "Clipboard remote data dropped reason=oversized count=1 max_length={}",
+                        MAX_REMOTE_CLIPBOARD_BYTES + 2
+                    ),
+                ]
+            );
+
+            // Data within the limit is delivered again.
+            offered.remote_paste(text_format(), FormatDataResponse::new_data(utf16("newer")));
+            offered.channel.jobs.flush(&connection);
+            assert_eq!(delivered.texts, ["newer"]);
+
+            // A file list counts its entries as well as its names.
+            let name = "a".repeat(MAX_REMOTE_CLIPBOARD_BYTES);
+            offered
+                .channel
+                .jobs
+                .offer_remote(Remote::Files(vec![(name, 0)]));
+            assert_eq!(offered.held_remote(), None);
+            offered.channel.jobs.flush(&connection);
+            assert!(delivered.files.is_empty());
+            assert_eq!(
+                delivered.logs.last().unwrap(),
+                &format!(
+                    "Clipboard remote data dropped reason=oversized count=1 max_length={}",
+                    MAX_REMOTE_CLIPBOARD_BYTES + std::mem::size_of::<(String, u64)>()
+                )
+            );
+        }
+
+        // oracle: mutant clip worker that never delivers the held server data.
+        #[test]
+        fn clip_worker_hands_the_held_remote_data_to_the_app() {
+            let mut delivered = Delivered::default();
+            let connection = Arc::new(delivering_connection(&mut delivered));
+            let (jobs, worker) = ClipWork::spawn(Arc::clone(&connection)).unwrap();
+            jobs.offer_remote(Remote::Text(utf16("한글")));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while lock(&jobs.remote).is_some() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            connection.stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            drop(connection);
+            assert_eq!(delivered.texts, ["한글"]);
+        }
+
+        // oracle: mutant queuing a log for each failed or malformed server response.
+        #[test]
+        fn failed_and_malformed_server_responses_are_counted_without_queuing() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut offered = Offered::new(Vec::new());
+            let error = ClipboardPdu::FormatDataResponse(FormatDataResponse::new_error());
+            for _ in 0..100 {
+                // Unsolicited: CLIPRDR hands every format data response to the backend.
+                offered
+                    .cliprdr
+                    .process(&ironrdp_core::encode_vec(&error).unwrap())
+                    .unwrap();
+                assert!(
+                    offered.jobs.try_recv().is_err(),
+                    "a failure queued clip work"
+                );
+            }
+            // An odd number of bytes is not UTF-16.
+            offered.remote_paste(
+                text_format(),
+                FormatDataResponse::new_data(vec![b'A', 0, 0]),
+            );
+            assert!(
+                offered.jobs.try_recv().is_err(),
+                "the text queued clip work"
+            );
+
+            offered.channel.jobs.flush(&connection);
+            assert!(delivered.texts.is_empty());
+            assert_eq!(
+                delivered.logs,
+                [
+                    "Clipboard format data rejected reason=remote-failure count=100 max_length=0",
+                    "Clipboard format data rejected reason=malformed-utf16 count=1 max_length=3",
+                ]
+            );
         }
 
         #[test]
