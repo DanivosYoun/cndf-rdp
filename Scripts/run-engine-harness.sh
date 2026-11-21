@@ -293,16 +293,18 @@ m3_channels() {
   local scenario="${ROOT_DIR}/Harness/docker/scenarios/m3-b1-channels.json"
   mkdir -p "${WORK}/results/${engine}"
   # Start a fresh B1 per engine so its records contain only this scenario's connections.
-  start_b1 a
+  start_b1 a || return
   ENGINE="$engine" run_scenario "$scenario" --reset-trust 1 --drop-trust 1
   docker logs "$(name b1)" > "${WORK}/results/${engine}/b1-server.log" 2>&1
   mv "${WORK}/results"/m3-b1-channels.* "${WORK}/results/${engine}/"
   python3 "${ROOT_DIR}/Harness/docker/b1-ironrdp/channel-results.py" \
-    "$scenario" "${WORK}/results/${engine}/b1-server.log" > "${WORK}/results/${engine}/b1-channels.json"
+    "$scenario" "${WORK}/results/${engine}/b1-server.log" > "${WORK}/results/${engine}/b1-channels.json" || return
+  python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
+    "${WORK}/results/${engine}/m3-b1-channels.json"
 }
 
 m3_b1() {
-  local requested_engine="${1:-both}"
+  local requested_engine="${1:-both}" failed=0
   case "$requested_engine" in
     both|freerdp|ironrdp) ;;
     *) echo "expected both, freerdp or ironrdp" >&2; return 2 ;;
@@ -315,15 +317,16 @@ m3_b1() {
   mac_build
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
   tunnel_up "${PORT_B1}"
-  if [[ "$requested_engine" != ironrdp ]]; then m3_channels freerdp; fi
-  if [[ "$requested_engine" != freerdp ]]; then m3_channels ironrdp; fi
+  if [[ "$requested_engine" != ironrdp ]]; then m3_channels freerdp || failed=1; fi
+  if [[ "$requested_engine" != freerdp ]]; then m3_channels ironrdp || failed=1; fi
   if [[ "$requested_engine" == both ]]; then
-    diff -u "${WORK}/results/freerdp/b1-channels.json" "${WORK}/results/ironrdp/b1-channels.json"
+    diff -u "${WORK}/results/freerdp/b1-channels.json" "${WORK}/results/ironrdp/b1-channels.json" || failed=1
   fi
+  return "$failed"
 }
 
 m3_b3() {
-  local requested_engine="${1:-both}" engine avail
+  local requested_engine="${1:-both}" engine avail failed=0
   case "$requested_engine" in
     both|freerdp|ironrdp) ;;
     *) echo "expected both, freerdp or ironrdp" >&2; return 2 ;;
@@ -353,7 +356,13 @@ m3_b3() {
     mkdir -p "${WORK}/results/${engine}"
     ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/m3-b3-home.json" --reset-trust 1 --drop-trust 1
     mv "${WORK}/results"/m3-b3-home.* "${WORK}/results/${engine}/"
+    docker exec "$(name b3)" sh -c 'for file in /var/log/xrdp.log /var/log/xrdp-sesman.log /home/harness/.local/share/xrdp/xrdp-chansrv*.log; do
+      [ ! -f "$file" ] || tail -100 "$file"
+    done' > "${WORK}/results/${engine}/b3-server.log" 2>&1
+    python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
+      "${WORK}/results/${engine}/m3-b3-home.json" || failed=1
   done
+  return "$failed"
 }
 
 down() {

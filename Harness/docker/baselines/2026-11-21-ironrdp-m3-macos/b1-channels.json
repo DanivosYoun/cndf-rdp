@@ -1,0 +1,76 @@
+[
+  {
+    "audioDvc": {
+      "AUDIO_PLAYBACK_DVC": false,
+      "AUDIO_PLAYBACK_LOSSY_DVC": false
+    },
+    "audioInfoFlags": 524288,
+    "id": "b1-audio-off-folder-off",
+    "staticChannels": [
+      "drdynvc"
+    ]
+  },
+  {
+    "audioDvc": {
+      "AUDIO_PLAYBACK_DVC": false,
+      "AUDIO_PLAYBACK_LOSSY_DVC": false
+    },
+    "audioInfoFlags": 524288,
+    "id": "b1-audio-off-folder-on",
+    "staticChannels": [
+      "drdynvc",
+      "rdpdr",
+      "rdpsnd"
+    ]
+  },
+  {
+    "audioDvc": {
+      "AUDIO_PLAYBACK_DVC": true,
+      "AUDIO_PLAYBACK_LOSSY_DVC": true
+    },
+    "audioInfoFlags": 0,
+    "id": "b1-audio-local-folder-off",
+    "staticChannels": [
+      "drdynvc",
+      "rdpdr",
+      "rdpsnd"
+    ]
+  },
+  {
+    "audioDvc": {
+      "AUDIO_PLAYBACK_DVC": true,
+      "AUDIO_PLAYBACK_LOSSY_DVC": true
+    },
+    "audioInfoFlags": 0,
+    "id": "b1-audio-local-folder-on",
+    "staticChannels": [
+      "drdynvc",
+      "rdpdr",
+      "rdpsnd"
+    ]
+  },
+  {
+    "audioDvc": {
+      "AUDIO_PLAYBACK_DVC": false,
+      "AUDIO_PLAYBACK_LOSSY_DVC": false
+    },
+    "audioInfoFlags": 532480,
+    "id": "b1-audio-remote-folder-off",
+    "staticChannels": [
+      "drdynvc"
+    ]
+  },
+  {
+    "audioDvc": {
+      "AUDIO_PLAYBACK_DVC": false,
+      "AUDIO_PLAYBACK_LOSSY_DVC": false
+    },
+    "audioInfoFlags": 532480,
+    "id": "b1-audio-remote-folder-on",
+    "staticChannels": [
+      "drdynvc",
+      "rdpdr",
+      "rdpsnd"
+    ]
+  }
+]

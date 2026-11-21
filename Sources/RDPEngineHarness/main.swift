@@ -393,6 +393,11 @@ private func runIteration(
     defer {
         if let driveURL { try? FileManager.default.removeItem(at: driveURL) }
     }
+    let pasteboard = run.enableClipboard == true
+        ? NSPasteboard(name: .init("cndf-rdp-harness-\(UUID().uuidString)"))
+        : nil
+    defer { pasteboard?.releaseGlobally() }
+
     let audioMode = RDPAudioPlaybackMode(rawValue: run.audioMode ?? 0)
     guard let audioMode else {
         result.failure = "invalidAudioMode"
@@ -413,7 +418,8 @@ private func runIteration(
         logLevel: .info,
         networkAutoDetect: run.networkAutoDetect ?? false,
         graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic,
-        engine: engine
+        engine: engine,
+        pasteboardName: pasteboard?.name.rawValue
     )
 
     let size = run.window ?? HarnessSize(width: 1280, height: 800)
@@ -566,6 +572,47 @@ private func runIteration(
                 drainRunLoop((step.intervalMs ?? 50) / 1000)
             }
             result.steps.append("scroll:\(unit)x\(max(deltas.count, deltasX.count)) \(seen.joined())")
+        case "clipboardSetRemote", "clipboardExpectRemote", "clipboardSetLocal", "clipboardExpectLocal":
+            guard let pasteboard, let value = step.text else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            let timeout = step.timeout ?? 10
+            let ok: Bool
+            switch step.op {
+            case "clipboardSetLocal":
+                pasteboard.clearContents()
+                do {
+                    ok = pasteboard.setString(value, forType: .string)
+                    try view.pollLocalClipboard()
+                } catch {
+                    result.steps.append("\(step.op):failed")
+                    aborted = true
+                    continue
+                }
+            case "clipboardExpectLocal":
+                ok = waitUntil(timeout) { pasteboard.string(forType: .string) == value }
+            case "clipboardSetRemote":
+                ok = run.fixturePort.flatMap {
+                    fixtureRequest(port: $0, path: "clipboard", body: Data(value.utf8), timeout: timeout)
+                } != nil
+            default:
+                let expected = Data(value.utf8)
+                ok = run.fixturePort.map { port in
+                    let deadline = Date().addingTimeInterval(timeout)
+                    repeat {
+                        let remaining = max(0.01, deadline.timeIntervalSinceNow)
+                        if fixtureRequest(port: port, path: "clipboard", body: nil, timeout: remaining) == expected {
+                            return true
+                        }
+                        drainRunLoop(min(0.1, remaining))
+                    } while Date() < deadline
+                    return false
+                } ?? false
+            }
+            result.steps.append("\(step.op):\(ok ? "ok" : "failed")")
+            aborted = !ok
         case "driveExpect":
             guard let driveURL, let fixturePort = run.fixturePort else {
                 result.steps.append("driveExpect:failed")

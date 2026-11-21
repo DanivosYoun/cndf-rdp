@@ -55,9 +55,10 @@ struct HarnessSize: Decodable {
 }
 
 struct HarnessStep: Decodable {
-    /// connect | waitConnected | waitFirstFrame | idle | inputLatency | resize | tap | scroll | shutdown
     var op: String
     var timeout: Double?
+    /// Text to send or expect in a clipboard step.
+    var text: String?
     var seconds: Double?
     var width: Double?
     var height: Double?

@@ -1,0 +1,474 @@
+{
+  "engine" : "freerdp",
+  "finishedAt" : "2026-11-21T11:37:12+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 422.7,
+        "min" : 422.7,
+        "p50" : 422.7,
+        "p95" : 422.7
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 824.7,
+        "min" : 824.7,
+        "p50" : 824.7,
+        "p95" : 824.7
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-off-folder-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 422.7,
+          "connected" : true,
+          "cpuSystemMs" : 247.98200000000003,
+          "cpuUserMs" : 217.21300000000002,
+          "durationMs" : 4441.3,
+          "firstFrameMs" : 824.7,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 223948800,
+          "framesDisplayedWithTap" : 27,
+          "framesReceived" : 27,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 75135141,
+          "physFootprintMaxBytes" : 92636000,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 2,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 223948800,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 4,
+        "min" : 4,
+        "p50" : 4,
+        "p95" : 4
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 417.5,
+        "min" : 417.5,
+        "p50" : 417.5,
+        "p95" : 417.5
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 739.3,
+        "min" : 739.3,
+        "p50" : 739.3,
+        "p95" : 739.3
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-off-folder-on",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 417.5,
+          "connected" : true,
+          "cpuSystemMs" : 254.293,
+          "cpuUserMs" : 234.30600000000004,
+          "durationMs" : 4426.2,
+          "firstFrameMs" : 739.3,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 215654400,
+          "framesDisplayedWithTap" : 26,
+          "framesReceived" : 26,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 107455360,
+          "physFootprintMaxBytes" : 114852752,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 5,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 6.6,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 215654400,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 6.6,
+        "min" : 6.6,
+        "p50" : 6.6,
+        "p95" : 6.6
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 414.6,
+        "min" : 414.6,
+        "p50" : 414.6,
+        "p95" : 414.6
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-local-folder-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 414.6,
+          "connected" : true,
+          "cpuSystemMs" : 243.53600000000006,
+          "cpuUserMs" : 128.192,
+          "durationMs" : 4478.7,
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 108716940,
+          "physFootprintMaxBytes" : 109200272,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 57,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 59.7,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 59.7,
+        "min" : 59.7,
+        "p50" : 59.7,
+        "p95" : 59.7
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 411.7,
+        "min" : 411.7,
+        "p50" : 411.7,
+        "p95" : 411.7
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-local-folder-on",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 411.7,
+          "connected" : true,
+          "cpuSystemMs" : 286.73300000000006,
+          "cpuUserMs" : 131.14999999999998,
+          "durationMs" : 4489.2,
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 110229733,
+          "physFootprintMaxBytes" : 110642064,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 69,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 71.8,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 71.8,
+        "min" : 71.8,
+        "p50" : 71.8,
+        "p95" : 71.8
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 410,
+        "min" : 410,
+        "p50" : 410,
+        "p95" : 410
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 645.4,
+        "min" : 645.4,
+        "p50" : 645.4,
+        "p95" : 645.4
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-remote-folder-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 410,
+          "connected" : true,
+          "cpuSystemMs" : 257.62699999999995,
+          "cpuUserMs" : 211.5089999999999,
+          "durationMs" : 4418.8,
+          "firstFrameMs" : 645.4,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 215654400,
+          "framesDisplayedWithTap" : 25,
+          "framesReceived" : 26,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 106704430,
+          "physFootprintMaxBytes" : 113410960,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 4,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 5.7,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 207360000,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 5.7,
+        "min" : 5.7,
+        "p50" : 5.7,
+        "p95" : 5.7
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 421,
+        "min" : 421,
+        "p50" : 421,
+        "p95" : 421
+      },
+      "engine" : "freerdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 657.7,
+        "min" : 657.7,
+        "p50" : 657.7,
+        "p95" : 657.7
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-remote-folder-on",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 421,
+          "connected" : true,
+          "cpuSystemMs" : 259.2159999999999,
+          "cpuUserMs" : 202.48900000000003,
+          "durationMs" : 4437.4,
+          "firstFrameMs" : 657.7,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 223948800,
+          "framesDisplayedWithTap" : 27,
+          "framesReceived" : 27,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 109284902,
+          "physFootprintMaxBytes" : 113542032,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 4,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 6.1,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 223948800,
+          "trustCallbacks" : [
+
+          ],
+          "trustStringCertificates" : [
+
+          ],
+          "trustStringDigests" : [
+
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 6.1,
+        "min" : 6.1,
+        "p50" : 6.1,
+        "p95" : 6.1
+      }
+    }
+  ],
+  "scenario" : "m3-b1-channels",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-21T11:36:43+09:00"
+}

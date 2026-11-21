@@ -88,6 +88,14 @@ final class IterationEvaluationTests: XCTestCase {
         XCTAssertFalse(updateDisplayControlReady(true, forLogMessage: "IronRDP disconnected."))
     }
 
+    func testChannelStepFailureFailsTheIterationWithoutAnExpectation() {
+        var iteration = IterationResult(iteration: 1)
+        iteration.steps = ["clipboardSetRemote:ok", "clipboardExpectLocal:failed", "shutdown:ok"]
+        XCTAssertEqual(evaluate(iteration, against: nil), [
+            "iteration 1: clipboardExpectLocal:failed"
+        ])
+    }
+
     func testUnexpectedDisconnectFailsBeforeShutdown() {
         var iteration = IterationResult(iteration: 1)
         iteration.disconnectReason = "error"

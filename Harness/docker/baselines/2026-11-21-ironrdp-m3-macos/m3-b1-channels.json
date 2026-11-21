@@ -1,0 +1,489 @@
+{
+  "engine" : "ironrdp",
+  "finishedAt" : "2026-11-21T11:37:46+09:00",
+  "host" : {
+    "backingScaleFactor" : "1.0",
+    "hostName" : "twyoun-dev-mac.local",
+    "osVersion" : "Version 27.0.1 (Build 26A434)"
+  },
+  "passed" : true,
+  "runs" : [
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 545,
+        "min" : 545,
+        "p50" : 545,
+        "p95" : 545
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 859.7,
+        "min" : 859.7,
+        "p50" : 859.7,
+        "p95" : 859.7
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-off-folder-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 545,
+          "connected" : true,
+          "cpuSystemMs" : 288.88100000000003,
+          "cpuUserMs" : 410.897,
+          "durationMs" : 4613.9,
+          "firstFrameMs" : 859.7,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 232243200,
+          "framesDisplayedWithTap" : 28,
+          "framesReceived" : 28,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 56487398,
+          "physFootprintMaxBytes" : 72844104,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 45,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 48.3,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 232243200,
+          "trustCallbacks" : [
+            "new"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 48.3,
+        "min" : 48.3,
+        "p50" : 48.3,
+        "p95" : 48.3
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 554.2,
+        "min" : 554.2,
+        "p50" : 554.2,
+        "p95" : 554.2
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 841.9,
+        "min" : 841.9,
+        "p50" : 841.9,
+        "p95" : 841.9
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-off-folder-on",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 554.2,
+          "connected" : true,
+          "cpuSystemMs" : 289.68000000000006,
+          "cpuUserMs" : 366.16200000000003,
+          "durationMs" : 4602.5,
+          "firstFrameMs" : 841.9,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 232243200,
+          "framesDisplayedWithTap" : 28,
+          "framesReceived" : 28,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 73960966,
+          "physFootprintMaxBytes" : 78005088,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 44,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 45.1,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 232243200,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 45.1,
+        "min" : 45.1,
+        "p50" : 45.1,
+        "p95" : 45.1
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 625.7,
+        "min" : 625.7,
+        "p50" : 625.7,
+        "p95" : 625.7
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-local-folder-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 625.7,
+          "connected" : true,
+          "cpuSystemMs" : 204.53999999999996,
+          "cpuUserMs" : 145.361,
+          "durationMs" : 4733.5,
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 74624522,
+          "physFootprintMaxBytes" : 75023200,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 100,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 103.4,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 103.4,
+        "min" : 103.4,
+        "p50" : 103.4,
+        "p95" : 103.4
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 556.9,
+        "min" : 556.9,
+        "p50" : 556.9,
+        "p95" : 556.9
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 0
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-local-folder-on",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 556.9,
+          "connected" : true,
+          "cpuSystemMs" : 201.48099999999988,
+          "cpuUserMs" : 139.04899999999998,
+          "durationMs" : 4665.9,
+          "frameBytesReceived" : 0,
+          "framesDisplayedWithTap" : 0,
+          "framesReceived" : 0,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 74933088,
+          "physFootprintMaxBytes" : 75170656,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 95,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 97,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 0,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 97,
+        "min" : 97,
+        "p50" : 97,
+        "p95" : 97
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 552.2,
+        "min" : 552.2,
+        "p50" : 552.2,
+        "p95" : 552.2
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 1018.4,
+        "min" : 1018.4,
+        "p50" : 1018.4,
+        "p95" : 1018.4
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-remote-folder-off",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 552.2,
+          "connected" : true,
+          "cpuSystemMs" : 261.3889999999999,
+          "cpuUserMs" : 403.50700000000006,
+          "durationMs" : 4610.2,
+          "firstFrameMs" : 1018.4,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 215654400,
+          "framesDisplayedWithTap" : 26,
+          "framesReceived" : 26,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 56320868,
+          "physFootprintMaxBytes" : 64881528,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 45,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 46.5,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 215654400,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 46.5,
+        "min" : 46.5,
+        "p50" : 46.5,
+        "p95" : 46.5
+      }
+    },
+    {
+      "connectToConnectedMs" : {
+        "count" : 1,
+        "max" : 562,
+        "min" : 562,
+        "p50" : 562,
+        "p95" : 562
+      },
+      "engine" : "ironrdp",
+      "expectationFailures" : [
+
+      ],
+      "firstFrameMs" : {
+        "count" : 1,
+        "max" : 894.3,
+        "min" : 894.3,
+        "p50" : 894.3,
+        "p95" : 894.3
+      },
+      "host" : "127.0.0.1",
+      "id" : "b1-audio-remote-folder-on",
+      "iterations" : [
+        {
+          "callbacksAfterShutdown" : 0,
+          "connectRises" : 1,
+          "connectToConnectedMs" : 562,
+          "connected" : true,
+          "cpuSystemMs" : 272.25299999999993,
+          "cpuUserMs" : 448.44499999999994,
+          "durationMs" : 4614,
+          "firstFrameMs" : 894.3,
+          "firstFrameSize" : [
+            1920,
+            1080
+          ],
+          "frameBytesReceived" : 223948800,
+          "framesDisplayedWithTap" : 27,
+          "framesReceived" : 27,
+          "inputLatencyTimeouts" : 0,
+          "iteration" : 1,
+          "passwordFoundInSessionLog" : false,
+          "physFootprintAvgBytes" : 66134888,
+          "physFootprintMaxBytes" : 73237368,
+          "prompts" : 0,
+          "shutdownDiagnostics" : {
+            "freeRDPWorkerWaitMs" : 44,
+            "inFlightCommandBuffers" : 0,
+            "pendingMain" : 0,
+            "renderDrainMs" : 0
+          },
+          "shutdownMs" : 45.9,
+          "steps" : [
+            "connect:ok",
+            "waitConnected:ok",
+            "idle:3.0s",
+            "shutdown:ok"
+          ],
+          "tapPixelBufferBytes" : 223948800,
+          "trustCallbacks" : [
+            "same"
+          ],
+          "trustStringCertificates" : [
+            [
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79",
+              "69d4588cd5d408725ff91b9d3c6a4fc3afc4ba4e070411c3fa46c0490a484f79"
+            ]
+          ],
+          "trustStringDigests" : [
+            "5dd45d8e3ef2c6b9d66c226beb91cf9fe45b2230e65181c974c500f816d62f56"
+          ]
+        }
+      ],
+      "passed" : true,
+      "port" : 33891,
+      "shutdownMs" : {
+        "count" : 1,
+        "max" : 45.9,
+        "min" : 45.9,
+        "p50" : 45.9,
+        "p95" : 45.9
+      }
+    }
+  ],
+  "scenario" : "m3-b1-channels",
+  "schema" : "cndf-engine-harness\/v0",
+  "startedAt" : "2026-11-21T11:37:15+09:00"
+}

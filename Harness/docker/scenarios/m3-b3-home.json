@@ -2,22 +2,92 @@
   "name": "m3-b3-home",
   "runs": [
     {
+      "id": "b3-clipboard",
+      "host": "127.0.0.1",
+      "port": 33894,
+      "fixturePort": 33898,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B3_PASS",
+      "expect": {
+        "connected": true,
+        "firstFrame": true,
+        "maxShutdownMs": 1000
+      },
+      "enableClipboard": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "clipboardSetRemote",
+          "text": "xrdp → Mac 한글 🎵"
+        },
+        {
+          "op": "clipboardExpectLocal",
+          "text": "xrdp → Mac 한글 🎵"
+        },
+        {
+          "op": "clipboardSetLocal",
+          "text": "Mac → xrdp 한글 🎵"
+        },
+        {
+          "op": "clipboardExpectRemote",
+          "text": "Mac → xrdp 한글 🎵"
+        },
+        {
+          "op": "shutdown"
+        }
+      ]
+    },
+    {
       "id": "b3-home-read-write",
       "host": "127.0.0.1",
       "port": 33894,
       "fixturePort": 33898,
       "username": "harness",
       "passwordEnv": "HARNESS_B3_PASS",
+      "expect": {
+        "connected": true,
+        "firstFrame": true,
+        "maxShutdownMs": 1000
+      },
       "shareHome": true,
       "steps": [
-        {"op": "connect"},
-        {"op": "waitConnected", "timeout": 15},
-        {"op": "waitFirstFrame", "timeout": 15},
-        {"op": "idle", "seconds": 8},
-        {"op": "driveExpect", "timeout": 10},
-        {"op": "shutdown"}
-      ],
-      "expect": {"connected": true, "firstFrame": true, "maxShutdownMs": 1000}
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 15
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 15
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "driveExpect",
+          "timeout": 10
+        },
+        {
+          "op": "shutdown"
+        }
+      ]
     }
   ]
 }

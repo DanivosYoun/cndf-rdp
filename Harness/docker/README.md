@@ -84,7 +84,21 @@ unchanged FreeRDP C bridge against FreeRDP 3.33.1 in a Linux container, with Win
 assertions disabled as in the macOS build. It establishes the observed advertising and
 DVC responses for that build. It does not measure macOS playback or Windows behavior.
 
-`HARNESS_BATCH=<batch8> Scripts/run-engine-harness.sh m3-b3` checks whether the xrdp
+`HARNESS_BATCH=<batch8> Scripts/run-engine-harness.sh m3-b3` checks clipboard text in both directions and whether the xrdp
 session can read a fixture via the redirected Home drive and write a file back. This
 mode requires access to `/dev/fuse` and uses a fresh B3 container per engine. Its fixture
 accepts only the harness token and provides fixed drive and xclip operations.
+
+The [IronRDP Linux baseline](baselines/2026-11-21-ironrdp-linux/m3-b1-channels.json)
+uses the merged branch's unchanged Rust ABI. Both engines advertised the same static
+channels and sent the same audio flags in all six cases. With Home enabled and audio
+off or remote, FreeRDP accepted the reliable audio DVC and IronRDP declined it. With
+local audio, both accepted the reliable channel and only IronRDP accepted the lossy
+channel. The B1 probe sends no audio over either DVC. The separate
+[IronRDP ABI counter](baselines/2026-11-21-ironrdp-linux/m3-b1-audio-waves.json) recorded
+142 waves in each local run and zero in the other modes.
+
+The Mac Studio run matched the Linux channel observations and recorded zero callbacks
+after shutdown in all 12 B1 sessions. The longest shutdown took 103.4 ms.
+[FreeRDP Mac results](baselines/2026-11-21-freerdp-m3-macos/m3-b1-channels.json) ·
+[IronRDP Mac results](baselines/2026-11-21-ironrdp-m3-macos/m3-b1-channels.json).
