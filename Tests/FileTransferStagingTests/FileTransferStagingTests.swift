@@ -93,9 +93,15 @@ final class FileTransferStagingTests: XCTestCase {
 
         let staging = FileTransferStaging(rootURL: temp)
         let decomposedName = "한글.txt".decomposedStringWithCanonicalMapping
-        let destination = try staging.makeRemoteDropDestination(fileName: decomposedName)
+        let destination = try staging.createRemoteDropFile(fileName: decomposedName)
+        try destination.handle.close()
 
-        XCTAssertEqual(FileNameNormalization.normalizeForTransfer(destination.lastPathComponent), "한글.txt")
+        XCTAssertEqual(FileNameNormalization.normalizeForTransfer(destination.url.lastPathComponent), "한글.txt")
+        // The stored entry is NFC too (Darwin `URL.path` reports NFD, so read the directory).
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: temp.path).map { $0.unicodeScalars.map(\.value) },
+            ["한글.txt".unicodeScalars.map(\.value)]
+        )
     }
 
     func testPayloadRoundTrip() throws {

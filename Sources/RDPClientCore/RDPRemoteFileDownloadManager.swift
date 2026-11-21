@@ -27,9 +27,8 @@ final class RDPRemoteFileDownloadManager {
 
         var urls: [URL] = []
         for (index, file) in files.enumerated() {
-            let destination = try staging.makeRemoteDropDestination(fileName: file.fileName)
-            FileManager.default.createFile(atPath: destination.path, contents: nil)
-            let handle = try FileHandle(forWritingTo: destination)
+            let destination = try staging.createRemoteDropFile(fileName: file.fileName)
+            let handle = destination.handle
             defer { try? handle.close() }
 
             var offset: UInt64 = 0
@@ -48,7 +47,7 @@ final class RDPRemoteFileDownloadManager {
                     break
                 }
             }
-            urls.append(destination)
+            urls.append(destination.url)
         }
 
         return urls
