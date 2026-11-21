@@ -43,12 +43,15 @@ public final class RDPSharedInputSession: @unchecked Sendable {
     private let executor: RDPInputExecutor?
     private let owner: RDPInputOwner
     private let connectionLifetime: AnyObject?
+    /// The keyboard profile of the connection this handle is bound to; `.standard` without one.
+    public let keyboardProfile: RDPKeyboardProfile
 
     init(executor: RDPInputExecutor, owner: RDPInputOwner) {
         self.executor = executor
         self.owner = owner
         self.state = .prepared
         self.connectionLifetime = executor.connectionLifetime
+        self.keyboardProfile = executor.keyboardProfile
     }
 
     private init() {
@@ -56,6 +59,7 @@ public final class RDPSharedInputSession: @unchecked Sendable {
         self.owner = .shared(0)
         self.state = .closed(.failed(.connectionLost))
         self.connectionLifetime = nil
+        self.keyboardProfile = .standard
     }
 
     /// A handle for a view without a usable connection: never active, always connection lost.
@@ -253,10 +257,12 @@ final class RDPInputExecutorRegistry {
             // A request may have captured its generation before a reconnect. It must not
             // replace the newer connection's ownership record or failure block.
             if binding.generation > generation {
-                return RDPInputExecutor(sender: makeSender(session, generation), schedule: schedule)
+                return RDPInputExecutor(sender: makeSender(session, generation),
+                                        keyboardProfile: session.keyboardProfile, schedule: schedule)
             }
         }
-        let executor = RDPInputExecutor(sender: makeSender(session, generation), schedule: schedule)
+        let executor = RDPInputExecutor(sender: makeSender(session, generation),
+                                        keyboardProfile: session.keyboardProfile, schedule: schedule)
         bindings.setObject(Binding(generation: generation, executor: executor), forKey: session)
         return executor
     }
@@ -361,9 +367,16 @@ final class RDPInputExecutor: @unchecked Sendable {
 
     private var held: [RDPInputOwner: RDPHeldInputs] = [:]
     private var lastPointer: RDPPointerLocation?
+    /// The profile of the connection this executor was made for (`RDPEngineSession.keyboardProfile`).
+    let keyboardProfile: RDPKeyboardProfile
 
-    init(sender: RDPInputSending, schedule: @escaping (@escaping () -> Void) -> Void) {
+    init(
+        sender: RDPInputSending,
+        keyboardProfile: RDPKeyboardProfile = .standard,
+        schedule: @escaping (@escaping () -> Void) -> Void
+    ) {
         self.sender = sender
+        self.keyboardProfile = keyboardProfile
         self.schedule = schedule
     }
 

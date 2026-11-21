@@ -182,6 +182,15 @@ final class RDPKoreanKeyboardTests: XCTestCase {
         XCTAssertEqual(waitForKeys(session, count: 5).last, KeySession.Key(code: 0x1F, pressed: true, extended: false))
     }
 
+    func testSharedHandleCarriesTheConnectionProfile() {
+        for profile in [RDPKeyboardProfile.standard, .korean] {
+            let (view, session) = makeView(profile: profile)
+            XCTAssertEqual(view.makeSharedInputSession().keyboardProfile, profile)
+            _ = session
+        }
+        XCTAssertEqual(RDPSharedInputSession.unavailable().keyboardProfile, .standard)
+    }
+
     private func makeView(profile: RDPKeyboardProfile) -> (RDPClientView, KeySession) {
         let session = KeySession(profile: profile)
         let view = RDPClientView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
