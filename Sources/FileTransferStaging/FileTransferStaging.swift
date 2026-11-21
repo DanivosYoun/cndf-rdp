@@ -4,6 +4,14 @@ public enum FileTransferStagingError: Error, Equatable {
     case sourceDoesNotExist(URL)
     case unableToCreateStagingDirectory(URL)
     case unableToReadFileSize(URL)
+    case unsafeRemoteFileName(String)
+    case unableToCreateRemoteDropFile(URL, errno: Int32)
+}
+
+/// A new, empty file created exclusively inside the staging root for a remote clipboard file.
+public struct RemoteDropFile {
+    public let url: URL
+    public let handle: FileHandle
 }
 
 public final class FileTransferStaging {
@@ -51,31 +59,80 @@ public final class FileTransferStaging {
         }
     }
 
-    public func makeRemoteDropDestination(fileName: String) throws -> URL {
+    /// Creates a new file for a remote (server-supplied) file name directly under `rootURL`.
+    ///
+    /// The name is untrusted: it is reduced to one safe path component, and the file is created
+    /// with `O_CREAT | O_EXCL | O_NOFOLLOW`, so an existing file or a planted symbolic link is
+    /// never opened or followed — the next free " N" name is used instead.
+    public func createRemoteDropFile(fileName: String) throws -> RemoteDropFile {
         try prepare()
-        return availableStagedURL(for: fileName)
-    }
 
-    private func availableStagedURL(for fileName: String) -> URL {
-        let normalizedName = FileNameNormalization.normalizeForTransfer(fileName)
-        let safeName = normalizedName.isEmpty ? "untitled" : normalizedName
-        let baseURL = rootURL.appendingPathComponent(safeName, isDirectory: false)
-        guard fileManager.fileExists(atPath: baseURL.path) else {
-            return baseURL
-        }
+        let safeName = Self.safeRemoteFileName(fileName)
+        let (base, ext) = Self.splitExtension(safeName)
+        let rootPath = rootURL.standardizedFileURL.path
 
-        let name = (safeName as NSString).deletingPathExtension
-        let ext = (safeName as NSString).pathExtension
+        for index in 0...Int.max {
+            let candidateName = Self.fitFileSystemNameLimit(
+                base: base,
+                suffix: index == 0 ? "" : " \(index)",
+                ext: ext
+            )
+            // Open by this composed string, not by `URL.path`: Darwin file URLs hand back
+            // decomposed (NFD) paths, which would store Korean names decomposed on disk.
+            let candidatePath = rootPath + "/" + candidateName
+            let candidate = URL(fileURLWithPath: candidatePath, isDirectory: false)
+            guard candidate.lastPathComponent == candidateName,
+                  candidate.deletingLastPathComponent().standardizedFileURL.path == rootPath else {
+                throw FileTransferStagingError.unsafeRemoteFileName(fileName)
+            }
 
-        for index in 1...Int.max {
-            let candidateName = ext.isEmpty ? "\(name) \(index)" : "\(name) \(index).\(ext)"
-            let candidate = rootURL.appendingPathComponent(candidateName, isDirectory: false)
-            if !fileManager.fileExists(atPath: candidate.path) {
-                return candidate
+            let descriptor = candidatePath.withCString {
+                open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+            }
+            if descriptor >= 0 {
+                return RemoteDropFile(url: candidate, handle: FileHandle(fileDescriptor: descriptor, closeOnDealloc: true))
+            }
+            let error = errno
+            guard error == EEXIST else {
+                throw FileTransferStagingError.unableToCreateRemoteDropFile(candidate, errno: error)
             }
         }
 
-        return rootURL.appendingPathComponent(UUID().uuidString, isDirectory: false)
+        throw FileTransferStagingError.unsafeRemoteFileName(fileName)
+    }
+
+    /// NFC, with path separators ("/", "\\"), NUL and other control characters replaced by "_".
+    /// ".", ".." and the empty name become "untitled".
+    private static func safeRemoteFileName(_ fileName: String) -> String {
+        let scalars = FileNameNormalization.normalizeForTransfer(fileName).unicodeScalars.map { scalar -> Unicode.Scalar in
+            scalar == "/" || scalar == "\\" || scalar.value < 0x20 || scalar.value == 0x7F ? "_" : scalar
+        }
+        let replaced = FileNameNormalization.normalizeForTransfer(String(String.UnicodeScalarView(scalars)))
+        return replaced.isEmpty || replaced == "." || replaced == ".." ? "untitled" : replaced
+    }
+
+    private static let maxExtensionUTF8Length = 32
+    private static let maxFileNameUTF8Length = 255
+
+    private static func splitExtension(_ name: String) -> (base: String, ext: String) {
+        guard let dot = name.lastIndex(of: "."), dot != name.startIndex else {
+            return (name, "")
+        }
+        let ext = String(name[name.index(after: dot)...])
+        guard !ext.isEmpty, ext.utf8.count <= maxExtensionUTF8Length else {
+            return (name, "")
+        }
+        return (String(name[..<dot]), ext)
+    }
+
+    /// Truncates `base` on character boundaries so the whole name fits NAME_MAX (255 UTF-8 bytes).
+    private static func fitFileSystemNameLimit(base: String, suffix: String, ext: String) -> String {
+        let tail = suffix + (ext.isEmpty ? "" : "." + ext)
+        var base = base
+        while !base.isEmpty, base.utf8.count + tail.utf8.count > maxFileNameUTF8Length {
+            base.removeLast()
+        }
+        return base + tail
     }
 
     private func stageLocalDirectoryForRemotePaste(_ directoryURL: URL) throws -> [StagedFile] {
