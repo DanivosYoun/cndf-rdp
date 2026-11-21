@@ -47,6 +47,8 @@ final class ClipboardMonitorReadyTests: XCTestCase {
         typedef struct { CliprdrClientContext *cliprdr; const char *local_text; size_t local_file_count; unsigned clip_requests_pending, clip_requests_stale, clip_request_format; } RDPBridgeSession;
         #define bridge_log(...) ((void)0)
         #define bridge_logf(...) ((void)0)
+        // 세대 상승은 ClipboardResponsePairingTests 가 따로 시험한다(설계 D-G3).
+        static void bridge_replace_remote_clipboard(RDPBridgeSession *session) { (void)session; }
         \(try function("bridge_send_client_format_list"))
         \(try function("bridge_cliprdr_monitor_ready"))
         static UINT step, expected_count, expected_first, capability_result;
