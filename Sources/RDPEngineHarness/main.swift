@@ -308,6 +308,30 @@ private func drainRunLoop(_ duration: TimeInterval) {
     }
 }
 
+/// Name, size and SHA-256 of a pasteboard file URL; a directory gets its recursive entry list.
+private func describeLocalFile(_ url: URL) -> [String: String] {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+        return ["name": url.lastPathComponent, "missing": "true"]
+    }
+    if isDirectory.boolValue {
+        let entries = (FileManager.default.subpaths(atPath: url.path) ?? []).sorted()
+        return ["name": url.lastPathComponent, "directory": entries.joined(separator: "|")]
+    }
+    guard let handle = try? FileHandle(forReadingFrom: url) else {
+        return ["name": url.lastPathComponent, "unreadable": "true"]
+    }
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    var bytes: UInt64 = 0
+    while let chunk = try? handle.read(upToCount: 8 << 20), !chunk.isEmpty {
+        hasher.update(data: chunk)
+        bytes += UInt64(chunk.count)
+    }
+    let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    return ["name": url.lastPathComponent, "bytes": String(bytes), "sha256": digest]
+}
+
 /// Runs the loop until `condition` holds or `timeout` passes. Returns whether it held.
 private func waitUntil(_ timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
@@ -547,6 +571,11 @@ private func runIteration(
             result.displayControlReady = delegate.isDisplayControlReady
             result.connectedAfterResize = view.isConnected && delegate.disconnectReason == nil
             result.steps.append("resize:\(Int(width))x\(Int(height))")
+            result.resizeLog.append(
+                "req=\(result.requestedResizeFrameSize!.map(String.init).joined(separator: "x")) "
+                    + "got=\(lastFrameSize.map { $0.map(String.init).joined(separator: "x") } ?? "none") "
+                    + "connected=\(result.connectedAfterResize!)"
+            )
         case "scroll":
             let deltas = step.scrollDeltas ?? []
             let deltasX = step.scrollDeltasX ?? []
@@ -645,6 +674,52 @@ private func runIteration(
             let waves = view.statistics?.audioWavesReceived ?? 0
             result.audioWavesReceived = waves
             result.steps.append("audioExpectWaves:\(ok ? "ok" : "failed")")
+            aborted = !ok
+        case "clipboardSetLocalFiles":
+            guard let pasteboard, let paths = step.paths, !paths.isEmpty else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            pasteboard.clearContents()
+            var ok = pasteboard.writeObjects(paths.map { URL(fileURLWithPath: $0) as NSURL })
+            do { try view.pollLocalClipboard() } catch { ok = false }
+            result.steps.append("\(step.op):\(ok ? "ok" : "failed")")
+            aborted = !ok
+        case "clipboardExpectLocalFiles":
+            guard let pasteboard else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            let wanted = step.count ?? 1
+            var urls: [URL] = []
+            let waitStart = CACurrentMediaTime()
+            let ok = waitUntil(step.timeout ?? 10) {
+                urls = pasteboard.readObjects(
+                    forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]
+                ) as? [URL] ?? []
+                return urls.count >= wanted
+            }
+            for url in urls { result.localFiles.append(describeLocalFile(url)) }
+            result.steps.append(
+                "\(step.op):\(ok ? "ok" : "failed") n=\(urls.count) waitMs=\(Int(milliseconds(CACurrentMediaTime() - waitStart)))"
+            )
+            aborted = !ok
+        case "clipboardWaitLocalPrefix":
+            guard let pasteboard, let prefix = step.prefix else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            var text = ""
+            let waitStart = CACurrentMediaTime()
+            let ok = waitUntil(step.timeout ?? 10) {
+                text = pasteboard.string(forType: .string) ?? ""
+                return text.hasPrefix(prefix)
+            }
+            if ok { result.localTexts.append(String(text.prefix(4000))) }
+            result.steps.append("\(step.op):\(ok ? "ok" : "failed") waitMs=\(Int(milliseconds(CACurrentMediaTime() - waitStart)))")
             aborted = !ok
         case "keys", "sharedKeys":
             var shared: RDPSharedInputSession?
