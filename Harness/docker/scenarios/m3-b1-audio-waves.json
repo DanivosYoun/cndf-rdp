@@ -1,0 +1,44 @@
+{
+  "name": "m3-b1-audio-waves",
+  "engine": "ironrdp",
+  "runs": [
+    {
+      "id": "b1-audio-local-folder-off-waves",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 1,
+      "shareHome": false,
+      "steps": [
+        { "op": "connect" },
+        { "op": "waitConnected", "timeout": 15 },
+        { "op": "audioExpectWaves", "minWaves": 1, "timeout": 10 },
+        { "op": "shutdown" }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    },
+    {
+      "id": "b1-audio-local-folder-on-waves",
+      "host": "127.0.0.1",
+      "port": 33891,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B1_PASS",
+      "audioMode": 1,
+      "shareHome": true,
+      "steps": [
+        { "op": "connect" },
+        { "op": "waitConnected", "timeout": 15 },
+        { "op": "audioExpectWaves", "minWaves": 1, "timeout": 10 },
+        { "op": "shutdown" }
+      ],
+      "expect": {
+        "connected": true,
+        "maxShutdownMs": 1000
+      }
+    }
+  ]
+}

@@ -107,6 +107,7 @@ struct IterationResult: Encodable {
     var physFootprintAvgBytes: UInt64 = 0
     var framesReceived: UInt64?
     var frameBytesReceived: UInt64?
+    var audioWavesReceived: UInt64?
     /// Frames shown on main while a frame tap was attached.
     var framesDisplayedWithTap = 0
     /// Bytes copied into tap CVPixelBuffers (the share-path copy point).

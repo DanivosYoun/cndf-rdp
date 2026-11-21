@@ -239,8 +239,19 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     public var statistics: RDPConnectionStatistics {
+        var nativeStats = CNDFIronStatistics()
+        let hasNativeStats = withSessionLock {
+            guard let nativeSession else { return false }
+            return cndf_iron_get_statistics(nativeSession, &nativeStats)
+        }
         statisticsLock.lock()
         defer { statisticsLock.unlock() }
+        if hasNativeStats {
+            statisticsStorage.audioWavesReceived = max(
+                statisticsStorage.audioWavesReceived,
+                nativeStats.audio_waves_received
+            )
+        }
         return statisticsStorage.snapshot()
     }
 
@@ -606,6 +617,15 @@ public final class IronRDPSession: RDPEngineSession {
         }
         guard let handle else { return }
         _ = cndf_iron_disconnect(handle)
+        var nativeStats = CNDFIronStatistics()
+        if cndf_iron_get_statistics(handle, &nativeStats) {
+            statisticsLock.lock()
+            statisticsStorage.audioWavesReceived = max(
+                statisticsStorage.audioWavesReceived,
+                nativeStats.audio_waves_received
+            )
+            statisticsLock.unlock()
+        }
         cndf_iron_session_destroy(handle, Self.destroyJoinTimeoutMs)
         // destroy closed the callback gate, so the engine's own disconnect report for a live
         // generation was dropped; report it here instead.

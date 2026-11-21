@@ -49,6 +49,7 @@ public struct RDPConnectionStatistics: Equatable, Sendable {
     public let localClipboardTextsSent: UInt64
     public let localFilesOffered: UInt64
     public let localFileBytesOffered: UInt64
+    public let audioWavesReceived: UInt64
     public let startedAt: Date?
     public let lastActivityAt: Date?
     /// Last network auto-detect result from the server; nil until one arrives.
@@ -750,6 +751,7 @@ struct MutableRDPConnectionStatistics {
     var localClipboardTextsSent: UInt64 = 0
     var localFilesOffered: UInt64 = 0
     var localFileBytesOffered: UInt64 = 0
+    var audioWavesReceived: UInt64 = 0
     var startedAt: Date?
     var lastActivityAt: Date?
     var networkBandwidthKbps: UInt32?
@@ -766,6 +768,7 @@ struct MutableRDPConnectionStatistics {
             localClipboardTextsSent: localClipboardTextsSent,
             localFilesOffered: localFilesOffered,
             localFileBytesOffered: localFileBytesOffered,
+            audioWavesReceived: audioWavesReceived,
             startedAt: startedAt,
             lastActivityAt: lastActivityAt,
             networkBandwidthKbps: networkBandwidthKbps,

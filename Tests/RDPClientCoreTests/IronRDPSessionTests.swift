@@ -488,6 +488,113 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(lengths, [firstChunk, 1])
     }
 
+    func testIronRDPRemoteFileListKeepsTraversalAbsoluteAndSymlinkInsideStagingRoot() throws {
+        try skipUnlessStub()
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ironrdp-drop-\(UUID().uuidString)", isDirectory: true)
+        let stagingDir = tempRoot.appendingPathComponent("a/b/staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let outsideSentinel = tempRoot.appendingPathComponent("outside.txt")
+        let sentinelData = Data("sentinel".utf8)
+        try sentinelData.write(to: outsideSentinel)
+
+        let plantedLink = stagingDir.appendingPathComponent("planted.txt")
+        try FileManager.default.createSymbolicLink(at: plantedLink, withDestinationURL: outsideSentinel)
+
+        let seedPayload = Data("hello".utf8)
+        let seedFile = tempRoot.appendingPathComponent("seed.txt")
+        try seedPayload.write(to: seedFile)
+
+        let session = try IronRDPSession(
+            resizeCoordinator: DisplayResizeCoordinator(),
+            certificateTrustTimeout: 5,
+            staging: FileTransferStaging(rootURL: stagingDir)
+        )
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        defer { try? session.disconnect() }
+        try session.connect(
+            RDPConnectionOptions(host: "localhost", pasteboardName: board.name.rawValue),
+            initialPointSize: CGSize(width: 800, height: 600),
+            scale: 1
+        )
+        XCTAssertTrue(waitUntil { session.isConnected })
+
+        // Offer 3 files so the stub answers range requests for indices 0, 1, 2 with `seedPayload`.
+        try session.sendLocalFiles([seedFile, seedFile, seedFile])
+        XCTAssertTrue(waitUntil {
+            (board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?.count == 3
+        })
+        board.clearContents()
+
+        let absTarget = tempRoot.appendingPathComponent("absolute.txt")
+        let maliciousNames = [
+            "../../../escape.txt",
+            absTarget.path,
+            "planted.txt"
+        ]
+        let nameBuffers = maliciousNames.map { Array($0.utf8) }
+        nameBuffers[0].withUnsafeBufferPointer { n0 in
+            nameBuffers[1].withUnsafeBufferPointer { n1 in
+                nameBuffers[2].withUnsafeBufferPointer { n2 in
+                    let files = [
+                        CNDFIronRemoteFile(name_utf8: n0.baseAddress, name_length: n0.count, size: UInt64(seedPayload.count)),
+                        CNDFIronRemoteFile(name_utf8: n1.baseAddress, name_length: n1.count, size: UInt64(seedPayload.count)),
+                        CNDFIronRemoteFile(name_utf8: n2.baseAddress, name_length: n2.count, size: UInt64(seedPayload.count))
+                    ]
+                    files.withUnsafeBufferPointer { buffer in
+                        session.callbacks.remote_file_list?(1, buffer.baseAddress, buffer.count, session.callbacks.context)
+                    }
+                }
+            }
+        }
+
+        XCTAssertTrue(waitUntil(timeout: 5) {
+            (board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?.count == 3
+        })
+        let urls = try XCTUnwrap(board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])
+        let expectedRoot = stagingDir.standardizedFileURL.path
+        for url in urls {
+            XCTAssertEqual(url.deletingLastPathComponent().standardizedFileURL.path, expectedRoot)
+            XCTAssertEqual(try Data(contentsOf: url), seedPayload)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempRoot.appendingPathComponent("escape.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: absTarget.path))
+        XCTAssertEqual(try Data(contentsOf: outsideSentinel), sentinelData)
+        XCTAssertEqual(urls[2].lastPathComponent, "planted 1.txt")
+    }
+
+    func testAudioWavesReceivedExposedFromABIAndPreservedAfterDisconnect() throws {
+        try skipUnlessStub()
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        defer { try? session.disconnect() }
+
+        try session.connect(
+            RDPConnectionOptions(host: "localhost", audioPlaybackMode: .playLocally),
+            initialPointSize: CGSize(width: 800, height: 600),
+            scale: 1
+        )
+        XCTAssertTrue(waitUntil { session.isConnected })
+        XCTAssertGreaterThanOrEqual(session.statistics.audioWavesReceived, 1)
+        let wavesWhileConnected = session.statistics.audioWavesReceived
+        try session.disconnect()
+        XCTAssertEqual(session.statistics.audioWavesReceived, wavesWhileConnected)
+
+        try session.connect(
+            RDPConnectionOptions(host: "localhost", audioPlaybackMode: .disabled),
+            initialPointSize: CGSize(width: 800, height: 600),
+            scale: 1
+        )
+        XCTAssertTrue(waitUntil { session.isConnected })
+        XCTAssertEqual(session.statistics.audioWavesReceived, 0)
+    }
+
     private func options(logFileURL: URL? = nil) -> RDPConnectionOptions {
         RDPConnectionOptions(
             host: "localhost",

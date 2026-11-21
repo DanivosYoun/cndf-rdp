@@ -633,11 +633,20 @@ private func runIteration(
                 result.steps.append("driveExpect:failed")
                 aborted = true
             }
+        case "audioExpectWaves":
+            let minWaves = step.minWaves ?? 1
+            let timeout = step.timeout ?? 10
+            let ok = waitUntil(timeout) { (view.statistics?.audioWavesReceived ?? 0) >= minWaves }
+            let waves = view.statistics?.audioWavesReceived ?? 0
+            result.audioWavesReceived = waves
+            result.steps.append("audioExpectWaves:\(ok ? "ok" : "failed")")
+            aborted = !ok
         case "shutdown":
             result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {
                 result.framesReceived = statistics.framesReceived
                 result.frameBytesReceived = statistics.frameBytesReceived
+                result.audioWavesReceived = statistics.audioWavesReceived
             }
             let shutdownStart = CACurrentMediaTime()
             let diagnostics = view.shutdown()

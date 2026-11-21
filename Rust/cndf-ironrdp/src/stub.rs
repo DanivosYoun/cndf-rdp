@@ -114,6 +114,9 @@ fn run(
     }
     let (mut width, mut height) = (options.width, options.height);
     let mut marker = 0u8;
+    if options.channels.audio == CNDFIronAudioMode::CNDF_IRON_AUDIO_LOCAL {
+        lock(&connection.statistics).audio_waves_received += 1;
+    }
     let _ = output.send(Output::Connected);
     let _ = output.send(Output::Frame(width, height, marker, true));
     while !connection.stop.load(Ordering::Acquire) {

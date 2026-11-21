@@ -59,6 +59,8 @@ struct HarnessStep: Decodable {
     var timeout: Double?
     /// Text to send or expect in a clipboard step.
     var text: String?
+    /// audioExpectWaves: minimum wave count expected (default 1).
+    var minWaves: UInt64?
     var seconds: Double?
     var width: Double?
     var height: Double?

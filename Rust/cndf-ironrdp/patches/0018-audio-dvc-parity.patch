@@ -1,0 +1,204 @@
+diff --git a/crates/ironrdp-client/src/audio.rs b/crates/ironrdp-client/src/audio.rs
+index 2abeace..66a0abc 100644
+--- a/crates/ironrdp-client/src/audio.rs
++++ b/crates/ironrdp-client/src/audio.rs
+@@ -14,7 +14,7 @@ use std::time::Instant;
+ 
+ use ironrdp_dvc::{DrdynvcClient, DvcChannelListener, DvcClientProcessor};
+ use ironrdp_pdu::pdu_other_err;
+-use ironrdp_rdpsnd::client::{Clock, DVC_CHANNEL_NAME, LOSSY_DVC_CHANNEL_NAME, RdpsndClientHandler, RdpsndDvcState};
++use ironrdp_rdpsnd::client::{Clock, DVC_CHANNEL_NAME, RdpsndClientHandler, RdpsndDvcState};
+ use ironrdp_rdpsnd::pdu::{AudioFormat, AudioFormatFlags, PitchPdu, QualityMode, VolumePdu};
+ use ironrdp_rdpsnd_native::capture::CaptureConfig;
+ use ironrdp_rdpsnd_native::cpal::{PlaybackConfig, RdpsndBackend};
+@@ -150,10 +150,7 @@ pub(crate) fn attach_playback(
+     let state = RdpsndDvcState::new(Box::new(playback.clone()))
+         .with_quality_mode(quality_mode)
+         .with_clock(clock());
+-    let lossy = state.clone();
+-    drdynvc
+-        .with_dynamic_channel_factory(DVC_CHANNEL_NAME, move || state.channel())
+-        .with_dynamic_channel_factory(LOSSY_DVC_CHANNEL_NAME, move || lossy.lossy_channel())
++    drdynvc.with_dynamic_channel_factory(DVC_CHANNEL_NAME, move || state.channel())
+ }
+ 
+ /// Listener that hands out a fresh [`ironrdp_rdpeai::client::RdpeaiClient`] on every
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index bcd2c24..a748a76 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -2931,6 +2931,47 @@ fn build_connector(
+ 
+     #[cfg(any(feature = "sound", feature = "rdpdr"))]
+     let audio_playback = connector_config.enable_audio_playback;
++
++    #[cfg(feature = "rdpdr")]
++    let rdpdr_channel = build_rdpdr_channel(rdpdr_factory, &config.connector.client_name, &config.channels.rdpdr, rdpdr_policy)?.or_else(|| {
++        config
++            .channels
++            .rdpdr
++            .enabled
++            .then(|| ironrdp_rdpdr::Rdpdr::new(Box::new(ironrdp_rdpdr::NoopRdpdrBackend), config.connector.client_name.clone()))
++    });
++    #[cfg(feature = "rdpdr")]
++    input_sender.set_rdpdr_drive_hotplug_available(
++        rdpdr_channel
++            .as_ref()
++            .is_some_and(ironrdp_rdpdr::Rdpdr::drive_hotplug_available),
++    );
++
++    #[cfg(any(feature = "sound", feature = "rdpdr"))]
++    let rdpsnd_kind = {
++        #[cfg(feature = "rdpdr")]
++        let rdpdr_attached = rdpdr_channel.is_some();
++        #[cfg(not(feature = "rdpdr"))]
++        let rdpdr_attached = false;
++
++        rdpsnd_backend_kind(audio_playback, rdpdr_attached)
++    };
++
++    #[cfg(feature = "rdpdr")]
++    if matches!(rdpsnd_kind, Some(RdpsndBackendKind::Noop)) {
++        let quality_mode = config.audio_quality_mode.into_rdpsnd();
++        drdynvc = drdynvc.with_dynamic_channel_factory(
++            ironrdp_rdpsnd::client::DVC_CHANNEL_NAME,
++            move || {
++                ironrdp_rdpsnd::client::RdpsndDvcState::new(Box::new(
++                    ironrdp_rdpsnd::client::NoopRdpsndBackend,
++                ))
++                .with_quality_mode(quality_mode)
++                .channel()
++            },
++        );
++    }
++
+     let rail_client = if connector_config.remote_application_mode {
+         let rail_client = RailClient::new(
+             connector_config.client_build,
+@@ -2990,31 +3031,6 @@ fn build_connector(
+         connector = connector.with_static_channel(rail_client);
+     }
+ 
+-    #[cfg(feature = "rdpdr")]
+-    let rdpdr_channel = build_rdpdr_channel(rdpdr_factory, &config.connector.client_name, &config.channels.rdpdr, rdpdr_policy)?.or_else(|| {
+-        config
+-            .channels
+-            .rdpdr
+-            .enabled
+-            .then(|| ironrdp_rdpdr::Rdpdr::new(Box::new(ironrdp_rdpdr::NoopRdpdrBackend), config.connector.client_name.clone()))
+-    });
+-    #[cfg(feature = "rdpdr")]
+-    input_sender.set_rdpdr_drive_hotplug_available(
+-        rdpdr_channel
+-            .as_ref()
+-            .is_some_and(ironrdp_rdpdr::Rdpdr::drive_hotplug_available),
+-    );
+-
+-    #[cfg(any(feature = "sound", feature = "rdpdr"))]
+-    let rdpsnd_kind = {
+-        #[cfg(feature = "rdpdr")]
+-        let rdpdr_attached = rdpdr_channel.is_some();
+-        #[cfg(not(feature = "rdpdr"))]
+-        let rdpdr_attached = false;
+-
+-        rdpsnd_backend_kind(audio_playback, rdpdr_attached)
+-    };
+-
+     #[cfg(feature = "sound")]
+     if matches!(rdpsnd_kind, Some(RdpsndBackendKind::Playback)) {
+         // INVARIANT: `audio_playback` is `config.channels.sound && connector.enable_audio_playback`,
+@@ -8544,4 +8560,94 @@ mod tests {
+         assert!(connector.config.enable_audio_playback);
+         assert!(has_rdpsnd);
+     }
++
++    #[cfg(all(feature = "sound", feature = "rdpdr"))]
++    #[test]
++    fn audio_dvc_matches_freerdp_matrix() {
++        use ironrdp_core::{decode, encode_vec};
++        use ironrdp_dvc::DrdynvcClient;
++        use ironrdp_dvc::pdu::{CreateRequestPdu, CreationStatus, DrdynvcClientPdu, DrdynvcServerPdu};
++        use ironrdp_rdpsnd::client::{DVC_CHANNEL_NAME, LOSSY_DVC_CHANNEL_NAME};
++        use ironrdp_svc::SvcProcessor as _;
++
++        let cases = [
++            (ironrdp_cfg::AudioMode::Disabled, false, false, false, false, false),
++            (ironrdp_cfg::AudioMode::Disabled, true, true, true, false, false),
++            (ironrdp_cfg::AudioMode::RedirectToClient, true, true, true, true, false),
++            (ironrdp_cfg::AudioMode::PlayOnServer, false, false, false, false, true),
++            (ironrdp_cfg::AudioMode::PlayOnServer, true, true, true, false, true),
++        ];
++
++        for (audio_mode, rdpdr_enabled, expect_static, expect_dvc, expect_playback, expect_remote) in cases {
++            let config = test_config_builder()
++                .with_rdpdr(rdpdr_enabled)
++                .with_audio_mode(audio_mode)
++                .with_audio_capture(false)
++                .build()
++                .expect("test configuration should build");
++
++            #[cfg(feature = "clipboard")]
++            let cliprdr_factory: CliprdrFactoryRef<'static> = None;
++            #[cfg(not(feature = "clipboard"))]
++            let cliprdr_factory: CliprdrFactoryRef<'static> = core::marker::PhantomData;
++            let rdpdr_factory: RdpdrFactoryRef<'static> = None;
++            let (input_sender, _input_receiver) = RdpInputSender::channel(1);
++            let (output_sender, _output_receiver) = crate::output_channel::output_channel(1);
++            let mut connector = build_connector(
++                &config,
++                SocketAddr::from(([127, 0, 0, 1], 0)),
++                (&input_sender, &output_sender),
++                cliprdr_factory,
++                rdpdr_factory,
++                RdpdrDevicePolicy::ALLOW_ALL,
++                false,
++                false,
++                None,
++            )
++            .expect("test connector should build");
++
++            assert_eq!(connector.config.enable_audio_playback, expect_playback);
++            assert_eq!(connector.config.remote_console_audio, expect_remote);
++            assert_eq!(
++                connector
++                    .static_channels
++                    .get_by_channel_name_key(&ChannelName::from_static(b"rdpdr\0\0\0"))
++                    .is_some(),
++                expect_static
++            );
++            assert_eq!(
++                connector
++                    .static_channels
++                    .get_by_channel_name_key(&ChannelName::from_static(b"rdpsnd\0\0"))
++                    .is_some(),
++                expect_static
++            );
++
++            let drdynvc = connector
++                .static_channels
++                .get_by_type_mut::<DrdynvcClient>()
++                .expect("drdynvc attached")
++                .channel_processor_downcast_mut::<DrdynvcClient>()
++                .expect("drdynvc processor");
++
++            let check_dvc = |drdynvc: &mut DrdynvcClient, id: u32, name: &str| -> bool {
++                let req = encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(id, name.to_owned())))
++                    .expect("encode create request");
++                let replies = drdynvc.process(&req).expect("process create request");
++                replies
++                    .iter()
++                    .find_map(|msg| {
++                        let reply_bytes = msg.encode_unframed_pdu().expect("encode create response");
++                        match decode::<DrdynvcClientPdu>(&reply_bytes).expect("decode create response") {
++                            DrdynvcClientPdu::Create(resp) => Some(resp.creation_status() == CreationStatus::OK),
++                            _ => None,
++                        }
++                    })
++                    .expect("create response")
++            };
++
++            assert_eq!(check_dvc(drdynvc, 1, DVC_CHANNEL_NAME), expect_dvc);
++            assert!(!check_dvc(drdynvc, 2, LOSSY_DVC_CHANNEL_NAME));
++        }
++    }
+ }
