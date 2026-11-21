@@ -240,6 +240,14 @@ typedef struct CNDFIronConnectOptions {
    */
   const char *drive_name;
   enum CNDFIronAudioMode audio_mode;
+  /**
+   * GCC Client Core Data keyboard fields. The v2 options default to the standard
+   * keyboard (0, 4, 0, 12) when struct_size does not cover them all.
+   */
+  uint32_t keyboard_layout;
+  uint32_t keyboard_type;
+  uint32_t keyboard_subtype;
+  uint32_t keyboard_function_keys;
 } CNDFIronConnectOptions;
 
 typedef struct CNDFIronInputEvent {

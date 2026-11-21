@@ -341,6 +341,10 @@ mod tests {
             drive_path: ptr::null(),
             drive_name: ptr::null(),
             audio_mode: CNDFIronAudioMode::CNDF_IRON_AUDIO_OFF,
+            keyboard_layout: 0,
+            keyboard_type: 4,
+            keyboard_subtype: 0,
+            keyboard_function_keys: 12,
         };
         let (generation, sequence, pixel) = unsafe {
             let session = cndf_iron_session_create(&callbacks);

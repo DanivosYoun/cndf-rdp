@@ -1198,6 +1198,13 @@ static UINT32 bridge_desktop_scale_percent(double scale) {
     return (UINT32)(fmin(5.0, fmax(1.0, scale)) * 100.0 + 0.5);
 }
 
+static BOOL bridge_apply_keyboard(rdpSettings *settings, const RDPBridgeConnectionOptions *options) {
+    return freerdp_settings_set_uint32(settings, FreeRDP_KeyboardLayout, options->keyboardLayout) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_KeyboardType, options->keyboardType) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_KeyboardSubType, options->keyboardSubType) &&
+           freerdp_settings_set_uint32(settings, FreeRDP_KeyboardFunctionKey, options->keyboardFunctionKey);
+}
+
 static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnectionOptions *options) {
     freerdp *instance = session->instance;
     rdpSettings *settings = instance->context->settings;
@@ -1260,6 +1267,7 @@ static BOOL configure_instance(RDPBridgeSession *session, const RDPBridgeConnect
            freerdp_settings_set_bool(settings, FreeRDP_RedirectParallelPorts, FALSE) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE) &&
            bridge_apply_graphics_mode(settings, options->compatibilityGraphics) &&
+           bridge_apply_keyboard(settings, options) &&
            freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE) &&
            freerdp_settings_set_bool(settings, FreeRDP_DesktopResize, TRUE) &&
@@ -1709,6 +1717,31 @@ bool rdp_bridge_graphics_settings_for_mode(bool compatibility, RDPBridgeGraphics
     return ok;
 #else
     (void)compatibility;
+    return false;
+#endif
+}
+
+bool rdp_bridge_keyboard_settings_for_options(const RDPBridgeConnectionOptions *options,
+                                              RDPBridgeKeyboardSettings *out) {
+    if ((options == NULL) || (out == NULL)) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+#if defined(RDP_FREERDP_REAL)
+    rdpSettings *settings = freerdp_settings_new(0);
+    if (settings == NULL) {
+        return false;
+    }
+    const BOOL ok = bridge_apply_keyboard(settings, options);
+    if (ok) {
+        out->keyboardLayout = freerdp_settings_get_uint32(settings, FreeRDP_KeyboardLayout);
+        out->keyboardType = freerdp_settings_get_uint32(settings, FreeRDP_KeyboardType);
+        out->keyboardSubType = freerdp_settings_get_uint32(settings, FreeRDP_KeyboardSubType);
+        out->keyboardFunctionKey = freerdp_settings_get_uint32(settings, FreeRDP_KeyboardFunctionKey);
+    }
+    freerdp_settings_free(settings);
+    return ok;
+#else
     return false;
 #endif
 }

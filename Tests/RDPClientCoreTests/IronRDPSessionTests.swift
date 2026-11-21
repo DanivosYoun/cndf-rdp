@@ -74,6 +74,7 @@ final class IronRDPSessionTests: XCTestCase {
         }
         XCTAssertEqual(session.connectionGeneration, 0)
         XCTAssertEqual(recorder.logs.dropFirst().first, "RDP channels clipboard=off folder=on audio=remote")
+        XCTAssertEqual(recorder.logs.dropFirst(2).first, "RDP keyboard profile=standard layout=0x0 type=4 subtype=0 fn=12")
     }
 
     func testCallbacksBeforeAnyConnectionAreDropped() throws {

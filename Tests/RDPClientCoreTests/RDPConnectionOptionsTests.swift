@@ -21,6 +21,18 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertNil(options.forcedDesktopSize)
         XCTAssertFalse(options.networkAutoDetect)
         XCTAssertEqual(options.graphicsMode, .automatic)
+        XCTAssertEqual(options.keyboardProfile, .standard)
+    }
+
+    /// Design D2: `.standard` keeps the pre-profile fields, `.korean` is Korean 101-key Type 1.
+    func testKeyboardProfileGCCFields() {
+        let standard = RDPKeyboardProfile.standard
+        XCTAssertEqual([standard.keyboardLayout, standard.keyboardType, standard.keyboardSubType, standard.keyboardFunctionKey],
+                       [0, 4, 0, 12])
+        let korean = RDPKeyboardProfile.korean
+        XCTAssertEqual([korean.keyboardLayout, korean.keyboardType, korean.keyboardSubType, korean.keyboardFunctionKey],
+                       [0x412, 8, 3, 12])
+        XCTAssertEqual(RDPConnectionOptions(host: "rdp.example", keyboardProfile: .korean).keyboardProfile, .korean)
     }
 
     func testStoresConnectionOptions() {

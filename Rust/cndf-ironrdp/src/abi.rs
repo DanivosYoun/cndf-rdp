@@ -177,6 +177,12 @@ pub struct CNDFIronConnectOptions {
     /// NULL selects "RemoteShare".
     pub drive_name: *const c_char,
     pub audio_mode: CNDFIronAudioMode,
+    /// GCC Client Core Data keyboard fields. The v2 options default to the standard
+    /// keyboard (0, 4, 0, 12) when struct_size does not cover them all.
+    pub keyboard_layout: u32,
+    pub keyboard_type: u32,
+    pub keyboard_subtype: u32,
+    pub keyboard_function_keys: u32,
 }
 
 #[repr(C)]

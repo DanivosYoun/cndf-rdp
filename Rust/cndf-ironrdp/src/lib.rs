@@ -157,6 +157,42 @@ struct Options {
     password: Zeroizing<String>,
     #[allow(dead_code)]
     channels: channels::Options,
+    #[allow(dead_code)]
+    keyboard: Keyboard,
+}
+
+/// GCC Client Core Data keyboard fields, passed to the connector unchanged.
+#[cfg_attr(feature = "stub", allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Keyboard {
+    layout: u32,
+    kind: u32,
+    subtype: u32,
+    function_keys: u32,
+}
+
+impl Keyboard {
+    const STANDARD: Self = Self {
+        layout: 0,
+        kind: 4,
+        subtype: 0,
+        function_keys: 12,
+    };
+
+    unsafe fn read(raw: *const CNDFIronConnectOptions) -> Self {
+        use std::mem::{offset_of, size_of};
+        if (raw.cast::<u32>().read() as usize)
+            < offset_of!(CNDFIronConnectOptions, keyboard_function_keys) + size_of::<u32>()
+        {
+            return Self::STANDARD;
+        }
+        Self {
+            layout: ptr::addr_of!((*raw).keyboard_layout).read(),
+            kind: ptr::addr_of!((*raw).keyboard_type).read(),
+            subtype: ptr::addr_of!((*raw).keyboard_subtype).read(),
+            function_keys: ptr::addr_of!((*raw).keyboard_function_keys).read(),
+        }
+    }
 }
 
 #[cfg_attr(feature = "stub", allow(dead_code))]
@@ -290,7 +326,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=20\0"
+            " ironrdp=15b4a03ff552 patches=21\0"
         );
         version.as_ptr().cast()
     })
@@ -372,6 +408,7 @@ pub unsafe extern "C" fn cndf_iron_connect(
         let Some(mut channel_options) = channels::Options::read(options) else {
             return CNDF_IRON_INVALID_ARGUMENT;
         };
+        let keyboard = Keyboard::read(options);
         use CNDFIronAudioMode::*;
         let capabilities = cndf_iron_capabilities();
         channel_options.audio = match channel_options.audio {
@@ -437,6 +474,7 @@ pub unsafe extern "C" fn cndf_iron_connect(
             log_level: options.log_level,
             password: Zeroizing::new(password.to_owned()),
             channels: channel_options,
+            keyboard,
         };
         let mut state = lock(&session.state);
         if session.callbacks.closed.load(Ordering::Acquire) {
@@ -701,6 +739,29 @@ mod tests {
             let probe = unsafe { &*context.cast::<Probe>() };
             probe.failures.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn reads_keyboard_fields_and_defaults_truncated_v1_to_standard() {
+        let mut raw: CNDFIronConnectOptions = unsafe { std::mem::zeroed() };
+        raw.struct_size = std::mem::size_of::<CNDFIronConnectOptions>() as u32;
+        raw.keyboard_layout = 0x412;
+        raw.keyboard_type = 8;
+        raw.keyboard_subtype = 3;
+        raw.keyboard_function_keys = 12;
+        let korean = unsafe { Keyboard::read(&raw) };
+        raw.struct_size = std::mem::offset_of!(CNDFIronConnectOptions, keyboard_layout) as u32;
+        let truncated = unsafe { Keyboard::read(&raw) };
+        assert_eq!(
+            korean,
+            Keyboard {
+                layout: 0x412,
+                kind: 8,
+                subtype: 3,
+                function_keys: 12
+            }
+        );
+        assert_eq!(truncated, Keyboard::STANDARD);
     }
 
     #[test]

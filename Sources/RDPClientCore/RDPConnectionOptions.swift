@@ -27,6 +27,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let graphicsMode: RDPGraphicsMode
     /// The engine `RDPConnectionView.connect` creates the session with. Fixed for the session.
     public let engine: RDPEngineKind
+    /// GCC keyboard fields both engines advertise. Fixed for the session.
+    public let keyboardProfile: RDPKeyboardProfile
 
     public init(
         host: String,
@@ -49,7 +51,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         networkAutoDetect: Bool = false,
         graphicsMode: RDPGraphicsMode = .automatic,
         engine: RDPEngineKind = .freeRDP,
-        pasteboardName: String? = nil
+        pasteboardName: String? = nil,
+        keyboardProfile: RDPKeyboardProfile = .standard
     ) {
         self.host = host
         self.port = port
@@ -72,6 +75,29 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.networkAutoDetect = networkAutoDetect
         self.graphicsMode = graphicsMode
         self.engine = engine
+        self.keyboardProfile = keyboardProfile
+    }
+}
+
+/// The keyboard a connection reports in GCC Client Core Data (design D2). The server's keyboard
+/// driver for this type and subtype decides which scancodes become VK_HANGUL and VK_HANJA.
+public enum RDPKeyboardProfile: String, Codable, Sendable {
+    /// What both engines sent before profiles existed.
+    case standard
+    /// Korean 101-key Type 1: right Alt is Han/Yeong and right Ctrl is Hanja.
+    case korean
+
+    public var keyboardLayout: UInt32 { gccFields.layout }
+    public var keyboardType: UInt32 { gccFields.type }
+    public var keyboardSubType: UInt32 { gccFields.subType }
+    public var keyboardFunctionKey: UInt32 { gccFields.functionKey }
+
+    // The one table of GCC keyboard values. The IME file name stays empty for every profile.
+    private var gccFields: (layout: UInt32, type: UInt32, subType: UInt32, functionKey: UInt32) {
+        switch self {
+        case .standard: return (0, 4, 0, 12)
+        case .korean: return (0x412, 8, 3, 12)
+        }
     }
 }
 
@@ -140,5 +166,12 @@ extension RDPConnectionOptions {
         }
         let folder = redirectedFolderPath?.isEmpty == false
         return "RDP channels clipboard=\(enableClipboard ? "on" : "off") folder=\(folder ? "on" : "off") audio=\(audio)"
+    }
+
+    /// Both engines log this line, so their GCC keyboard fields can be diffed (design I4).
+    var keyboardLogMessage: String {
+        let profile = keyboardProfile
+        return "RDP keyboard profile=\(profile.rawValue) layout=0x\(String(profile.keyboardLayout, radix: 16))"
+            + " type=\(profile.keyboardType) subtype=\(profile.keyboardSubType) fn=\(profile.keyboardFunctionKey)"
     }
 }
