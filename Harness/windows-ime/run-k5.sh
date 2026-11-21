@@ -150,11 +150,10 @@ PY
 # WinRM output goes through the OEM code page, so the UTF-8 files travel as base64.
 fetch() {
   printf '$o = "C:\\k5\\out\\%s"; foreach ($e in "keys.log", "state.txt") { if (Test-Path "$o.$e") { "=== $e"; [Convert]::ToBase64String([IO.File]::ReadAllBytes("$o.$e")) } }\n' "$1" | ps \
-    | python3 -c 'import base64, sys
-for line in sys.stdin.read().split("\n"):
-    line = line.strip()
-    if line.startswith("==="): print(line)
-    elif line: sys.stdout.write(base64.b64decode(line).decode("utf-8", "replace"))' > "${WORK}/results/$1.windows.txt" || true
+    | python3 -c 'import base64, re, sys
+for part in re.split(r"^(=== .*)$", sys.stdin.read(), flags=re.M):
+    if part.startswith("==="): print(part)
+    elif part.strip(): sys.stdout.write(base64.b64decode("".join(part.split())).decode("utf-8", "replace"))' > "${WORK}/results/$1.windows.txt" || true
 }
 
 teardown() {

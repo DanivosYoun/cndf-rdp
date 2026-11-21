@@ -61,9 +61,11 @@ public static class K5Probe {
         return p;
     }
 
-    // The cursor line of a console's screen buffer. The probe has no console of its own.
+    // The cursor line of a console's screen buffer. The hidden powershell.exe host's own console
+    // is given up first: a process can be attached to one console only.
     static string ConsoleLine(Process p) {
         if (p == null || p.HasExited) return "";
+        FreeConsole();
         if (!AttachConsole(p.Id)) return "attach-failed";
         string line = "";
         IntPtr h = CreateFile("CONOUT$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
