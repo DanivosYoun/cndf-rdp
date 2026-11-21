@@ -184,8 +184,10 @@ pub(super) fn run_stub(connection: &Connection, commands: Receiver<ClipboardComm
     }
 }
 
+const MAX_FILE_RANGE_LENGTH: u32 = 64 * 1024 * 1024;
+
 fn read_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
-    if length > 64 * 1024 * 1024 || offset.checked_add(u64::from(length))? > file.size {
+    if length > MAX_FILE_RANGE_LENGTH || offset.checked_add(u64::from(length))? > file.size {
         return None;
     }
     let mut source = std::fs::File::open(&file.path).ok()?;
@@ -262,6 +264,16 @@ mod real {
     };
     use ironrdp_core::IntoOwned;
     use std::collections::{HashSet, VecDeque};
+
+    fn read_file_contents_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
+        if length > MAX_FILE_RANGE_LENGTH {
+            return None;
+        }
+        // Windows requests a full buffer even if fewer bytes remain in the file.
+        let available = file.size.checked_sub(offset)?;
+        let length = u64::from(length).min(available) as u32;
+        read_range(file, offset, length)
+    }
 
     pub(crate) type Job = Box<dyn FnOnce(&Connection) + Send>;
 
@@ -613,8 +625,9 @@ mod real {
             }
             let input = self.0.input.clone();
             self.0.queue(move |_| {
-                let data = file
-                    .and_then(|file| read_range(&file, request.position, request.requested_size));
+                let data = file.and_then(|file| {
+                    read_file_contents_range(&file, request.position, request.requested_size)
+                });
                 let response = match data {
                     Some(bytes) => FileContentsResponse::new_data_response(stream, bytes),
                     None => FileContentsResponse::new_error(stream),
@@ -640,6 +653,31 @@ mod real {
     mod tests {
         use super::*;
         use ironrdp_cliprdr::pdu::ClipboardFormatName;
+
+        #[test]
+        fn file_contents_range_returns_the_remaining_bytes_at_eof() {
+            let path = std::env::temp_dir()
+                .join(format!("cndf-iron-file-contents-{}", std::process::id()));
+            let mut fixture = std::fs::File::create_new(&path).unwrap();
+            std::io::Write::write_all(&mut fixture, b"CNDF").unwrap();
+            drop(fixture);
+            let file = LocalFile {
+                path: path.to_str().unwrap().to_owned(),
+                name: "fixture".into(),
+                size: 4,
+            };
+
+            let short = read_file_contents_range(&file, 1, 256 * 1024);
+            let at_eof = read_file_contents_range(&file, 4, 1);
+            let past_eof = read_file_contents_range(&file, 5, 1);
+            let over_limit = read_file_contents_range(&file, 1, 64 * 1024 * 1024 + 1);
+            std::fs::remove_file(path).unwrap();
+
+            assert_eq!(short.as_deref(), Some(&b"NDF"[..]));
+            assert_eq!(at_eof.as_deref(), Some(&b""[..]));
+            assert!(past_eof.is_none());
+            assert!(over_limit.is_none());
+        }
 
         #[test]
         fn real_capabilities_expose_all_channels() {
