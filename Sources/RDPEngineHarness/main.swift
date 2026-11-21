@@ -324,10 +324,13 @@ private func describeLocalFile(_ url: URL) -> [String: String] {
     defer { try? handle.close() }
     var hasher = SHA256()
     var bytes: UInt64 = 0
-    while let chunk = try? handle.read(upToCount: 8 << 20), !chunk.isEmpty {
+    // Drain each chunk: on the main thread without a pool the chunks pile up until the step ends.
+    while autoreleasepool(invoking: {
+        guard let chunk = try? handle.read(upToCount: 8 << 20), !chunk.isEmpty else { return false }
         hasher.update(data: chunk)
         bytes += UInt64(chunk.count)
-    }
+        return true
+    }) {}
     let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
     return ["name": url.lastPathComponent, "bytes": String(bytes), "sha256": digest]
 }

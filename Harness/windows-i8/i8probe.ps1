@@ -49,6 +49,7 @@ public static class I8Probe {
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, uint data, IntPtr extra);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int left, top, right, bottom; }
 
     static StreamWriter log;
@@ -155,6 +156,10 @@ public static class I8Probe {
     }
 
     static void Tick() {
+        try { TickBody(); } catch (Exception ex) { Log("tick error " + ex.GetType().Name + " " + ex.Message); pasteState = 0; }
+    }
+
+    static void TickBody() {
         long now = clock.ElapsedMilliseconds;
         uint seq = GetClipboardSequenceNumber();
         if (seq != lastSeq) {
@@ -188,7 +193,9 @@ public static class I8Probe {
                 SetCursorPos(r.left + (r.right - r.left) * 3 / 4, r.top + (r.bottom - r.top) * 3 / 4);
                 mouse_event(2, 0, 0, 0, IntPtr.Zero); mouse_event(4, 0, 0, 0, IntPtr.Zero);
                 System.Threading.Thread.Sleep(300);
-                SendKeys.SendWait("^v");
+                // keybd_event, not SendKeys.SendWait: SendWait did not return while Explorer pasted.
+                keybd_event(0x11, 0x1D, 0, IntPtr.Zero); keybd_event(0x56, 0x2F, 0, IntPtr.Zero);
+                keybd_event(0x56, 0x2F, 2, IntPtr.Zero); keybd_event(0x11, 0x1D, 2, IntPtr.Zero);
                 Log("paste sent");
             } else Log("paste window lost");
             pasteState = 4; stateSince = now; lastChange = now; lastSignature = "";

@@ -45,6 +45,9 @@ w2m = "W2M 한글 🎵 텍스트"
 write("b-text", [READY,
     {"op": "clipboardSetLocal", "text": "M2W 한글 🎵 텍스트"}, {"op": "idle", "seconds": 2},
     cmd("settext " + b64(w2m)), {"op": "clipboardExpectLocal", "text": w2m, "timeout": 15},
+    # A Mac copy within ~300 ms of a received remote copy is lost on Windows (both engines,
+    # int-8 dbg-window); the burst starts 1 s later so it measures the burst alone.
+    {"op": "idle", "seconds": 1},
     ] + [{"op": "clipboardSetLocal", "text": f"M2W-연속-{k}"} for k in range(1, 6)] + [{"op": "idle", "seconds": 3},
     cmd("burst 5 " + b64("W2M-연속")), {"op": "clipboardExpectLocal", "text": "W2M-연속-5", "timeout": 15},
     {"op": "idle", "seconds": 2}])

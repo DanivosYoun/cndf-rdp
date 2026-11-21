@@ -100,7 +100,6 @@ if (-not (Test-Path C:\i8\lang-before.txt)) {
 }
 'lang-before=' + ((Get-Content C:\i8\lang-before.txt) -join ' ; ')
 'freeGB=' + [math]::Round((Get-PSDrive C).Free / 1GB, 1)
-'quser=' + [bool](quser 2>$null)
 PS
   upload "${ROOT_DIR}/Harness/windows-i8/i8probe.ps1" 'C:\i8\i8probe.ps1'
   ps <<'PS'
@@ -138,7 +137,10 @@ PS
 run() {
   local name="$1" engine="$2" scenario="$3" cut_pid=""
   printf 'Set-Content -NoNewline -Path C:\\i8\\runid.txt -Value "%s"\n' "${name}" | ps
-  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${scenario}" "${MAC}:${I8_MAC_DIR}/scenarios/${name}.json"
+  # The run id names the session log; use the run name so repeated runs keep their own logs.
+  python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); d["runs"][0]["id"] = sys.argv[3]; json.dump(d, open(sys.argv[2], "w"), ensure_ascii=False)' \
+    "${scenario}" "${WORK}/results/${name}.scenario.json" "${name}"
+  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/results/${name}.scenario.json" "${MAC}:${I8_MAC_DIR}/scenarios/${name}.json"
   log "run ${name} engine=${engine}"
   if [[ -n "${CUT_AFTER:-}" ]]; then
     ( sleep "${CUT_AFTER}"; kill "$(cat "${WORK}/tunnel.pid")" 2>/dev/null; echo "cut $(date '+%H:%M:%S')" >> "${WORK}/results/${name}.cut.txt" ) &
