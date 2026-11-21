@@ -344,6 +344,8 @@ mod real {
         requests: HashSet<u32>,
         /// RANGE responses accepted for the server and not yet handled by the session.
         range_responses: Vec<(oneshot::Receiver<()>, u64)>,
+        /// The text response that may still be queued for the session.
+        text_response: Option<oneshot::Receiver<()>>,
     }
 
     impl State {
@@ -389,6 +391,17 @@ mod real {
                 return messages.send(message).is_ok();
             }
             self.input.send_clipboard(message).is_ok()
+        }
+
+        fn send_with_completion(&self, message: Message, completion: oneshot::Sender<()>) -> bool {
+            #[cfg(test)]
+            if self.messages.is_some() {
+                // The capture hook records only the message; dropping the completion retires it.
+                return self.send(message);
+            }
+            self.input
+                .send_clipboard_with_completion(message, completion)
+                .is_ok()
         }
 
         fn queue(&self, job: impl FnOnce(&Connection) + Send + 'static) {
@@ -622,14 +635,36 @@ mod real {
         }
 
         fn on_format_data_request(&mut self, request: FormatDataRequest) {
-            let state = lock(&self.0.state);
+            let mut state = lock(&self.0.state);
+            let wants_text = matches!(state.offer, Offer::Text(_))
+                && request.format == ClipboardFormatId::CF_UNICODETEXT;
+            // Every request would otherwise queue another copy of the text while writes are blocked.
+            let busy = wants_text && state.text_response.as_mut().is_some_and(pending);
             let response = match &state.offer {
-                Offer::Text(text) if request.format == ClipboardFormatId::CF_UNICODETEXT => {
+                Offer::Text(text) if wants_text && !busy => {
                     FormatDataResponse::new_unicode_string(text)
                 }
                 _ => FormatDataResponse::new_error(),
-            };
-            self.0.send(Message::SendFormatData(response.into_owned()));
+            }
+            .into_owned();
+            if !wants_text || busy {
+                drop(state);
+                self.0.send(Message::SendFormatData(response));
+                if busy {
+                    self.0.queue(|connection| {
+                        connection.clip_log(
+                            CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                            "Clipboard format data rejected reason=busy",
+                        );
+                    });
+                }
+                return;
+            }
+            let (completion, handled) = oneshot::channel();
+            state.text_response = Some(handled);
+            drop(state);
+            self.0
+                .send_with_completion(Message::SendFormatData(response), completion);
         }
 
         fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
@@ -1186,6 +1221,53 @@ mod real {
             drop(jobs);
             let mut state = lock(&channel.state);
             assert!(state.reserve_range(MAX_RANGE_BYTES_IN_FLIGHT).is_some());
+        }
+
+        // oracle: mutant queuing a second copy of the text before the first response is handled.
+        #[test]
+        fn text_responses_queue_one_copy_at_a_time() {
+            use ironrdp_client::rdp::RdpInputEvent;
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (work, _jobs) = mpsc::channel();
+            let channel = Channel::new(input, work);
+            let mut backend = CndfCliprdrBackend(channel.clone());
+            backend.on_ready();
+            channel.submit(ClipboardCommand::Text("가".repeat(1024)));
+            let text = FormatDataRequest {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+            };
+            backend.on_format_data_request(text.clone());
+            backend.on_format_data_request(text.clone());
+            let mut responses = Vec::new();
+            while let Ok(event) = ordered.try_recv() {
+                match event {
+                    RdpInputEvent::ClipboardWithCompletion(
+                        Message::SendFormatData(response),
+                        completion,
+                    ) => {
+                        responses.push((response.is_error(), Some(completion)));
+                    }
+                    RdpInputEvent::Clipboard(Message::SendFormatData(response)) => {
+                        responses.push((response.is_error(), None));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                responses
+                    .iter()
+                    .map(|(error, _)| *error)
+                    .collect::<Vec<_>>(),
+                [false, true]
+            );
+            drop(responses);
+            backend.on_format_data_request(text);
+            let Ok(RdpInputEvent::ClipboardWithCompletion(Message::SendFormatData(response), _)) =
+                ordered.try_recv()
+            else {
+                panic!("expected a text response");
+            };
+            assert!(!response.is_error());
         }
 
         #[test]
