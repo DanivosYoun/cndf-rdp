@@ -1,5 +1,15 @@
-_cndf_iron_*
+_cndf_iron_abi_version
 _cndf_iron_capabilities
-_cndf_iron_clipboard_offer_text
 _cndf_iron_clipboard_offer_files
+_cndf_iron_clipboard_offer_text
 _cndf_iron_clipboard_request_file_range
+_cndf_iron_connect
+_cndf_iron_disconnect
+_cndf_iron_get_statistics
+_cndf_iron_is_connected
+_cndf_iron_redeliver_frame
+_cndf_iron_resize
+_cndf_iron_send_input
+_cndf_iron_session_create
+_cndf_iron_session_destroy
+_cndf_iron_version
