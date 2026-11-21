@@ -819,6 +819,22 @@ enum ResizeFrameSizeCheckStatus: String, Equatable {
     case notApplicable = "N/A"
 }
 
+/// One resize step logs `req=<w>x<h> got=<w>x<h>|none`. The structured fields keep
+/// only the last step, so a matching final pair used to hide an earlier mismatch.
+private func resizeLogDiffersFromRequest(_ lines: [String]) -> Bool {
+    for line in lines {
+        var fields: [String: String] = [:]
+        for token in line.split(separator: " ") {
+            let parts = token.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            fields[String(parts[0])] = String(parts[1])
+        }
+        guard let req = fields["req"], let got = fields["got"] else { continue }
+        if req != got { return true }
+    }
+    return false
+}
+
 func evaluateResizeFrameSize(
     _ iteration: IterationResult,
     against expect: HarnessExpectation?
@@ -833,6 +849,9 @@ func evaluateResizeFrameSize(
             return (.fail, "\(prefix) resize: Display Control did not open")
         }
         return (.notApplicable, nil)
+    }
+    if resizeLogDiffersFromRequest(iteration.resizeLog) {
+        return (.fail, "\(prefix) resize: logged frame size differs from the request")
     }
     if let requested = iteration.requestedResizeFrameSize {
         if iteration.resizeFrameSize != requested {

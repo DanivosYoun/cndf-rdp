@@ -180,7 +180,9 @@ scenario_files() {
 run_tree() {
   local tree="$1" tag="$2"; shift 2
   local scenario status
-  mac_build "${tree}" >&2
+  # A failing build must stop this driver. `return` keeps the status visible to
+  # the caller; `set -e` alone is dropped when the caller inspects $? .
+  mac_build "${tree}" >&2 || return $?
   for scenario in $(scenario_files "$@"); do
     # run_one toggles errexit itself, so its status is taken in a condition.
     if run_one "${scenario}" "${WORK}/results/${tag}"; then status=0; else status=$?; fi
@@ -207,10 +209,21 @@ case "${1:-}" in
     tree="$(cd "$2" && pwd)"; shift 2
     trap down EXIT
     check_memory; prepare; tunnel_up
+    # run_tree's status must be kept. A process substitution hides a build
+    # failure (no scenario lines, failed stays 0, the script exits 0).
+    set +e
+    run_tree "${tree}" run "$@" > "${WORK}/run.status"
+    tree_status=$?
+    set -e
     failed=0
+    if [[ "${tree_status}" -ne 0 ]]; then
+      log "client build or scenario driver failed (exit ${tree_status})"
+      failed=1
+    fi
     while read -r name status; do
+      [[ -n "${name}" ]] || continue
       (( status == 0 )) || failed=1
-    done < <(run_tree "${tree}" run "$@")
+    done < "${WORK}/run.status"
     log "results in ${WORK}/results/run"
     exit "${failed}"
     ;;
