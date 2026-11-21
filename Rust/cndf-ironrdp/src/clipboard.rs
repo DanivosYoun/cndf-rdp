@@ -569,24 +569,36 @@ mod real {
             }
             let mut descriptors = Vec::with_capacity(files.len());
             for file in files {
-                let (relative_path, name) = match file.name.rsplit_once('\\') {
+                // A name ending with `\` is a directory (the staging never ends a file name with it).
+                let (full_name, is_directory) = match file.name.strip_suffix('\\') {
+                    Some(stripped) => (stripped, true),
+                    None => (file.name.as_str(), false),
+                };
+                let (relative_path, name) = match full_name.rsplit_once('\\') {
                     Some((parent, name)) => (Some(parent.to_owned()), name),
-                    None => (None, file.name.as_str()),
+                    None => (None, full_name),
                 };
                 // Keep the I/O index aligned with the entries retained by initiate_file_copy.
                 if name.is_empty()
-                    || file.name.chars().count() > 259
-                    || file.name.starts_with(['/', '\\'])
-                    || file.name.as_bytes().get(1) == Some(&b':')
+                    || full_name.chars().count() > 259
+                    || full_name.starts_with(['/', '\\'])
+                    || full_name.as_bytes().get(1) == Some(&b':')
                 {
                     continue;
                 }
+                let mut advertised = file.clone();
+                let attributes = if is_directory {
+                    advertised.size = 0;
+                    ClipboardFileAttributes::DIRECTORY
+                } else {
+                    ClipboardFileAttributes::NORMAL
+                };
                 let mut descriptor = FileDescriptor::new(name)
-                    .with_attributes(ClipboardFileAttributes::NORMAL)
-                    .with_file_size(file.size);
+                    .with_attributes(attributes)
+                    .with_file_size(advertised.size);
                 descriptor.relative_path = relative_path;
                 descriptors.push(descriptor);
-                state.advertised.push(Arc::new(file.clone()));
+                state.advertised.push(Arc::new(advertised));
             }
             let rejected = files.len() - descriptors.len();
             if rejected != 0 {
@@ -1756,6 +1768,88 @@ mod real {
             offered.hold(&mut held);
             assert_eq!(held.len(), 1);
             assert_eq!(held[0].instance, offered.cliprdr.instance());
+        }
+
+        fn directory(name: &str, size: u64) -> LocalFile {
+            LocalFile {
+                path: "/unused-directory".into(),
+                name: name.into(),
+                size,
+            }
+        }
+
+        // R-1 oracle: mutant skipping the `\` marker strip (the entry is dropped and indices shift),
+        // or advertising a directory as NORMAL.
+        #[test]
+        fn directory_marker_advertises_a_directory_descriptor() {
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            let capabilities = ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                ClipboardProtocolVersion::V2,
+                Capabilities::STREAM_FILECLIP_ENABLED | Capabilities::USE_LONG_FORMAT_NAMES,
+            ));
+            let ready = ClipboardPdu::FormatListResponse(FormatListResponse::Ok);
+            for pdu in [capabilities, ready] {
+                cliprdr
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap();
+            }
+            let file = LocalFile {
+                path: "/unused".into(),
+                name: "폴더M\\a.txt".into(),
+                size: 3,
+            };
+            channel.submit(ClipboardCommand::Files(vec![
+                directory("폴더M\\", 0),
+                directory("폴더M\\빈폴더\\", 0),
+                file,
+            ]));
+            let mut descriptors = None;
+            while let Ok(event) = ordered.try_recv() {
+                if let RdpInputEvent::Clipboard(Message::SendInitiateFileCopy(files)) = event {
+                    descriptors = Some(files);
+                }
+            }
+            let descriptors = descriptors.expect("file offer");
+            assert_eq!(descriptors.len(), 3);
+            assert_eq!(lock(&channel.state).advertised.len(), descriptors.len());
+            let empty = &descriptors[1];
+            assert_eq!(empty.name, "빈폴더");
+            assert_eq!(empty.relative_path.as_deref(), Some("폴더M"));
+            assert_eq!(empty.attributes, Some(ClipboardFileAttributes::DIRECTORY));
+            assert_eq!(empty.file_size, Some(0));
+            let root = &descriptors[0];
+            assert_eq!((root.name.as_str(), root.relative_path.as_deref()), ("폴더M", None));
+            assert_eq!(root.attributes, Some(ClipboardFileAttributes::DIRECTORY));
+            assert_eq!(descriptors[2].attributes, Some(ClipboardFileAttributes::NORMAL));
+            assert_eq!(descriptors[2].file_size, Some(3));
+            // The upstream filter keeps every entry, so the I/O index stays aligned.
+            cliprdr.initiate_file_copy(descriptors).unwrap();
+        }
+
+        // R-2 oracle: mutant answering SIZE for a directory with the size the caller passed.
+        #[test]
+        fn directory_size_request_answers_zero() {
+            let mut offered = Offered::new(vec![directory("폴더M\\빈폴더\\", 5)]);
+            let pdu = ClipboardPdu::FileContentsRequest(FileContentsRequest {
+                flags: FileContentsFlags::SIZE,
+                requested_size: 8,
+                ..range(1, 0, 8)
+            });
+            let output = offered
+                .cliprdr
+                .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                .unwrap();
+            assert_eq!(output.len(), 1);
+            let bytes = output[0].encode_unframed_pdu().unwrap();
+            let ClipboardPdu::FileContentsResponse(response) =
+                ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap()
+            else {
+                panic!("unexpected answer");
+            };
+            assert_eq!(response.stream_id(), 1);
+            assert_eq!(response.data(), 0u64.to_le_bytes());
         }
 
         // oracle: mutant deferring a response that needs no file read, or answering a request twice.
