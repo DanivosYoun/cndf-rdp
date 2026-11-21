@@ -1,13 +1,14 @@
+import ClipboardBridge
+import FileTransferStaging
 import CoreGraphics
 import Foundation
 import IronRDPBridge
 
-/// IronRDP engine session over the `CNDFIronRDP.h` ABI v0. Mirrors `RDPSession`'s contract:
+/// IronRDP engine session over the `CNDFIronRDP.h` ABI v1. Mirrors `RDPSession`'s contract:
 /// callbacks arrive on engine threads, frames are copied into `RDPFrame` and handed to the
 /// existing `didReceiveFrame` path, and certificate trust uses the FreeRDP-compatible PEM key.
 ///
-/// Clipboard, drive redirection, sound and output suppression are not supported (M1); the
-/// corresponding options are ignored rather than pretending to be on.
+/// Output suppression is unsupported.
 public final class IronRDPSession: RDPEngineSession {
     public weak var delegate: RDPSessionDelegate?
 
@@ -35,22 +36,31 @@ public final class IronRDPSession: RDPEngineSession {
     // threads: engine threads take it while holding the ABI callback gate.
     private let callbackLock = NSLock()
     private var callbackGeneration: UInt64?
+    // Native generations restart when a handle is recreated. Keep a Swift connection
+    // generation for work that can outlive a callback or a native handle.
+    private var clipboardGeneration: UInt64 = 0
+    private var remoteFileDownloadManager: RDPRemoteFileDownloadManager?
     private var pendingTrust: CertificateTrustDecision?
     private var trustClosed = false
     private var lastRemotePointer: RDPRemotePointer?
     private var logFileURL: URL?
     private let logLock = NSLock()
     private let statisticsLock = NSLock()
-    private var framesReceived: UInt64 = 0
-    private var frameBytesReceived: UInt64 = 0
-    private var startedAt: Date?
-    private var lastActivityAt: Date?
+    private var statisticsStorage = MutableRDPConnectionStatistics()
+    private let staging: FileTransferStaging
+    private var clipboardCoordinator: ClipboardCoordinator?
+    private var remoteClipboardSink: IronRDPClipboardSink?
 
     public convenience init(resizeCoordinator: DisplayResizeCoordinator = DisplayResizeCoordinator()) throws {
         try self.init(resizeCoordinator: resizeCoordinator, certificateTrustTimeout: 120)
     }
 
-    init(resizeCoordinator: DisplayResizeCoordinator, certificateTrustTimeout: TimeInterval) throws {
+    init(
+        resizeCoordinator: DisplayResizeCoordinator,
+        certificateTrustTimeout: TimeInterval,
+        staging: FileTransferStaging = FileTransferStaging()
+    ) throws {
+        self.staging = staging
         self.resizeCoordinator = resizeCoordinator
         self.certificateTrustTimeout = certificateTrustTimeout
         self.callbacks = CNDFIronCallbacks()
@@ -147,6 +157,52 @@ public final class IronRDPSession: RDPEngineSession {
             }
             session.deliverRemotePointer(pointer)
         }
+        callbacks.remote_text = { generation, bytes, length, context in
+            guard let context else { return }
+            let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
+            guard let clipboard = session.clipboardContext(for: generation) else { return }
+            let text = utf8String(bytes, length)
+            session.deliverClipboard(generation, connection: clipboard.connection) { session in
+                session.updateStatistics { $0.remoteClipboardTextsReceived += 1 }
+                session.clipboardCoordinator?.receiveRemoteText(text)
+                session.delegate?.rdpSession(session, didReceiveRemoteText: text)
+            }
+        }
+        callbacks.remote_file_list = { generation, files, count, context in
+            guard let context, let files else { return }
+            let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
+            guard let clipboard = session.clipboardContext(for: generation) else { return }
+            let descriptors = UnsafeBufferPointer(start: files, count: count).map { file in
+                (name: utf8String(file.name_utf8, file.name_length), size: file.size)
+            }
+            session.deliverClipboard(generation, connection: clipboard.connection) { session in
+                let entries = descriptors.map { file in
+                    RDPFileListEntry(
+                        fileName: FileNameNormalization.normalizeForTransfer(file.name),
+                        byteCount: file.size,
+                        localURL: nil
+                    )
+                }
+                session.updateStatistics {
+                    $0.remoteFilesReceived += UInt64(entries.count)
+                    $0.remoteFileBytesReceived &+= entries.reduce(UInt64(0)) { $0 &+ $1.byteCount }
+                }
+                session.delegate?.rdpSession(session, didReceiveRemoteFiles: entries.map(RDPRemoteFile.init(entry:)))
+                guard !entries.isEmpty, session.clipboardIsCurrent(generation, connection: clipboard.connection) else { return }
+                session.materializeRemoteFiles(entries, with: clipboard.manager, generation: generation, connection: clipboard.connection)
+            }
+        }
+        callbacks.remote_file_contents = { generation, stream, ok, bytes, length, context in
+            guard let context else { return }
+            let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
+            guard let clipboard = session.clipboardContext(for: generation) else { return }
+            if ok {
+                let data = bytes.map { Data(bytes: $0, count: length) } ?? Data()
+                clipboard.manager.receive(streamId: stream, data: data)
+            } else {
+                clipboard.manager.fail(streamId: stream)
+            }
+        }
     }
 
     deinit {
@@ -185,21 +241,7 @@ public final class IronRDPSession: RDPEngineSession {
     public var statistics: RDPConnectionStatistics {
         statisticsLock.lock()
         defer { statisticsLock.unlock() }
-        return RDPConnectionStatistics(
-            framesReceived: framesReceived,
-            frameBytesReceived: frameBytesReceived,
-            remoteClipboardTextsReceived: 0,
-            remoteFilesReceived: 0,
-            remoteFileBytesReceived: 0,
-            localClipboardTextsSent: 0,
-            localFilesOffered: 0,
-            localFileBytesOffered: 0,
-            startedAt: startedAt,
-            lastActivityAt: lastActivityAt,
-            networkBandwidthKbps: nil,
-            networkBaseRTTMs: nil,
-            networkAverageRTTMs: nil
-        )
+        return statisticsStorage.snapshot()
     }
 
     public func connect(_ options: RDPConnectionOptions, initialPointSize: CGSize, scale: Double) throws {
@@ -229,6 +271,21 @@ public final class IronRDPSession: RDPEngineSession {
             resetStatistics()
             emitLog("RDP engine=ironrdp version=\(Self.engineVersion)")
 
+            emitLog(options.channelLogMessage)
+
+            let connection = inputConnectionGeneration &+ 1
+            let sink = IronRDPClipboardSink(staging: staging) { [weak self] command in
+                guard let self else { throw Self.clipboardDisconnected }
+                try self.withClipboardConnection(connection, command)
+            }
+            let manager = RDPRemoteFileDownloadManager(staging: staging) { [weak self] stream, index, offset, length in
+                guard let self else { throw Self.clipboardDisconnected }
+                try self.requestRemoteFileRange(connection: connection, stream: stream, index: index, offset: offset, length: length)
+            }
+            let coordinator = options.enableClipboard
+                ? ClipboardCoordinator(pasteboard: options.clipboardPasteboard, remoteSink: sink)
+                : nil
+
             // Held across connect so the first callbacks of the new generation wait for it
             // to be recorded instead of being dropped as stale.
             callbackLock.lock()
@@ -237,33 +294,45 @@ public final class IronRDPSession: RDPEngineSession {
             let status = options.host.withCString { hostPointer in
                 (options.username ?? "").withCString { usernamePointer in
                     withOptionalCString(options.domain) { domainPointer in
-                        withPasswordBytes(options) { passwordPointer, passwordLength in
-                            var nativeOptions = CNDFIronConnectOptions(
-                                struct_size: UInt32(MemoryLayout<CNDFIronConnectOptions>.stride),
-                                host: hostPointer,
-                                port: options.port,
-                                username: usernamePointer,
-                                domain: domainPointer,
-                                desktop_width: desktopSize.pixelWidth,
-                                desktop_height: desktopSize.pixelHeight,
-                                scale_percent: scalePercent(desktopSize.scale),
-                                color_depth: options.colorDepth.rawValue,
-                                graphics_pipeline: options.graphicsMode != .compatibility,
-                                log_level: options.logLevel.ironLogLevel
-                            )
-                            return cndf_iron_connect(nativeSession, &nativeOptions, passwordPointer, passwordLength, &generation)
+                        withOptionalCString(options.redirectedFolderPath) { drivePath in
+                            withOptionalCString(options.redirectedFolderName) { driveName in
+                                withPasswordBytes(options) { passwordPointer, passwordLength in
+                                    var nativeOptions = CNDFIronConnectOptions(
+                                        struct_size: UInt32(MemoryLayout<CNDFIronConnectOptions>.stride),
+                                        host: hostPointer,
+                                        port: options.port,
+                                        username: usernamePointer,
+                                        domain: domainPointer,
+                                        desktop_width: desktopSize.pixelWidth,
+                                        desktop_height: desktopSize.pixelHeight,
+                                        scale_percent: scalePercent(desktopSize.scale),
+                                        color_depth: options.colorDepth.rawValue,
+                                        graphics_pipeline: options.graphicsMode != .compatibility,
+                                        log_level: options.logLevel.ironLogLevel,
+                                        clipboard: options.enableClipboard,
+                                        drive_path: drivePath,
+                                        drive_name: driveName,
+                                        audio_mode: CNDFIronAudioMode(rawValue: options.audioPlaybackMode.rawValue)
+                                    )
+                                    return cndf_iron_connect(nativeSession, &nativeOptions, passwordPointer, passwordLength, &generation)
+                                }
+                            }
                         }
                     }
                 }
             }
             if status == CNDF_IRON_OK {
                 callbackGeneration = generation
+                clipboardGeneration = connection
+                remoteFileDownloadManager = options.enableClipboard ? manager : nil
             }
             callbackLock.unlock()
 
             try throwIfNeeded(status)
             nativeGeneration = generation
-            inputConnectionGeneration &+= 1
+            inputConnectionGeneration = connection
+            clipboardCoordinator = coordinator
+            remoteClipboardSink = sink
             lastConnectionOptions = options
             currentDesktopSize = desktopSize
         }
@@ -287,14 +356,118 @@ public final class IronRDPSession: RDPEngineSession {
         tearDownNativeSession(reportingDisconnect: true)
     }
 
-    public func pollLocalClipboard() throws {}
+    public func pollLocalClipboard() throws {
+        try withSessionLock {
+            do {
+                try clipboardCoordinator?.pollLocalPasteboard()
+            } catch ClipboardBridgeError.noSupportedPasteboardContent {
+                return
+            } catch {
+                delegate?.rdpSession(self, didLog: "Local clipboard sync failed: \(error)")
+                throw error
+            }
+        }
+    }
 
     public func sendLocalFiles(_ urls: [URL]) throws {
-        throw RDPSessionError.configurationInvalid(reason: "IronRDP does not support clipboard file transfer.")
+        delegate?.rdpSession(self, didLog: "Local files offered to remote clipboard: \(urls.count).")
+        do {
+            try withSessionLock {
+                guard let remoteClipboardSink, clipboardCoordinator != nil else { throw Self.clipboardDisconnected }
+                let offeredBytes = try urls.reduce(UInt64(0)) { total, url in
+                    let values = try url.resourceValues(forKeys: [.fileSizeKey])
+                    return total + UInt64(values.fileSize ?? 0)
+                }
+                try remoteClipboardSink.sendLocalFiles(urls)
+                updateStatistics {
+                    $0.localFilesOffered += UInt64(urls.count)
+                    $0.localFileBytesOffered += offeredBytes
+                }
+            }
+        } catch {
+            delegate?.rdpSession(self, didLog: "Local file offer failed: \(error)")
+            throw error
+        }
     }
 
     public func sendLocalText(_ text: String) throws {
-        throw RDPSessionError.configurationInvalid(reason: "IronRDP does not support clipboard redirection.")
+        try withSessionLock {
+            guard let remoteClipboardSink else { throw Self.clipboardDisconnected }
+            try remoteClipboardSink.sendLocalText(text)
+            updateStatistics { $0.localClipboardTextsSent += 1 }
+        }
+    }
+
+    private static var clipboardDisconnected: RDPSessionError {
+        .bridgeRejectedOperation(Int32(CNDF_IRON_NOT_CONNECTED.rawValue))
+    }
+
+    private func withClipboardConnection(
+        _ connection: UInt64,
+        _ command: (OpaquePointer, UInt64) -> CNDFIronStatus
+    ) throws {
+        try withSessionLock {
+            guard let nativeSession, inputConnectionGeneration == connection,
+                  clipboardIsCurrent(nativeGeneration, connection: connection) else {
+                throw Self.clipboardDisconnected
+            }
+            try throwIfNeeded(command(nativeSession, nativeGeneration))
+        }
+    }
+
+    func requestRemoteFileRange(connection: UInt64, stream: UInt32, index: UInt32, offset: UInt64, length: UInt32) throws {
+        try withClipboardConnection(connection) { session, generation in
+            cndf_iron_clipboard_request_file_range(session, generation, stream, index, offset, length)
+        }
+    }
+
+    private func clipboardContext(for generation: UInt64) -> (connection: UInt64, manager: RDPRemoteFileDownloadManager)? {
+        callbackLock.lock()
+        defer { callbackLock.unlock() }
+        guard !trustClosed, callbackGeneration == generation, let remoteFileDownloadManager else { return nil }
+        return (clipboardGeneration, remoteFileDownloadManager)
+    }
+
+    private func clipboardIsCurrent(_ generation: UInt64, connection: UInt64) -> Bool {
+        clipboardContext(for: generation)?.connection == connection
+    }
+
+    private func deliverClipboard(
+        _ generation: UInt64,
+        connection: UInt64,
+        _ deliver: @escaping (IronRDPSession) -> Void
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.withSessionLock {
+                guard self.clipboardIsCurrent(generation, connection: connection) else { return }
+                deliver(self)
+            }
+        }
+    }
+
+    private func materializeRemoteFiles(
+        _ entries: [RDPFileListEntry],
+        with manager: RDPRemoteFileDownloadManager,
+        generation: UInt64,
+        connection: UInt64
+    ) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard self?.clipboardIsCurrent(generation, connection: connection) == true else { return }
+            do {
+                let urls = try manager.materialize(entries)
+                self?.deliverClipboard(generation, connection: connection) { session in
+                    session.clipboardCoordinator?.receiveRemoteFiles(urls)
+                    let fileNames = urls.map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
+                        .joined(separator: ", ")
+                    session.delegate?.rdpSession(session, didLog: "Remote files materialized to local pasteboard: \(fileNames).")
+                }
+            } catch {
+                self?.deliverClipboard(generation, connection: connection) { session in
+                    session.delegate?.rdpSession(session, didLog: "Remote file materialization failed: \(error)")
+                }
+            }
+        }
     }
 
     /// A forced update (`sendForcedDesktopSize`) re-delivers the current framebuffer without a
@@ -401,6 +574,7 @@ public final class IronRDPSession: RDPEngineSession {
         defer { callbackLock.unlock() }
         guard let generation, callbackGeneration == generation else { return false }
         callbackGeneration = nil
+        remoteFileDownloadManager = nil
         return true
     }
 
@@ -426,6 +600,8 @@ public final class IronRDPSession: RDPEngineSession {
         let handle: OpaquePointer? = withSessionLock {
             let handle = nativeSession
             nativeSession = nil
+            clipboardCoordinator = nil
+            remoteClipboardSink = nil
             return handle
         }
         guard let handle else { return }
@@ -490,19 +666,22 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     private func recordFrame(byteCount: Int) {
-        statisticsLock.lock()
-        framesReceived += 1
-        frameBytesReceived += UInt64(byteCount)
-        lastActivityAt = Date()
-        statisticsLock.unlock()
+        updateStatistics {
+            $0.framesReceived += 1
+            $0.frameBytesReceived += UInt64(byteCount)
+        }
     }
 
     private func resetStatistics() {
         statisticsLock.lock()
-        framesReceived = 0
-        frameBytesReceived = 0
-        startedAt = Date()
-        lastActivityAt = startedAt
+        statisticsStorage = MutableRDPConnectionStatistics(startedAt: Date(), lastActivityAt: Date())
+        statisticsLock.unlock()
+    }
+
+    private func updateStatistics(_ update: (inout MutableRDPConnectionStatistics) -> Void) {
+        statisticsLock.lock()
+        update(&statisticsStorage)
+        statisticsStorage.lastActivityAt = Date()
         statisticsLock.unlock()
     }
 

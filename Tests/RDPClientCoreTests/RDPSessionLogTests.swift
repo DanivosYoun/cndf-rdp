@@ -14,6 +14,7 @@ final class RDPSessionLogTests: XCTestCase {
         try? session.disconnect()
 
         let lines = try String(contentsOf: log, encoding: .utf8).split(separator: "\n")
+        XCTAssertTrue(lines.dropFirst().first?.hasSuffix("RDP channels clipboard=on folder=off audio=off") == true)
         XCTAssertTrue(lines.first?.hasSuffix("RDP engine=freerdp version=\(RDPMacInfo.freerdpVersion)") == true)
     }
 }

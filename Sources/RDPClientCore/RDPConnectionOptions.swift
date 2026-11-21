@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import IronRDPBridge
 
 public struct RDPConnectionOptions: Equatable, Sendable {
     public let host: String
@@ -9,6 +10,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let securePassword: RDPSecureString?
     public let domain: String?
     public let enableClipboard: Bool
+    /// A named pasteboard for isolated sessions. Nil uses the system pasteboard.
+    public let pasteboardName: String?
     public let enableDriveRedirection: Bool
     public let redirectedFolderPath: String?
     public let redirectedFolderName: String?
@@ -45,7 +48,8 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         forcedDesktopSize: CGSize? = nil,
         networkAutoDetect: Bool = false,
         graphicsMode: RDPGraphicsMode = .automatic,
-        engine: RDPEngineKind = .freeRDP
+        engine: RDPEngineKind = .freeRDP,
+        pasteboardName: String? = nil
     ) {
         self.host = host
         self.port = port
@@ -54,6 +58,7 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.securePassword = securePassword
         self.domain = domain
         self.enableClipboard = enableClipboard
+        self.pasteboardName = pasteboardName
         self.enableDriveRedirection = enableDriveRedirection
         self.redirectedFolderPath = redirectedFolderPath
         self.redirectedFolderName = redirectedFolderName
@@ -83,10 +88,23 @@ public enum RDPEngineKind: String, Codable, Sendable {
     /// Known before connecting, so callers can compute the effective clipboard setting
     /// (design I11) before the session exists.
     public var supportsClipboard: Bool {
-        switch self {
-        case .freeRDP: return true
-        case .ironRDP: return false
+        supportsIronCapability(CNDF_IRON_CAP_CLIPBOARD)
+    }
+
+    public var supportsDriveRedirection: Bool {
+        supportsIronCapability(CNDF_IRON_CAP_DRIVE)
+    }
+
+    public func supportsAudioPlayback(_ mode: RDPAudioPlaybackMode) -> Bool {
+        switch mode {
+        case .disabled: return true
+        case .playLocally: return supportsIronCapability(CNDF_IRON_CAP_AUDIO_LOCAL)
+        case .playOnRemote: return supportsIronCapability(CNDF_IRON_CAP_AUDIO_REMOTE)
         }
+    }
+
+    private func supportsIronCapability(_ bit: UInt32) -> Bool {
+        self == .freeRDP || (cndf_iron_capabilities() & bit) != 0
     }
 }
 
@@ -110,4 +128,17 @@ public enum RDPLogLevel: String, Equatable, Sendable {
     case error
     case fatal
     case off
+}
+
+extension RDPConnectionOptions {
+    var channelLogMessage: String {
+        let audio: String
+        switch audioPlaybackMode {
+        case .disabled: audio = "off"
+        case .playLocally: audio = "local"
+        case .playOnRemote: audio = "remote"
+        }
+        let folder = redirectedFolderPath?.isEmpty == false
+        return "RDP channels clipboard=\(enableClipboard ? "on" : "off") folder=\(folder ? "on" : "off") audio=\(audio)"
+    }
 }

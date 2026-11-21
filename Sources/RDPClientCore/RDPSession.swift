@@ -1,3 +1,4 @@
+import AppKit
 import ClipboardBridge
 import CoreGraphics
 import FileTransferStaging
@@ -258,7 +259,12 @@ public final class RDPSession {
 
         let sink = FreeRDPClipboardBridge(session: bridgeSession, staging: staging)
         self.remoteClipboardSink = sink
-        self.remoteFileDownloadManager = RDPRemoteFileDownloadManager(session: bridgeSession, staging: staging)
+        self.remoteFileDownloadManager = RDPRemoteFileDownloadManager(staging: staging) { stream, index, offset, length in
+            let status = rdp_bridge_request_remote_file_range(bridgeSession, stream, index, offset, length)
+            guard status == RDPBridgeStatusOK else {
+                throw RDPSessionError.bridgeRejectedOperation(Int32(status.rawValue))
+            }
+        }
         self.clipboardCoordinator = ClipboardCoordinator(
             pasteboard: SystemPasteboardClient(),
             remoteSink: sink
@@ -332,6 +338,11 @@ public final class RDPSession {
             resetStatistics()
             // Same first line as IronRDPSession, so a session log names its engine (design D4).
             emitLog("RDP engine=freerdp version=\(RDPMacInfo.freerdpVersion)")
+            emitLog(options.channelLogMessage)
+            let previousClipboardCoordinator = clipboardCoordinator
+            if options.pasteboardName != lastConnectionOptions?.pasteboardName, let remoteClipboardSink {
+                clipboardCoordinator = ClipboardCoordinator(pasteboard: options.clipboardPasteboard, remoteSink: remoteClipboardSink)
+            }
             let bridgeDesktopSize = initialDesktopSize ?? fixedDesktopSize(from: options.forcedDesktopSize)
 
             let status = options.host.withCString { hostPointer in
@@ -372,7 +383,10 @@ public final class RDPSession {
                 }
             }
 
-            try throwIfNeeded(status)
+            if status != RDPBridgeStatusOK {
+                clipboardCoordinator = previousClipboardCoordinator
+                try throwIfNeeded(status)
+            }
             inputConnectionGeneration &+= 1
             lastConnectionOptions = options
         }
@@ -727,7 +741,7 @@ private extension RDPDisconnectReason {
     }
 }
 
-private struct MutableRDPConnectionStatistics {
+struct MutableRDPConnectionStatistics {
     var framesReceived: UInt64 = 0
     var frameBytesReceived: UInt64 = 0
     var remoteClipboardTextsReceived: UInt64 = 0
@@ -810,9 +824,16 @@ public struct RDPRemoteFile: Equatable, Sendable {
     public let byteCount: UInt64
     public let localURL: URL?
 
-    fileprivate init(entry: RDPFileListEntry) {
+    init(entry: RDPFileListEntry) {
         self.fileName = entry.fileName
         self.byteCount = entry.byteCount
         self.localURL = entry.localURL
+    }
+}
+
+extension RDPConnectionOptions {
+    var clipboardPasteboard: SystemPasteboardClient {
+        let pasteboard = pasteboardName.map { NSPasteboard(name: NSPasteboard.Name($0)) } ?? .general
+        return SystemPasteboardClient(pasteboard: pasteboard)
     }
 }
