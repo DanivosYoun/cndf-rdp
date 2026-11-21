@@ -372,13 +372,24 @@ mod real {
         }
     }
 
+    /// The server clipboard copy the session knows, and the data of it not handed to the app yet.
+    #[derive(Default)]
+    struct RemoteSlot {
+        /// INVARIANT: Of the current copy: replacing the clipboard empties it.
+        pending: Option<Remote>,
+        /// Counts server Format Lists and CLIPRDR channel ends.
+        copy: u64,
+        /// The copy whose file list the app was handed last; only its RANGEs reach the wire.
+        ranges_for: Option<u64>,
+    }
+
     /// The clip worker's inputs: its job queue, the newest server clipboard data, and the failures
     /// it logs.
     #[derive(Clone)]
     pub(crate) struct ClipJobs {
         work: mpsc::Sender<Job>,
         /// INVARIANT: One slot, so a response flood holds at most `MAX_REMOTE_CLIPBOARD_BYTES`.
-        remote: Arc<Mutex<Option<Remote>>>,
+        remote: Arc<Mutex<RemoteSlot>>,
         refusals: Arc<Mutex<Refusals>>,
     }
 
@@ -397,21 +408,45 @@ mod real {
         /// value, so data over the limit drops the older value too.
         fn offer_remote(&self, remote: Remote) {
             let bytes = remote.bytes();
-            let mut pending = lock(&self.remote);
+            let mut slot = lock(&self.remote);
             let mut refusals = lock(&self.refusals);
-            if let Some(superseded) = pending.take() {
+            if let Some(superseded) = slot.pending.take() {
                 refusals.record(Refusal::Superseded, superseded.bytes() as u64);
             }
             if bytes > MAX_REMOTE_CLIPBOARD_BYTES {
                 refusals.record(Refusal::Oversized, bytes as u64);
             } else {
-                *pending = Some(remote);
+                slot.pending = Some(remote);
             }
+        }
+
+        /// Starts a new server clipboard copy: the data of the previous one is no longer handed to
+        /// the app, and RANGEs for the list handed for it are refused.
+        fn replace_clipboard(&self) {
+            let mut slot = lock(&self.remote);
+            slot.copy += 1;
+            if let Some(superseded) = slot.pending.take() {
+                lock(&self.refusals).record(Refusal::Superseded, superseded.bytes() as u64);
+            }
+        }
+
+        /// Whether a RANGE reads the copy whose file list the app was handed last.
+        fn ranges_current(&self) -> bool {
+            let slot = lock(&self.remote);
+            slot.ranges_for == Some(slot.copy)
         }
 
         /// The clip worker's work between jobs: delivers the newest server data, then logs.
         fn flush(&self, connection: &Connection) {
-            let remote = lock(&self.remote).take();
+            let remote = {
+                let mut slot = lock(&self.remote);
+                let remote = slot.pending.take();
+                // Before the callback, so a RANGE the app requests from it is accepted.
+                if matches!(remote, Some(Remote::Files(_))) {
+                    slot.ranges_for = Some(slot.copy);
+                }
+                remote
+            };
             match remote {
                 Some(Remote::Text(data)) => match decode_text(&data) {
                     Some(text) => notify_text(connection, &text),
@@ -634,7 +669,8 @@ mod real {
                     offset,
                     length,
                 } => {
-                    if !state.ready {
+                    // The state lock orders this check before any later clipboard replacement.
+                    if !state.ready || !self.jobs.ranges_current() {
                         return CNDF_IRON_NOT_CONNECTED;
                     }
                     let Ok(index) = i32::try_from(list_index) else {
@@ -697,6 +733,7 @@ mod real {
         fn drop(&mut self) {
             let mut state = lock(&self.channel.state);
             state.ready = false;
+            self.channel.jobs.replace_clipboard();
             for stream in state.requests.drain() {
                 self.channel
                     .queue(move |connection| notify_range(connection, stream, None));
@@ -811,6 +848,7 @@ mod real {
             formats: &[ClipboardFormat],
         ) -> Option<ClipboardFormatId> {
             let mut state = lock(&self.channel.state);
+            self.channel.jobs.replace_clipboard();
             for stream in state.requests.drain() {
                 self.channel
                     .queue(move |connection| notify_range(connection, stream, None));
@@ -1097,6 +1135,7 @@ mod real {
             cliprdr
                 .process(&ironrdp_core::encode_vec(&ready).unwrap())
                 .unwrap();
+            hand_file_list(&channel, &connection);
 
             for stream_id in 1..=3 {
                 assert_eq!(
@@ -1204,6 +1243,14 @@ mod real {
                     "Clipboard format data rejected reason=remote-failure count=1 max_length=0",
                 ]
             );
+        }
+
+        /// Hands the app a server file list, as the clip worker does, so RANGEs for it are sent.
+        fn hand_file_list(channel: &Channel, connection: &Connection) {
+            channel
+                .jobs
+                .offer_remote(Remote::Files(vec![("remote.txt".into(), 2)]));
+            channel.jobs.flush(connection);
         }
 
         fn test_channel(input: RdpInputSender) -> (Channel, mpsc::Receiver<Job>) {
@@ -1406,7 +1453,10 @@ mod real {
 
             /// The bytes of server clipboard data held for the clip worker.
             fn held_remote(&self) -> Option<usize> {
-                lock(&self.channel.jobs.remote).as_ref().map(Remote::bytes)
+                lock(&self.channel.jobs.remote)
+                    .pending
+                    .as_ref()
+                    .map(Remote::bytes)
             }
         }
 
@@ -2276,7 +2326,7 @@ mod real {
             ready(&mut cliprdr);
             copy(&mut cliprdr, file_format());
             answer(&mut cliprdr, FormatDataResponse::new_unicode_string("x"));
-            assert!(lock(&channel.jobs.remote).is_none());
+            assert!(lock(&channel.jobs.remote).pending.is_none());
         }
 
         #[test]
@@ -2289,7 +2339,7 @@ mod real {
                 &mut cliprdr,
                 FormatDataResponse::new_unicode_string("unsolicited"),
             );
-            assert!(lock(&channel.jobs.remote).is_none());
+            assert!(lock(&channel.jobs.remote).pending.is_none());
         }
 
         #[test]
@@ -2320,7 +2370,7 @@ mod real {
             let (jobs, worker) = ClipWork::spawn(Arc::clone(&connection)).unwrap();
             jobs.offer_remote(Remote::Text(utf16("한글")));
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while lock(&jobs.remote).is_some() && std::time::Instant::now() < deadline {
+            while lock(&jobs.remote).pending.is_some() && std::time::Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
             }
             connection.stop.store(true, Ordering::Release);
@@ -2452,15 +2502,7 @@ mod real {
             let (mut channel, jobs) = test_channel(input);
             let (messages, receive) = mpsc::channel();
             channel.messages = Some(messages);
-            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
-            process(
-                &mut cliprdr,
-                ClipboardPdu::Capabilities(ChannelCapabilities::new(
-                    ClipboardProtocolVersion::V2,
-                    Capabilities::STREAM_FILECLIP_ENABLED | Capabilities::USE_LONG_FORMAT_NAMES,
-                )),
-            );
-            ready(&mut cliprdr);
+            let cliprdr = streaming_client(&channel);
             (channel, cliprdr, jobs, receive)
         }
 
@@ -2496,6 +2538,7 @@ mod real {
             let mut responses = Vec::new();
             let connection = range_recording_connection(&mut responses);
             let (channel, mut cliprdr, jobs, receive) = range_client();
+            hand_file_list(&channel, &connection);
             submit_range(&channel, &mut cliprdr, &receive, 7);
             while jobs.try_recv().is_ok() {}
 
@@ -2533,6 +2576,186 @@ mod real {
                 job(&connection);
             }
             assert!(responses.is_empty());
+        }
+
+        /// A ready CLIPRDR client of `channel` that negotiated file streaming.
+        fn streaming_client(channel: &Channel) -> CliprdrClient {
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            process(
+                &mut cliprdr,
+                ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    Capabilities::STREAM_FILECLIP_ENABLED | Capabilities::USE_LONG_FORMAT_NAMES,
+                )),
+            );
+            ready(&mut cliprdr);
+            cliprdr
+        }
+
+        /// The server copies files and answers the paste with `response`.
+        fn remote_file_copy(cliprdr: &mut CliprdrClient, response: OwnedFormatDataResponse) {
+            assert_eq!(
+                kinds(&copy(cliprdr, file_format()))
+                    .last()
+                    .map(String::as_str),
+                Some("FormatDataRequest")
+            );
+            answer(cliprdr, response);
+        }
+
+        fn submit_status(channel: &Channel, stream_id: u32) -> CNDFIronStatus {
+            channel.submit(ClipboardCommand::Range {
+                stream_id,
+                list_index: 0,
+                offset: 0,
+                length: 1,
+            })
+        }
+
+        fn sent_ranges(receive: &mpsc::Receiver<Message>) -> usize {
+            receive
+                .try_iter()
+                .filter(|message| matches!(message, Message::SendFileContentsRequest(_)))
+                .count()
+        }
+
+        /// R-G1 (4B): after a newer server copy of files whose list failed, a RANGE for the list
+        /// handed to the app is refused without reaching the wire, and the one in flight fails.
+        // oracle: mutant without the RANGE gate, or not advancing the copy on a Format List.
+        #[test]
+        fn ranges_for_a_handed_list_are_refused_after_a_newer_copy() {
+            let mut responses = Vec::new();
+            let connection = range_recording_connection(&mut responses);
+            let (channel, mut cliprdr, jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("old.txt", 2));
+            channel.jobs.flush(&connection);
+            submit_range(&channel, &mut cliprdr, &receive, 1);
+
+            remote_file_copy(&mut cliprdr, FormatDataResponse::new_error().into_owned());
+            assert_eq!(submit_status(&channel, 2), CNDF_IRON_NOT_CONNECTED);
+            assert_eq!(sent_ranges(&receive), 0);
+            assert!(lock(&channel.state).requests.is_empty());
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            assert_eq!(responses, [(1, None)]);
+        }
+
+        /// What a file list callback that requests a RANGE at once observed.
+        struct ImmediateRange {
+            channel: Channel,
+            statuses: Vec<CNDFIronStatus>,
+        }
+
+        /// R-G6: a RANGE requested inside the file list callback is accepted.
+        // oracle: mutant choosing the RANGE copy after the file list callback.
+        #[test]
+        fn a_range_requested_inside_the_file_list_callback_is_accepted() {
+            extern "C" fn files(
+                _: u64,
+                _: *const CNDFIronRemoteFile,
+                _: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let probe = unsafe { &mut *context.cast::<ImmediateRange>() };
+                let status = submit_status(&probe.channel, 9);
+                probe.statuses.push(status);
+            }
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            let mut probe = ImmediateRange {
+                channel: channel.clone(),
+                statuses: Vec::new(),
+            };
+            let mut unused = Vec::new();
+            let mut connection = range_recording_connection(&mut unused);
+            connection.callbacks = Arc::new(Callbacks {
+                table: CNDFIronCallbacks {
+                    remote_file_list: Some(files),
+                    context: (&mut probe as *mut ImmediateRange).cast(),
+                    ..unsafe { std::mem::zeroed() }
+                },
+                gate: Mutex::default(),
+                closed: AtomicBool::new(false),
+            });
+            remote_file_copy(&mut cliprdr, file_list("new.txt", 1));
+            channel.jobs.flush(&connection);
+            drop(connection);
+            assert_eq!(probe.statuses, [CNDF_IRON_OK]);
+            assert_eq!(sent_ranges(&receive), 1);
+        }
+
+        /// R-G2 (4A): a server copy with no supported format drops the list not handed yet.
+        // oracle: mutant keeping the held list on a Format List.
+        #[test]
+        fn a_newer_copy_drops_the_list_not_handed_yet() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let (channel, mut cliprdr, _jobs, _receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("old.txt", 0));
+            let unsupported = ClipboardFormat::new(ClipboardFormatId::new(0xc123))
+                .with_name(ClipboardFormatName::new("PNG"));
+            copy(&mut cliprdr, unsupported);
+            assert_eq!(
+                lock(&channel.jobs.refusals).0[Refusal::Superseded as usize].0,
+                1
+            );
+            channel.jobs.flush(&connection);
+            drop(connection);
+            assert!(delivered.files.is_empty());
+        }
+
+        /// R-G3: a newer list held for the clip worker does not make the handed list current.
+        // oracle: mutant choosing the RANGE copy when the list is held instead of handed.
+        #[test]
+        fn a_held_newer_list_leaves_ranges_refused() {
+            let mut unused = Vec::new();
+            let connection = range_recording_connection(&mut unused);
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("a.txt", 1));
+            channel.jobs.flush(&connection);
+            remote_file_copy(&mut cliprdr, file_list("b.txt", 1));
+            assert_eq!(submit_status(&channel, 1), CNDF_IRON_NOT_CONNECTED);
+            assert_eq!(sent_ranges(&receive), 0);
+        }
+
+        /// R-G4: two Format Lists in a row hand the newest list, whose RANGE is accepted.
+        // oracle: mutant that never chooses the RANGE copy.
+        #[test]
+        fn consecutive_format_lists_hand_the_newest_list_for_ranges() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            for _ in 0..2 {
+                assert_eq!(
+                    kinds(&copy(&mut cliprdr, file_format()))
+                        .last()
+                        .map(String::as_str),
+                    Some("FormatDataRequest")
+                );
+            }
+            answer(&mut cliprdr, file_list("one.txt", 1));
+            answer(&mut cliprdr, file_list("two.txt", 1));
+            channel.jobs.flush(&connection);
+            drop(connection);
+            assert_eq!(delivered.files, [vec![("two.txt".to_owned(), 1)]]);
+            assert_eq!(submit_status(&channel, 1), CNDF_IRON_OK);
+            assert_eq!(sent_ranges(&receive), 1);
+        }
+
+        /// R-G5: a new CLIPRDR channel does not serve RANGEs for a list the old one handed.
+        // oracle: mutant not advancing the copy when the backend drops.
+        #[test]
+        fn a_new_channel_refuses_ranges_for_the_old_list() {
+            let mut unused = Vec::new();
+            let connection = range_recording_connection(&mut unused);
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("a.txt", 1));
+            channel.jobs.flush(&connection);
+            drop(cliprdr);
+            let _next = streaming_client(&channel);
+            assert!(lock(&channel.state).ready);
+            assert_eq!(submit_status(&channel, 1), CNDF_IRON_NOT_CONNECTED);
+            assert_eq!(sent_ranges(&receive), 0);
         }
     }
 }
