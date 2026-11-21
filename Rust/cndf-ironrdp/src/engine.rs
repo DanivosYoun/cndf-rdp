@@ -82,6 +82,142 @@ impl tracing::field::Visit for SafeLogMessage {
 struct Logs {
     connection: Arc<Connection>,
     minimum: CNDFIronLogLevel,
+    repeats: Arc<Mutex<Repeats>>,
+}
+
+/// How long one IronRDP log event name logs only its first occurrence.
+const REPEAT_WINDOW: Duration = Duration::from_secs(1);
+/// Event names tracked at once; more names inside one window count as `other`.
+const REPEAT_NAMES: usize = 64;
+
+/// A log line chosen by `Repeats`: an event name, or how often it repeated in one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Line {
+    Name(&'static str),
+    Repeated(&'static str, u64),
+}
+
+impl Line {
+    fn emit(self, connection: &Connection, minimum: CNDFIronLogLevel, level: CNDFIronLogLevel) {
+        match self {
+            Self::Name(name) => log(connection, minimum, level, name),
+            Self::Repeated(name, count) => log(
+                connection,
+                minimum,
+                level,
+                &format!("{name} repeated count={count}"),
+            ),
+        }
+    }
+}
+
+/// One event name's current window: when its first line was logged, the repeats since, and the
+/// highest level among them.
+#[derive(Clone, Copy)]
+struct Window {
+    name: &'static str,
+    started: Instant,
+    repeats: u64,
+    level: CNDFIronLogLevel,
+}
+
+impl Window {
+    fn summary(&self) -> Option<(CNDFIronLogLevel, Line)> {
+        (self.repeats != 0).then_some((self.level, Line::Repeated(self.name, self.repeats)))
+    }
+}
+
+/// Server-triggered IronRDP log events reduced to one line per name per window plus a count.
+///
+/// INVARIANT: Fixed size, so an event flood adds no memory and at most two lines per window.
+struct Repeats {
+    windows: [Option<Window>; REPEAT_NAMES],
+    other: Option<Window>,
+}
+
+impl Default for Repeats {
+    fn default() -> Self {
+        Self {
+            windows: [None; REPEAT_NAMES],
+            other: None,
+        }
+    }
+}
+
+fn louder(a: CNDFIronLogLevel, b: CNDFIronLogLevel) -> CNDFIronLogLevel {
+    if (b as u32) > (a as u32) {
+        b
+    } else {
+        a
+    }
+}
+
+impl Repeats {
+    /// Records one event and returns the lines to log for it.
+    fn record(
+        &mut self,
+        name: &'static str,
+        level: CNDFIronLogLevel,
+        now: Instant,
+    ) -> [Option<(CNDFIronLogLevel, Line)>; 2] {
+        let fresh = Window {
+            name,
+            started: now,
+            repeats: 0,
+            level,
+        };
+        if let Some(window) = self.windows.iter_mut().flatten().find(|w| w.name == name) {
+            if now.duration_since(window.started) < REPEAT_WINDOW {
+                window.repeats += 1;
+                window.level = louder(window.level, level);
+                return [None, None];
+            }
+            let summary = window.summary();
+            *window = fresh;
+            return [summary, Some((level, Line::Name(name)))];
+        }
+        let free = self.windows.iter_mut().find(|slot| {
+            slot.is_none_or(|w| now.duration_since(w.started) >= REPEAT_WINDOW)
+        });
+        if let Some(slot) = free {
+            let summary = slot.and_then(|w| w.summary());
+            *slot = Some(fresh);
+            return [summary, Some((level, Line::Name(name)))];
+        }
+        let other = self.other.get_or_insert(Window {
+            name: "other",
+            ..fresh
+        });
+        other.repeats += 1;
+        other.level = louder(other.level, level);
+        if now.duration_since(other.started) < REPEAT_WINDOW {
+            return [None, None];
+        }
+        let summary = other.summary();
+        self.other = None;
+        [summary, None]
+    }
+
+    /// Takes the repeats not logged yet, as at the end of a session.
+    fn drain(&mut self) -> impl Iterator<Item = (CNDFIronLogLevel, Line)> {
+        let windows = std::mem::take(self);
+        windows
+            .windows
+            .into_iter()
+            .chain([windows.other])
+            .flatten()
+            .filter_map(|w| w.summary())
+    }
+}
+
+impl Logs {
+    /// Logs the repeats the session has not logged yet.
+    fn flush(connection: &Connection, minimum: CNDFIronLogLevel, repeats: &Mutex<Repeats>) {
+        let lines: Vec<_> = lock(repeats).drain().collect();
+        for (level, line) in lines {
+            line.emit(connection, minimum, level);
+        }
+    }
 }
 
 impl<S: tracing::Subscriber> Layer<S> for Logs {
@@ -104,8 +240,12 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
             event.record(&mut message);
             log(&self.connection, self.minimum, level, &message.0);
         } else {
-            // Other IronRDP event fields may contain session data.
-            log(&self.connection, self.minimum, level, metadata.name());
+            // Other IronRDP event fields may contain session data. A server can trigger these
+            // without limit, so each name logs once per window and then only a count.
+            let lines = lock(&self.repeats).record(metadata.name(), level, Instant::now());
+            for (level, line) in lines.into_iter().flatten() {
+                line.emit(&self.connection, self.minimum, level);
+            }
         }
     }
 }
@@ -245,10 +385,12 @@ fn run(
             LevelFilter::OFF
         }
     };
+    let repeats = Arc::<Mutex<Repeats>>::default();
     let subscriber = tracing_subscriber::registry().with(
         Logs {
             connection: Arc::clone(connection),
             minimum,
+            repeats: Arc::clone(&repeats),
         }
         .with_filter(filter),
     );
@@ -309,6 +451,7 @@ fn run(
             debug_assert!(retry.is_none());
         });
     });
+    Logs::flush(connection, minimum, &repeats);
     connection.connected.store(false, Ordering::Release);
     *lock(&connection.input) = None;
     // DNS uses Tokio's blocking pool. Cancel the session without waiting for an
@@ -727,5 +870,163 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("unknown surface"));
         assert!(!messages[0].contains("private source sentinel"));
+    }
+
+    fn logging_connection(messages: &mut Vec<String>) -> Arc<Connection> {
+        let table = CNDFIronCallbacks {
+            log: Some(capture_log),
+            certificate_trust: None,
+            connected: None,
+            failure: None,
+            disconnect: None,
+            frame: None,
+            pointer: None,
+            remote_text: None,
+            remote_file_list: None,
+            remote_file_contents: None,
+            context: (messages as *mut Vec<String>).cast(),
+        };
+        Arc::new(Connection {
+            generation: 1,
+            connected: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            input: Mutex::default(),
+            clipboard: Mutex::default(),
+            log_level: CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+            callbacks: Arc::new(Callbacks {
+                table,
+                gate: Mutex::default(),
+                closed: AtomicBool::new(false),
+            }),
+            statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
+        })
+    }
+
+    #[test]
+    fn server_triggered_warning_flood_logs_one_line_and_a_count() {
+        let mut messages = Vec::<String>::new();
+        let connection = logging_connection(&mut messages);
+        let minimum = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let subscriber = tracing_subscriber::registry().with(
+            Logs {
+                connection: Arc::clone(&connection),
+                minimum,
+                repeats: Arc::clone(&repeats),
+            }
+            .with_filter(LevelFilter::INFO),
+        );
+        let started = Instant::now();
+        tracing::subscriber::with_default(subscriber, || {
+            for index in 0..100_000u32 {
+                tracing::warn!(target: "ironrdp_session", index, "private server sentinel");
+            }
+            tracing::debug!(target: "ironrdp_session", "below the minimum");
+        });
+        assert!(started.elapsed() < REPEAT_WINDOW, "flood must fit in one window");
+        Logs::flush(&connection, minimum, &repeats);
+
+        assert_eq!(messages.len(), 2, "{:?}", &messages[..messages.len().min(3)]);
+        let name = &messages[0];
+        assert!(name.starts_with("event "), "{name}");
+        assert_eq!(messages[1], format!("{name} repeated count=99999"));
+        assert!(messages.iter().all(|m| !m.contains("private server sentinel")));
+        Logs::flush(&connection, minimum, &repeats);
+        assert_eq!(messages.len(), 2, "a flush logs each repeat once");
+    }
+
+    const WARN: CNDFIronLogLevel = CNDFIronLogLevel::CNDF_IRON_LOG_WARN;
+    const ERROR: CNDFIronLogLevel = CNDFIronLogLevel::CNDF_IRON_LOG_ERROR;
+
+    fn lines(lines: [Option<(CNDFIronLogLevel, Line)>; 2]) -> Vec<(CNDFIronLogLevel, Line)> {
+        lines.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn repeats_log_the_count_when_the_window_ends() {
+        let mut repeats = Repeats::default();
+        let start = Instant::now();
+        let inside = start + REPEAT_WINDOW - Duration::from_millis(1);
+        assert_eq!(lines(repeats.record("a", WARN, start)), [(WARN, Line::Name("a"))]);
+        assert_eq!(lines(repeats.record("a", ERROR, inside)), []);
+        assert_eq!(lines(repeats.record("a", WARN, inside)), []);
+        let next = start + REPEAT_WINDOW;
+        assert_eq!(
+            lines(repeats.record("a", WARN, next)),
+            [(ERROR, Line::Repeated("a", 2)), (WARN, Line::Name("a"))]
+        );
+        // A window without repeats ends without a count.
+        assert_eq!(
+            lines(repeats.record("a", WARN, next + REPEAT_WINDOW)),
+            [(WARN, Line::Name("a"))]
+        );
+        assert_eq!(repeats.drain().count(), 0);
+    }
+
+    #[test]
+    fn repeats_keep_sixty_four_names_and_count_the_rest_as_other() {
+        let names: Vec<&'static str> = (0..=REPEAT_NAMES)
+            .map(|index| &*format!("n{index}").leak())
+            .collect();
+        let mut repeats = Repeats::default();
+        let start = Instant::now();
+        for name in &names[..REPEAT_NAMES] {
+            assert_eq!(lines(repeats.record(name, WARN, start)), [(WARN, Line::Name(name))]);
+            assert_eq!(lines(repeats.record(name, WARN, start)), []);
+        }
+        let extra = names[REPEAT_NAMES];
+        assert_eq!(lines(repeats.record(extra, WARN, start)), []);
+        assert_eq!(lines(repeats.record(extra, ERROR, start)), []);
+        let mut drained: Vec<_> = repeats.drain().collect();
+        assert_eq!(drained.pop(), Some((ERROR, Line::Repeated("other", 2))));
+        assert_eq!(drained.len(), REPEAT_NAMES);
+        for (line, name) in drained.iter().zip(&names) {
+            assert_eq!(*line, (WARN, Line::Repeated(name, 1)));
+        }
+    }
+
+    #[test]
+    fn repeats_reuse_an_ended_window_for_a_new_name() {
+        let names: Vec<&'static str> = (0..=REPEAT_NAMES)
+            .map(|index| &*format!("n{index}").leak())
+            .collect();
+        let mut repeats = Repeats::default();
+        let start = Instant::now();
+        for name in &names[..REPEAT_NAMES] {
+            repeats.record(name, WARN, start);
+        }
+        repeats.record(names[0], WARN, start);
+        let later = start + REPEAT_WINDOW;
+        let extra = names[REPEAT_NAMES];
+        assert_eq!(
+            lines(repeats.record(extra, WARN, later)),
+            [(WARN, Line::Repeated(names[0], 1)), (WARN, Line::Name(extra))]
+        );
+    }
+
+    #[test]
+    fn other_logs_its_count_at_most_once_per_window() {
+        let names: Vec<&'static str> = (0..=REPEAT_NAMES)
+            .map(|index| &*format!("n{index}").leak())
+            .collect();
+        let (named, extra) = (&names[..REPEAT_NAMES], names[REPEAT_NAMES]);
+        let mut repeats = Repeats::default();
+        let start = Instant::now();
+        for name in named {
+            repeats.record(name, WARN, start);
+        }
+        assert_eq!(lines(repeats.record(extra, WARN, start)), []);
+        assert_eq!(lines(repeats.record(extra, WARN, start)), []);
+        // Every name starts a new window, so the table stays full.
+        let later = start + REPEAT_WINDOW;
+        for name in named {
+            assert_eq!(lines(repeats.record(name, WARN, later)), [(WARN, Line::Name(name))]);
+        }
+        assert_eq!(
+            lines(repeats.record(extra, ERROR, later)),
+            [(ERROR, Line::Repeated("other", 3))]
+        );
+        assert_eq!(lines(repeats.record(extra, WARN, later)), []);
+        assert_eq!(repeats.drain().last(), Some((WARN, Line::Repeated("other", 1))));
     }
 }
