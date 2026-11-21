@@ -19,6 +19,10 @@ def main():
     path, labels = sys.argv[1], sys.argv[2:]
     text = open(path, encoding="utf-8", errors="replace").read()
     keys = text.split("=== keys.log", 1)[-1].split("=== state.txt", 1)[0]
+    # The probe appends to <run>.keys.log; a rerun under the same name is judged on its own logon.
+    starts = [m.start() for m in re.finditer(r"^.* start run=", keys, flags=re.M)]
+    if starts:
+        keys = keys[starts[-1]:]
     state = text.split("=== state.txt", 1)[1] if "=== state.txt" in text else ""
     rows, current = [], None
     for line in keys.splitlines():

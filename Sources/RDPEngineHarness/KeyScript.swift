@@ -30,10 +30,17 @@ import RDPClientCore
 ///   ctrldown ctrlup   left Control down / up; optdown optup and these keep the other held modifiers
 ///   roptdown roptup   right Option down / up
 ///   kd:<key> ku:<key> key down / up with the held modifiers (_ is space)
+///   kr:<key>          an auto-repeat key down of a held key (follow design W3)
 ///   f7 f8 f9          tap that key (f7 marks a row in the Windows probe log)
 ///   shiftdown shiftup left Shift down / up, keeping the other held modifiers (follow design W4)
 ///   mask              shared only; accepted for old scripts and does nothing: the Hangul tap goes
 ///                     through the executor's imeTap, which always masks it (follow design G6)
+///
+/// C4 (follow design W5) replays, through a share handle, the host commands the app's real viewer
+/// path (SharedRDPViewerView → RDPInputForwarder → wire → CNDFRDPInputBackend) produced for a
+/// recorded script; hex scancodes, <mods> a comma list or -:
+///   x:k:<scan>:d|u:<mods>  x:mod:<mods>  x:chord:<scans>  x:ime:hangul|hanja
+///   x:m:<x>,<y>:-|l|r|m:<move|down|up>:<mods>
 /// <src>: ko (2-Set Korean), ko3 (3-Set Korean), en (ABC), us (U.S.)
 struct KeyScript {
     private static let keyCodes: [Character: UInt16] = [
@@ -101,11 +108,11 @@ struct KeyScript {
             case "shiftup": release(.shift, device: Self.leftShift, keyCode: 56); pause(0.05)
             case "roptdown": press(.option, device: Self.rightAlt, keyCode: 61); pause(0.05)
             case "roptup": release(.option, device: Self.rightAlt, keyCode: 61); pause(0.05)
-            case "kd", "ku":
+            case "kd", "ku", "kr":
                 guard let code = argument.replacingOccurrences(of: "_", with: " ").first.flatMap({ Self.keyCodes[$0] }) else {
                     unknown.append(token); continue
                 }
-                key(code, down: parts[0] == "kd")
+                key(code, down: parts[0] != "ku", isARepeat: parts[0] == "kr")
                 pause(0.03)
             case "ropt": tapModifier(.option, device: Self.rightAlt, keyCode: 61, pause: pause)
             case "rctl": tapModifier(.control, device: Self.rightControl, keyCode: 62, pause: pause)
@@ -164,11 +171,44 @@ struct KeyScript {
                 pause(0.2)
             case "wait":
                 pause((Double(argument) ?? 100) / 1000)
+            case "x":
+                guard let shared, let command = Self.recordedCommand(argument) else { unknown.append(token); continue }
+                _ = shared.submit(command)
             default:
                 unknown.append(token)
             }
         }
         return unknown
+    }
+
+    /// One `x:` token as the share host's command (C4 W5).
+    private static func recordedCommand(_ argument: String) -> RDPSharedInputCommand? {
+        let fields = argument.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        func scans(_ text: String) -> [UInt16]? {
+            if text == "-" { return [] }
+            let values = text.split(separator: ",").map { UInt16($0, radix: 16) }
+            return values.contains(nil) ? nil : values.compactMap { $0 }
+        }
+        switch (fields.first, fields.count) {
+        case ("k", 4):
+            guard let scan = UInt16(fields[1], radix: 16), let modifiers = scans(fields[3]) else { return nil }
+            return .key(scanCode: scan, pressed: fields[2] == "d", modifiers: modifiers)
+        case ("mod", 2):
+            return scans(fields[1]).map { .modifiers($0) }
+        case ("chord", 2):
+            return scans(fields[1]).map { .chord($0) }
+        case ("ime", 2):
+            return fields[1] == "hangul" ? .imeTap(.hangul) : fields[1] == "hanja" ? .imeTap(.hanja) : nil
+        case ("m", 5):
+            let xy = fields[1].split(separator: ",").compactMap { Int32($0) }
+            let buttons: [String: RDPMouseButton?] = ["-": nil, "l": .left, "r": .right, "m": .middle]
+            let flags: [String: RDPMouseFlags] = ["move": .move, "down": .down, "up": .up]
+            guard xy.count == 2, let button = buttons[fields[2]], let flag = flags[fields[3]],
+                  let modifiers = scans(fields[4]) else { return nil }
+            return .mouse(x: xy[0], y: xy[1], button: button, flags: flag, modifiers: modifiers)
+        default:
+            return nil
+        }
     }
 
     private mutating func tapModifier(_ modifier: NSEvent.ModifierFlags, device: UInt, keyCode: UInt16,
