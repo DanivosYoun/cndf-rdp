@@ -172,7 +172,7 @@ LANG_RESTORE='if (Test-Path C:\k5\lang-before.json) {
 }'
 
 korean_off() {
-  { printf '%s\n' "${LANG_RESTORE}"; echo 'Get-WinUserLanguageList | ForEach-Object { "$($_.LanguageTag) | $($_.InputMethodTips -join \",\")" }'; } | ps
+  { printf '%s\n' "${LANG_RESTORE}"; echo "Get-WinUserLanguageList | ForEach-Object { 'lang=' + \$_.LanguageTag + ' | ' + (\$_.InputMethodTips -join ',') }"; } | ps
 }
 
 teardown() {

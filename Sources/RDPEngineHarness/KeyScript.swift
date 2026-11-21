@@ -71,7 +71,13 @@ struct KeyScript {
     /// Plays `script`; returns the tokens it could not play.
     mutating func play(_ script: String, pause: (TimeInterval) -> Void) -> [String] {
         var unknown: [String] = []
+        let traced = ProcessInfo.processInfo.environment["K5_TRACE"] != nil
+        let start = ProcessInfo.processInfo.systemUptime
         for token in script.split(separator: " ").map(String.init) {
+            if traced {
+                FileHandle.standardError.write(Data(String(format: "K5X %.0f %@\n",
+                    (ProcessInfo.processInfo.systemUptime - start) * 1000, token).utf8))
+            }
             let parts = token.split(separator: ":", maxSplits: 1).map(String.init)
             let argument = parts.count > 1 ? parts[1] : ""
             switch parts[0] {
