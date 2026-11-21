@@ -707,11 +707,20 @@ mod real {
         })
     }
 
+    /// A DIRECTORY entry ends with `\`, which a sanitized name cannot end with, so the session
+    /// can tell it from a file without a field in the C ABI.
     fn remote_name(file: &FileDescriptor) -> String {
-        match file.relative_path.as_deref() {
+        let mut name = match file.relative_path.as_deref() {
             Some(path) if !path.is_empty() => format!("{path}\\{}", file.name),
             _ => file.name.clone(),
+        };
+        if file
+            .attributes
+            .is_some_and(|attributes| attributes.contains(ClipboardFileAttributes::DIRECTORY))
+        {
+            name.push('\\');
         }
+        name
     }
 
     fn decode_text(data: &[u8]) -> Option<String> {
@@ -783,10 +792,18 @@ mod real {
 
         /// Pastes in the iteration of the server's Format List, so a repeated copy queues nothing
         /// for the session. Before the channel is ready the choice waits for `paste_on_ready`.
+        /// Any server Format List replaces the clipboard the RANGE requests in flight read, so they
+        /// fail now, as in `Drop`; a late response finds no request and is not delivered.
         fn paste_on_remote_copy(
             &mut self,
             formats: &[ClipboardFormat],
         ) -> Option<ClipboardFormatId> {
+            let mut state = lock(&self.channel.state);
+            for stream in state.requests.drain() {
+                self.channel
+                    .queue(move |connection| notify_range(connection, stream, None));
+            }
+            drop(state);
             let choice = choose_format(formats);
             if !self.ready {
                 self.deferred_paste = choice;
@@ -2277,6 +2294,151 @@ mod real {
         fn joins_normalized_remote_components() {
             let file = FileDescriptor::new("문서.txt").with_relative_path(r"root\sub");
             assert_eq!(remote_name(&file), r"root\sub\문서.txt");
+        }
+
+        /// R1: only a DIRECTORY entry ends with the `\` marker the session reads as a folder.
+        #[test]
+        fn marks_only_directory_entries_with_a_trailing_backslash() {
+            let folder = FileDescriptor::new("하위")
+                .with_relative_path("폴더W")
+                .with_attributes(ClipboardFileAttributes::DIRECTORY);
+            let file = FileDescriptor::new("루트.txt")
+                .with_relative_path("폴더W")
+                .with_attributes(ClipboardFileAttributes::ARCHIVE);
+            let bare = FileDescriptor::new("빈.txt");
+            assert_eq!(remote_name(&folder), r"폴더W\하위\");
+            assert_eq!(remote_name(&file), r"폴더W\루트.txt");
+            assert_eq!(remote_name(&bare), "빈.txt");
+        }
+
+        fn range_recording_connection(responses: &mut Vec<(u32, Option<Vec<u8>>)>) -> Connection {
+            extern "C" fn record_range(
+                _: u64,
+                stream_id: u32,
+                ok: bool,
+                bytes: *const u8,
+                length: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let data =
+                    ok.then(|| unsafe { std::slice::from_raw_parts(bytes, length).to_vec() });
+                unsafe { &mut *context.cast::<Vec<(u32, Option<Vec<u8>>)>>() }
+                    .push((stream_id, data));
+            }
+            let table = CNDFIronCallbacks {
+                remote_file_contents: Some(record_range),
+                context: (responses as *mut Vec<(u32, Option<Vec<u8>>)>).cast(),
+                // Every other field is an optional callback.
+                ..unsafe { std::mem::zeroed() }
+            };
+            Connection {
+                generation: 1,
+                connected: AtomicBool::new(true),
+                stop: AtomicBool::new(false),
+                input: Mutex::default(),
+                clipboard: Mutex::default(),
+                log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
+                callbacks: Arc::new(Callbacks {
+                    table,
+                    gate: Mutex::default(),
+                    closed: AtomicBool::new(false),
+                }),
+                statistics: Arc::default(),
+            }
+        }
+
+        /// A ready CLIPRDR client whose RANGE requests the test forwards itself.
+        fn range_client() -> (
+            Channel,
+            CliprdrClient,
+            mpsc::Receiver<Job>,
+            mpsc::Receiver<Message>,
+        ) {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (mut channel, jobs) = test_channel(input);
+            let (messages, receive) = mpsc::channel();
+            channel.messages = Some(messages);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            process(
+                &mut cliprdr,
+                ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    Capabilities::STREAM_FILECLIP_ENABLED | Capabilities::USE_LONG_FORMAT_NAMES,
+                )),
+            );
+            ready(&mut cliprdr);
+            (channel, cliprdr, jobs, receive)
+        }
+
+        fn submit_range(
+            channel: &Channel,
+            cliprdr: &mut CliprdrClient,
+            receive: &mpsc::Receiver<Message>,
+            stream_id: u32,
+        ) {
+            assert_eq!(
+                channel.submit(ClipboardCommand::Range {
+                    stream_id,
+                    list_index: 0,
+                    offset: 0,
+                    length: 1,
+                }),
+                CNDF_IRON_OK
+            );
+            while let Ok(message) = receive.try_recv() {
+                if let Message::SendFileContentsRequest(request) = message {
+                    assert!(cliprdr
+                        .request_file_contents_for_session(request)
+                        .unwrap()
+                        .is_some());
+                }
+            }
+        }
+
+        /// R2: any server Format List, even one with no supported format, fails the RANGE in
+        /// flight once, and the late response for it is not delivered.
+        #[test]
+        fn server_format_list_fails_the_range_in_flight_once() {
+            let mut responses = Vec::new();
+            let connection = range_recording_connection(&mut responses);
+            let (channel, mut cliprdr, jobs, receive) = range_client();
+            submit_range(&channel, &mut cliprdr, &receive, 7);
+            while jobs.try_recv().is_ok() {}
+
+            let unsupported = ClipboardFormat::new(ClipboardFormatId::new(0xc123))
+                .with_name(ClipboardFormatName::new("PNG"));
+            copy(&mut cliprdr, unsupported);
+            assert!(lock(&channel.state).requests.is_empty());
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+
+            process(
+                &mut cliprdr,
+                ClipboardPdu::FileContentsResponse(FileContentsResponse::new_data_response(
+                    7,
+                    vec![1],
+                )),
+            );
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            assert_eq!(responses, [(7, None)]);
+        }
+
+        /// R3: a server Format List with no RANGE in flight notifies nothing.
+        #[test]
+        fn server_format_list_without_ranges_notifies_nothing() {
+            let mut responses = Vec::new();
+            let connection = range_recording_connection(&mut responses);
+            let (channel, mut cliprdr, jobs, _receive) = range_client();
+            while jobs.try_recv().is_ok() {}
+            copy(&mut cliprdr, text_format());
+            assert!(lock(&channel.state).requests.is_empty());
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            assert!(responses.is_empty());
         }
     }
 }
