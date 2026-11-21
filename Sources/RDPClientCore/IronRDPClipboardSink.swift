@@ -25,7 +25,7 @@ final class IronRDPClipboardSink: RemoteClipboardSink {
     func sendLocalFiles(_ urls: [URL]) throws {
         let stagedFiles = try staging.stageLocalFilesForRemotePaste(urls)
         let paths = stagedFiles.map { strdup($0.stagedURL.path) }
-        let names = stagedFiles.map { strdup($0.fileName) }
+        let names = stagedFiles.map { strdup($0.wireName) }
         defer {
             paths.forEach { free($0) }
             names.forEach { free($0) }

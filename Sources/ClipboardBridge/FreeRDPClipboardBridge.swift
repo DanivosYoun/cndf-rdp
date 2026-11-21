@@ -41,7 +41,7 @@ public final class FreeRDPClipboardBridge: RemoteClipboardSink {
 private extension Array where Element == StagedFile {
     func withBridgeLocalFiles<T>(_ body: (UnsafeBufferPointer<RDPBridgeLocalFile>) throws -> T) throws -> T {
         let paths = map { strdup($0.stagedURL.path) }
-        let names = map { strdup($0.fileName) }
+        let names = map { strdup($0.wireName) }
         defer {
             paths.forEach { free($0) }
             names.forEach { free($0) }
