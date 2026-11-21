@@ -472,10 +472,7 @@ static UINT bridge_cliprdr_monitor_ready(
         return status;
     }
 
-    if ((session->local_text != NULL) || (session->local_file_count > 0)) {
-        return bridge_send_client_format_list(session);
-    }
-    return CHANNEL_RC_OK;
+    return bridge_send_client_format_list(session);
 }
 
 static UINT bridge_cliprdr_server_format_list(
