@@ -1,0 +1,21 @@
+[package]
+name = "b5-hostile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "B5 hostile RDP server: replays server-memory attacks against a real client (harness only)"
+
+# Built inside the IronRDP workspace at the pinned commit (Dockerfile copies this crate to
+# crates/b5-hostile), so the paths and dependency versions are the workspace's own.
+[dependencies]
+ironrdp-acceptor = { path = "../ironrdp-acceptor" }
+ironrdp-async = { path = "../ironrdp-async" }
+ironrdp-bulk = { path = "../ironrdp-bulk" }
+ironrdp-core = { path = "../ironrdp-core", features = ["alloc"] }
+ironrdp-dvc = { path = "../ironrdp-dvc" }
+ironrdp-pdu = { path = "../ironrdp-pdu" }
+ironrdp-server = { path = "../ironrdp-server", default-features = false, features = ["helper"] }
+ironrdp-svc = { path = "../ironrdp-svc" }
+ironrdp-tokio = { path = "../ironrdp-tokio" }
+tokio = { version = "1", features = ["net", "macros", "rt", "time", "io-util"] }
+tokio-rustls = "0.26"

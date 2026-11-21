@@ -1,0 +1,11 @@
+b5 listening 0.0.0.0:3389 attack=DvcFanout warmup=1 bytes=0 count=4000 partial=60000
+b5 accepted 192.168.131.240:37836
+b5 192.168.131.240:37836 error=[read frame by hint] custom error
+b5 accepted 192.168.131.240:37848
+b5 connection=1 active user=1002 cliprdr=None rdpsnd=Some(1005) drdynvc=Some(1006)
+b5 connection=1 warmup
+b5 connection=1 closed client_bytes=32
+b5 accepted 192.168.131.240:44054
+b5 connection=2 active user=1002 cliprdr=None rdpsnd=Some(1005) drdynvc=Some(1006)
+b5 connection=2 attack=DvcFanout stopped wire=6314848 error=Broken pipe (os error 32)
+b5 connection=2 closed client_bytes=54

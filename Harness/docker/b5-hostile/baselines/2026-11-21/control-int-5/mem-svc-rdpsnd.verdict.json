@@ -1,0 +1,36 @@
+{
+  "scenario": "mem-svc-rdpsnd",
+  "attack": "svc-rdpsnd",
+  "args": {
+    "bytes": 268435456
+  },
+  "warmupFootprintMaxBytes": 26739504,
+  "attackFootprintMaxBytes": 305120264,
+  "growthBytes": 278380760,
+  "growthMiB": 265.5,
+  "limitBytes": 69206016,
+  "limitMiB": 66.0,
+  "wireBytes": 268821350,
+  "serverAttackLine": "b5 connection=2 attack=SvcRdpsnd done wire=268821350 channel=1005 message=268435456 after_bitmap_sent=true",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": null,
+  "attackFramesReceived": 2,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:60.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "ended",
+  "logPattern": null,
+  "logLines": [],
+  "checks": {
+    "budget": false,
+    "warmup": true,
+    "outcome": false
+  },
+  "passed": false
+}

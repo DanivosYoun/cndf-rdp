@@ -1,0 +1,81 @@
+{
+  "name": "mem-svc-cliprdr",
+  "engine": "ironrdp",
+  "b5": {
+    "attack": "svc-cliprdr",
+    "args": {
+      "bytes": 268435456
+    },
+    "pathBudgetBytes": 67108864,
+    "marginBytes": 67108864,
+    "outcome": "connected",
+    "note": "D1 cliprdr message: 64 MiB, oversized item fails alone (FormatDataResponse). One 256 MiB FormatDataResponse = 1/4 of design probe P1 (1 GiB wire).",
+    "logPattern": "/crates/ironrdp-cliprdr/src/lib.rs:"
+  },
+  "runs": [
+    {
+      "id": "warmup",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "enableClipboard": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    },
+    {
+      "id": "attack",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "enableClipboard": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 60
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    }
+  ]
+}

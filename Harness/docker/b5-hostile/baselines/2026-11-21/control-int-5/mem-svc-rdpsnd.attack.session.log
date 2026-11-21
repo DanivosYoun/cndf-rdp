@@ -1,0 +1,13 @@
+2026-11-21T12:37:36Z RDP engine=ironrdp version=cndf-ironrdp 0.1.0 ironrdp=15b4a03ff552 patches=20
+2026-11-21T12:37:36Z RDP channels clipboard=off folder=on audio=off
+2026-11-21T12:37:36Z Starting IronRDP connection
+2026-11-21T12:37:36Z GCC display requested: 1280x800 DesktopScaleFactor=100 DeviceScaleFactor=100.
+2026-11-21T12:37:36Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:23
+2026-11-21T12:37:37Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:1606
+2026-11-21T12:37:37Z RDP tls profile=modern version=TLSv1.3 cipher=TLS13_AES_256_GCM_SHA384 engine=ironrdp
+2026-11-21T12:37:37Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/connection.rs:2399
+2026-11-21T12:37:37Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-connector/src/license_exchange.rs:296
+2026-11-21T12:37:37Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-async/src/connector.rs:165
+2026-11-21T12:37:37Z IronRDP connected.
+2026-11-21T12:38:03Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-rdpsnd/src/client.rs:459
+2026-11-21T12:38:37Z IronRDP disconnected.

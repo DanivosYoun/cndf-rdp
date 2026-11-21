@@ -1,0 +1,39 @@
+{
+  "scenario": "mem-fp-mppc",
+  "attack": "fp-mppc",
+  "args": {
+    "bytes": 134217728
+  },
+  "warmupFootprintMaxBytes": 26280728,
+  "attackFootprintMaxBytes": 44860208,
+  "growthBytes": 18579480,
+  "growthMiB": 17.7,
+  "limitBytes": 83886080,
+  "limitMiB": 80.0,
+  "wireBytes": 98559,
+  "serverAttackLine": "b5 connection=2 attack=FpMppc done wire=98559 reassembled=135184000 after_bitmap_sent=true",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": null,
+  "attackFramesReceived": 2,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:20.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "connected",
+  "logPattern": "/crates/ironrdp-session/src/fast_path.rs:",
+  "logLines": [
+    "2026-11-21T12:41:42Z event /Users/danivosy/xcode-work/mem-k8-harness-91564da8/cndf-rdp/Vendor/IronRDP/src/crates/ironrdp-session/src/fast_path.rs:1026"
+  ],
+  "checks": {
+    "budget": true,
+    "warmup": true,
+    "outcome": true,
+    "log": true
+  },
+  "passed": true
+}

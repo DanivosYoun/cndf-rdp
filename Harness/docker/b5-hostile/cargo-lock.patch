@@ -1,0 +1,28 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ab946ba..8525dc0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -419,6 +419,23 @@ dependencies = [
+  "pkg-config",
+ ]
+ 
++[[package]]
++name = "b5-hostile"
++version = "0.1.0"
++dependencies = [
++ "ironrdp-acceptor",
++ "ironrdp-async",
++ "ironrdp-bulk",
++ "ironrdp-core 0.3.1",
++ "ironrdp-dvc",
++ "ironrdp-pdu",
++ "ironrdp-server",
++ "ironrdp-svc",
++ "ironrdp-tokio",
++ "tokio",
++ "tokio-rustls",
++]
++
+ [[package]]
+ name = "base16ct"
+ version = "1.0.0"

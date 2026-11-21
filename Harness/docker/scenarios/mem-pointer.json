@@ -1,0 +1,78 @@
+{
+  "name": "mem-pointer",
+  "engine": "ironrdp",
+  "b5": {
+    "attack": "pointer",
+    "args": {
+      "count": 512
+    },
+    "pathBudgetBytes": 33554432,
+    "marginBytes": 67108864,
+    "outcome": "connected",
+    "note": "D1 pointer cache: 32 advertised entries, each <= 384x384x4 (~32 MiB with capacity). 512 Large pointers 384x384 = 1/2 of design probe P3 (1024, ~1 GiB held on int-5)."
+  },
+  "runs": [
+    {
+      "id": "warmup",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    },
+    {
+      "id": "attack",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 25
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    }
+  ]
+}
