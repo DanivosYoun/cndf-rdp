@@ -44,7 +44,7 @@ final class ClipboardMonitorReadyTests: XCTestCase {
             UINT (*ClientCapabilities)(CliprdrClientContext *, const CLIPRDR_CAPABILITIES *);
             UINT (*ClientFormatList)(CliprdrClientContext *, const CLIPRDR_FORMAT_LIST *);
         };
-        typedef struct { CliprdrClientContext *cliprdr; const char *local_text; size_t local_file_count; } RDPBridgeSession;
+        typedef struct { CliprdrClientContext *cliprdr; const char *local_text; size_t local_file_count; unsigned clip_requests_pending, clip_requests_stale, clip_request_format; } RDPBridgeSession;
         #define bridge_log(...) ((void)0)
         #define bridge_logf(...) ((void)0)
         \(try function("bridge_send_client_format_list"))

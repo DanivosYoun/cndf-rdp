@@ -3,6 +3,13 @@ import Foundation
 import FreeRDPBridge
 
 final class RDPRemoteFileDownloadManager {
+    /// A range reply that cannot belong to the file the descriptor described (design D-5, INV-C1).
+    enum ChunkError: Error, Equatable {
+        case truncated
+        case overlong
+    }
+
+
     // Internal and settable so tests can hold or answer range requests.
     var requestRange: (UInt32, UInt32, UInt64, UInt32) throws -> Void
     private let staging: FileTransferStaging
@@ -83,12 +90,11 @@ final class RDPRemoteFileDownloadManager {
                         offset: offset,
                         length: requestLength
                     )
+                    // A reply must be 1…requestLength bytes; anything else fails the whole list (INV-C1).
+                    if chunk.isEmpty { throw ChunkError.truncated }
+                    if chunk.count > Int(requestLength) { throw ChunkError.overlong }
                     try handle.write(contentsOf: chunk)
                     offset += UInt64(chunk.count)
-
-                    if chunk.isEmpty {
-                        break
-                    }
                 }
             }
         } catch {
