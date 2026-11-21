@@ -92,8 +92,11 @@ struct IterationResult: Encodable {
     /// After the resize step: still connected with no disconnect, and the last remote frame
     /// size seen during the step (nil = no frame arrived).
     var connectedAfterResize: Bool?
+    var displayControlReady: Bool?
     var resizeFrameSize: [Int]?
     var requestedResizeFrameSize: [Int]?
+    /// Final resize frame size check outcome: "pass", "fail", or "N/A".
+    var resizeFrameSizeCheck: String?
     var shutdownMs: Double?
     var shutdownDiagnostics: [String: Int]?
     /// Delegate callbacks delivered after `shutdown()` returned (must be 0).

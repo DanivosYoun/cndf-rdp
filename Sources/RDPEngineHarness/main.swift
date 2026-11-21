@@ -116,6 +116,7 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
     /// engines can be compared byte for byte (design I3).
     private(set) var trustStringDigests: [String] = []
     private(set) var prompts = 0
+    private(set) var displayControlReady = false
     private(set) var failure: RDPSessionError?
     private(set) var disconnectReason: RDPDisconnectReason?
     private(set) var callbacksAfterShutdown = 0
@@ -138,6 +139,9 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
 
     func rdpConnectionView(_ view: RDPConnectionView, didLog message: String) {
         guard noteCallback() else { return }
+        lock.withLock {
+            displayControlReady = updateDisplayControlReady(displayControlReady, forLogMessage: message)
+        }
         fputs("[RDP] \(message)\n", stderr)
     }
 
@@ -214,6 +218,22 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
         defer { lock.unlock() }
         return failure
     }
+
+    var isDisplayControlReady: Bool {
+        lock.withLock { displayControlReady }
+    }
+}
+
+func updateDisplayControlReady(_ current: Bool, forLogMessage message: String) -> Bool {
+    if message.hasPrefix("Display control capabilities received:") {
+        return true
+    }
+    if message == "Display control channel closed."
+        || message == "FreeRDP disconnected."
+        || message == "IronRDP disconnected." {
+        return false
+    }
+    return current
 }
 
 /// SHA-256 (hex) of each PEM certificate block in a trust string, in order.
@@ -463,6 +483,7 @@ private func runIteration(
             drainRunLoop(step.seconds ?? 2)
             view.onRenderedFrame = previousTap
             result.resizeFrameSize = lastFrameSize
+            result.displayControlReady = delegate.isDisplayControlReady
             result.connectedAfterResize = view.isConnected && delegate.disconnectReason == nil
             result.steps.append("resize:\(Int(width))x\(Int(height))")
         case "scroll":
@@ -564,6 +585,36 @@ private func runIteration(
     return result
 }
 
+enum ResizeFrameSizeCheckStatus: String, Equatable {
+    case pass
+    case fail
+    case notApplicable = "N/A"
+}
+
+func evaluateResizeFrameSize(
+    _ iteration: IterationResult,
+    against expect: HarnessExpectation?
+) -> (status: ResizeFrameSizeCheckStatus?, failure: String?) {
+    guard expect?.resizeKeepsSession == true else { return (nil, nil) }
+    let prefix = "iteration \(iteration.iteration):"
+    if expect?.resizeAppliesFrameSize == false {
+        return (.notApplicable, nil)
+    }
+    if iteration.displayControlReady != true {
+        if expect?.resizeAppliesFrameSize == true {
+            return (.fail, "\(prefix) resize: Display Control did not open")
+        }
+        return (.notApplicable, nil)
+    }
+    if let requested = iteration.requestedResizeFrameSize {
+        if iteration.resizeFrameSize != requested {
+            return (.fail, "\(prefix) resize: frame size \(iteration.resizeFrameSize.map { String(describing: $0) } ?? "nil"), expected \(requested)")
+        }
+        return (.pass, nil)
+    }
+    return (.fail, "\(prefix) resize: no requested frame size")
+}
+
 func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?) -> [String] {
     var failures: [String] = []
     let prefix = "iteration \(iteration.iteration):"
@@ -600,14 +651,8 @@ func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?)
        iteration.connectedAfterResize != true || iteration.connectRises > 1 {
         failures.append("\(prefix) resize: connectedAfterResize=\(iteration.connectedAfterResize.map(String.init) ?? "nil"), connectRises=\(iteration.connectRises)")
     }
-    if expect.resizeKeepsSession == true {
-        if let requested = iteration.requestedResizeFrameSize {
-            if iteration.resizeFrameSize != requested {
-                failures.append("\(prefix) resize: frame size \(iteration.resizeFrameSize.map { String(describing: $0) } ?? "nil"), expected \(requested)")
-            }
-        } else {
-            failures.append("\(prefix) resize: no requested frame size")
-        }
+    if let resizeFailure = evaluateResizeFrameSize(iteration, against: expect).failure {
+        failures.append(resizeFailure)
     }
     if let maxShutdownMs = expect.maxShutdownMs, let shutdownMs = iteration.shutdownMs,
        shutdownMs > Double(maxShutdownMs) {
@@ -647,9 +692,10 @@ private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
         var iterations: [IterationResult] = []
         var failures: [String] = []
         for iteration in 1...max(1, run.repeatCount ?? 1) {
-            let result = autoreleasepool {
+            var result = autoreleasepool {
                 runIteration(run, engine: runEngine, iteration: iteration, trustStore: trustStore, workDirectory: arguments.workDirectory)
             }
+            result.resizeFrameSizeCheck = evaluateResizeFrameSize(result, against: expect).status?.rawValue
             failures += evaluate(result, against: expect)
             iterations.append(result)
             drainRunLoop(0.5)
