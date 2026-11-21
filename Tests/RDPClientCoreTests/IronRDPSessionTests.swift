@@ -393,6 +393,38 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(session.statistics.remoteFileBytesReceived, UInt64(data.count))
     }
 
+    /// T-M5: an empty folder offered through the stub (which echoes names) arrives as an empty directory.
+    func testClipboardStubRoundTripsEmptyFolder() throws {
+        try skipUnlessStub()
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let folder = root.appendingPathComponent("M", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder.appendingPathComponent("empty"), withIntermediateDirectories: true)
+        try Data("abc".utf8).write(to: folder.appendingPathComponent("f.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+        let staging = FileTransferStaging(rootURL: root.appendingPathComponent("staging"))
+        let session = try IronRDPSession(resizeCoordinator: DisplayResizeCoordinator(), certificateTrustTimeout: 5, staging: staging)
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        defer { try? session.disconnect() }
+        try session.connect(RDPConnectionOptions(host: "localhost", pasteboardName: board.name.rawValue),
+                            initialPointSize: CGSize(width: 800, height: 600), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected })
+
+        try session.sendLocalFiles([folder])
+        XCTAssertTrue(waitUntil {
+            (board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?.count == 1
+        })
+        let urls = try XCTUnwrap(board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])
+        let received = try XCTUnwrap(urls.first)
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: received.appendingPathComponent("empty").path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: received.appendingPathComponent("empty").path), [])
+        XCTAssertEqual(try Data(contentsOf: received.appendingPathComponent("f.txt")), Data("abc".utf8))
+    }
+
     func testClipboardCallbacksAreDroppedAcrossDisconnectAndReconnect() throws {
         try skipUnlessStub()
         let board = NSPasteboard.withUniqueName()

@@ -139,23 +139,34 @@ public final class FileTransferStaging {
     private func stageLocalDirectoryForRemotePaste(_ directoryURL: URL) throws -> [StagedFile] {
         guard let enumerator = fileManager.enumerator(
             at: directoryURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey],
             options: [.skipsPackageDescendants]
         ) else {
             return []
         }
 
-        var files: [StagedFile] = []
         let rootName = FileNameNormalization.normalizeForTransfer(directoryURL.lastPathComponent)
+        // Every folder, the root included, is an entry so empty folders reach the server (design D-1).
+        var files: [StagedFile] = [directoryEntry(directoryURL, fileName: rootName)]
         for case let fileURL as URL in enumerator {
-            let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
             if values.isDirectory == true {
+                // Packages are not descended into, so they would arrive as empty shells; skip them.
+                if values.isPackage != true {
+                    let relativePath = relativeTransferPath(fileURL: fileURL, rootURL: directoryURL, rootName: rootName)
+                    files.append(directoryEntry(fileURL, fileName: relativePath))
+                }
                 continue
             }
             let relativePath = relativeTransferPath(fileURL: fileURL, rootURL: directoryURL, rootName: rootName)
             files.append(try stageLocalFileForRemotePaste(fileURL, fileName: relativePath))
         }
+        // A prefix sorts first, so every parent precedes its descendants (INV-D1).
         return files.sorted { $0.fileName < $1.fileName }
+    }
+
+    private func directoryEntry(_ url: URL, fileName: String) -> StagedFile {
+        StagedFile(sourceURL: url, stagedURL: url, fileName: normalizedTransferPath(fileName), byteCount: 0, isDirectory: true)
     }
 
     private func stageLocalFileForRemotePaste(_ sourceURL: URL, fileName: String) throws -> StagedFile {
@@ -167,9 +178,14 @@ public final class FileTransferStaging {
         return StagedFile(
             sourceURL: sourceURL,
             stagedURL: sourceURL,
-            fileName: normalizedTransferPath(fileName),
+            fileName: Self.withoutDirectoryMarker(normalizedTransferPath(fileName)),
             byteCount: UInt64(size)
         )
+    }
+
+    /// A legal macOS file name may end in `\\`, which the bridges read as a folder (INV-D2); replace it.
+    private static func withoutDirectoryMarker(_ name: String) -> String {
+        name.hasSuffix("\\") ? String(name.dropLast()) + "_" : name
     }
 
     private func relativeTransferPath(fileURL: URL, rootURL: URL, rootName: String) -> String {
