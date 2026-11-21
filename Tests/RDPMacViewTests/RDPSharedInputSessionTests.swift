@@ -86,12 +86,12 @@ private final class Harness {
     let queue: ManualQueue
     let executor: RDPInputExecutor
 
-    init() {
+    init(profile: RDPKeyboardProfile = .standard) {
         let sender = FakeSender()
         let queue = ManualQueue()
         self.sender = sender
         self.queue = queue
-        self.executor = RDPInputExecutor(sender: sender) { work in
+        self.executor = RDPInputExecutor(sender: sender, keyboardProfile: profile) { work in
             queue.schedule(work)
         }
     }
@@ -953,5 +953,95 @@ final class RDPSharedInputSessionTests: XCTestCase {
         let secondResult = await h.close(second)
         XCTAssertEqual(secondResult, .released)
         XCTAssertEqual(h.sender.events, [up(keyB), up(keyV)])
+    }
+
+    // MARK: IME taps (design G6, G7)
+
+    private let maskedHangul: [FakeSender.Event] = [down(0x138), down(control), up(control), up(0x138)]
+
+    func testIMETapIsTheMaskedChordOnKoreanAndNothingOnStandard() async {
+        let h = Harness(profile: .korean)
+        let session = h.activeSession()
+        h.submit(session, .imeTap(.hangul), .imeTap(.hanja))
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, maskedHangul + [down(0x11D), up(0x11D)])
+        h.sender.events.removeAll()
+        h.executor.hostIMETap(.hangul)
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, maskedHangul)
+
+        let standard = Harness(profile: .standard)
+        let standardSession = standard.activeSession()
+        standard.submit(standardSession, .imeTap(.hangul), .imeTap(.hanja))
+        standard.executor.hostIMETap(.hangul)
+        standard.queue.runAll()
+        XCTAssertEqual(standard.sender.events, [])
+    }
+
+    func testIMETapWaitsUntilControlAndAltAreAllReleased() {
+        let h = Harness(profile: .korean)
+        h.executor.hostModifiers([control, alt])
+        h.queue.runAll()
+        h.sender.events.removeAll()
+        h.executor.hostIMETap(.hangul)
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [])
+        h.executor.hostModifiers([control])
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [up(alt)])
+        h.executor.hostModifiers([])
+        h.queue.runAll()
+        // The deferred tap arrives after the last Control goes up (E3a order).
+        XCTAssertEqual(h.sender.events, [up(alt), up(control)] + maskedHangul)
+    }
+
+    func testTwoDeferredIMETapsCancelOut() {
+        let h = Harness(profile: .korean)
+        h.executor.hostModifiers([control])
+        h.executor.hostIMETap(.hangul)
+        h.executor.hostIMETap(.hangul)
+        h.executor.hostModifiers([])
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(control), up(control)])
+    }
+
+    func testAnotherOwnersControlDefersTheTap() async {
+        let h = Harness(profile: .korean)
+        let session = h.activeSession()
+        h.executor.hostModifiers([control])
+        h.submit(session, .imeTap(.hangul))
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(control)])
+        h.executor.hostModifiers([])
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(control), up(control)] + maskedHangul)
+        _ = await h.close(session)
+    }
+
+    func testWindowsDefersAndShiftDoesNot() {
+        let h = Harness(profile: .korean)
+        h.executor.hostModifiers([shift])
+        h.executor.hostIMETap(.hanja)
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(shift), down(0x11D), up(0x11D)])
+        h.sender.events.removeAll()
+        h.executor.hostModifiers([windows])
+        h.executor.hostIMETap(.hanja)
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [up(shift), down(windows)])
+        h.executor.hostModifiers([])
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [up(shift), down(windows), up(windows), down(0x11D), up(0x11D)])
+    }
+
+    func testClosingAnOwnerDropsItsDeferredTap() async {
+        let h = Harness(profile: .korean)
+        let session = h.activeSession()
+        h.submit(session, .modifiers([control]), .imeTap(.hangul))
+        h.queue.runAll()
+        XCTAssertEqual(h.sender.events, [down(control)])
+        let result = await h.close(session)
+        XCTAssertEqual(result, .released)
+        XCTAssertEqual(h.sender.events, [down(control), up(control)])
     }
 }

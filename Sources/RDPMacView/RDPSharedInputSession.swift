@@ -12,6 +12,9 @@ public enum RDPSharedInputCommand: Sendable {
     case scroll(x: Int32, y: Int32, deltaY: Int32, deltaX: Int32, modifiers: [UInt16])
     case modifiers([UInt16])
     case chord([UInt16])
+    /// A Hangul or Hanja tap. The executor builds it from its own keyboard profile and defers it
+    /// while any owner holds Control, Alt or Windows (design G6, G7).
+    case imeTap(RDPKeyboardMapper.IMEToggle)
 }
 
 public enum RDPSharedInputCloseFailure: Sendable, Equatable {
@@ -416,12 +419,15 @@ final class RDPInputExecutor: @unchecked Sendable {
                 failures[owner] = .connectionLost
                 blockSharing()
             }
+            emitPendingIMETapsIfReleased()
         }
     }
 
     func submitCleanup(owner: RDPInputOwner, wasActive: Bool, completion: @escaping (RDPSharedInputCloseResult) -> Void) {
         schedule { [self] in
-            completion(close(owner, wasActive: wasActive))
+            let result = close(owner, wasActive: wasActive)
+            emitPendingIMETapsIfReleased()
+            completion(result)
         }
     }
 
@@ -500,6 +506,13 @@ final class RDPInputExecutor: @unchecked Sendable {
         }
     }
 
+    /// A Hangul or Hanja tap from the local view, by the same rules as `.imeTap`.
+    func hostIMETap(_ toggle: RDPKeyboardMapper.IMEToggle) {
+        submitHost { [self] in
+            requestIMETap(.host, toggle)
+        }
+    }
+
     /// Releases everything the host holds by the `close` rules, as one transaction; the executor
     /// stays in use. Share owners' records are left alone (design D6, I7).
     func hostReleaseAll() {
@@ -513,6 +526,7 @@ final class RDPInputExecutor: @unchecked Sendable {
         schedule { [self] in
             executingOwner = .host
             _ = sender.perform(body)
+            emitPendingIMETapsIfReleased()
         }
     }
 
@@ -540,6 +554,58 @@ final class RDPInputExecutor: @unchecked Sendable {
             syncModifiers(owner, to: modifiers)
         case let .chord(scanCodes):
             chord(owner, scanCodes)
+        case let .imeTap(toggle):
+            requestIMETap(owner, toggle)
+        }
+    }
+
+    // MARK: IME taps (design G6, G7, I-G8, I-G9)
+
+    /// Windows reads the union of every owner's keys, and a Hangul key that arrives while one of
+    /// these is down does not switch the IME (E3b). Shift is left out on purpose (I-G9).
+    private static let tapDeferringModifiers: [RDPInputKey] = [
+        RDPKeyboardMapper.leftControl, RDPKeyboardMapper.rightControl,
+        RDPKeyboardMapper.leftAlt, RDPKeyboardMapper.rightAlt, RDPKeyboardMapper.leftWindows
+    ].map { RDPInputKey.fromScancode($0) }
+
+    /// Taps not yet sent, per owner, as a parity per toggle: two requested taps cancel out.
+    private var pendingIMETaps: [RDPInputOwner: Set<RDPKeyboardMapper.IMEToggle>] = [:]
+
+    private func requestIMETap(_ owner: RDPInputOwner, _ toggle: RDPKeyboardMapper.IMEToggle) {
+        guard RDPKeyboardMapper.imeTapChord(toggle, profile: keyboardProfile) != nil else { return }
+        let toggles = (pendingIMETaps[owner] ?? []).symmetricDifference([toggle])
+        pendingIMETaps[owner] = toggles.isEmpty ? nil : toggles
+    }
+
+    /// Runs at the end of every unit of work: once no owner holds a deferring modifier, sends
+    /// each owner's pending taps once.
+    private func emitPendingIMETapsIfReleased() {
+        guard !pendingIMETaps.isEmpty,
+              !held.values.contains(where: { inputs in Self.tapDeferringModifiers.contains(where: inputs.holds) }) else {
+            return
+        }
+        let pending = pendingIMETaps.sorted { Self.ownerOrder($0.key) < Self.ownerOrder($1.key) }
+        pendingIMETaps = [:]
+        for (owner, toggles) in pending {
+            executingOwner = owner
+            let ran = sender.perform { [self] in
+                for toggle in RDPKeyboardMapper.IMEToggle.allCases where toggles.contains(toggle) {
+                    if let keys = RDPKeyboardMapper.imeTapChord(toggle, profile: keyboardProfile) {
+                        chord(owner, keys)
+                    }
+                }
+            }
+            if !ran, case .shared = owner {
+                failures[owner] = .connectionLost
+                blockSharing()
+            }
+        }
+    }
+
+    private static func ownerOrder(_ owner: RDPInputOwner) -> UInt64 {
+        switch owner {
+        case .host: return 0
+        case let .shared(id): return id
         }
     }
 
@@ -701,6 +767,8 @@ final class RDPInputExecutor: @unchecked Sendable {
     /// Releases what the owner holds: buttons and ordinary keys first, then modifiers in
     /// reverse press order, at the last pointer position actually sent.
     private func close(_ owner: RDPInputOwner, wasActive: Bool) -> RDPSharedInputCloseResult {
+        // A closed owner's deferred taps are dropped before its release (I-F13, I-G9).
+        pendingIMETaps[owner] = nil
         guard wasActive else { return .released }
         executingOwner = owner
         guard let inputs = held[owner], !inputs.isEmpty else {

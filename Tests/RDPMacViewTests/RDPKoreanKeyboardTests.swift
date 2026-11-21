@@ -92,6 +92,16 @@ final class RDPKoreanKeyboardTests: XCTestCase {
         XCTAssertNil(RDPKeyboardMapper.imeToggleScancode(forMacKeyCode: 104, profile: .standard))
         XCTAssertNil(RDPKeyboardMapper.imeToggleScancode(forMacKeyCode: 102, profile: .standard))
         XCTAssertNil(RDPKeyboardMapper.imeToggleScancode(forMacKeyCode: 0, profile: .korean))
+    }
+
+    func testIMETapChordMasksHangulOnKoreanOnly() {
+        XCTAssertEqual(RDPKeyboardMapper.imeTapChord(.hangul, profile: .korean), [0x138, 0x1D])
+        XCTAssertEqual(RDPKeyboardMapper.imeTapChord(.hanja, profile: .korean), [0x11D])
+        XCTAssertNil(RDPKeyboardMapper.imeTapChord(.hangul, profile: .standard))
+        XCTAssertNil(RDPKeyboardMapper.imeTapChord(.hanja, profile: .standard))
+        XCTAssertEqual(RDPKeyboardMapper.imeToggle(forMacKeyCode: 104), .hangul)
+        XCTAssertEqual(RDPKeyboardMapper.imeToggle(forMacKeyCode: 102), .hanja)
+        XCTAssertNil(RDPKeyboardMapper.imeToggle(forMacKeyCode: 0))
         XCTAssertTrue(RDPKeyboardMapper.isIMEToggleKey(104))
         XCTAssertTrue(RDPKeyboardMapper.isIMEToggleKey(102))
         XCTAssertFalse(RDPKeyboardMapper.isIMEToggleKey(0))
@@ -148,8 +158,11 @@ final class RDPKoreanKeyboardTests: XCTestCase {
         view.keyUp(with: keyEvent(.keyUp, keyCode: 104))
         view.keyDown(with: keyEvent(.keyDown, keyCode: 102))
         view.keyUp(with: keyEvent(.keyUp, keyCode: 102))
-        XCTAssertEqual(waitForKeys(session, count: 4), [
+        // Hangul is the masked tap E0 38, 1D, 1D up, E0 38 up (design G6); Hanja stays bare.
+        XCTAssertEqual(waitForKeys(session, count: 6), [
             KeySession.Key(code: 0x38, pressed: true, extended: true),
+            KeySession.Key(code: 0x1D, pressed: true, extended: false),
+            KeySession.Key(code: 0x1D, pressed: false, extended: false),
             KeySession.Key(code: 0x38, pressed: false, extended: true),
             KeySession.Key(code: 0x1D, pressed: true, extended: true),
             KeySession.Key(code: 0x1D, pressed: false, extended: true)

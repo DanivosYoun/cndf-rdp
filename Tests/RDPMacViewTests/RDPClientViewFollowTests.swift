@@ -101,6 +101,10 @@ private let deviceLeftAlt: UInt = 0x20
 private let deviceRightAlt: UInt = 0x40
 private let hangulDown = FollowKeySession.Key(code: 0x38, pressed: true, extended: true)
 private let hangulUp = FollowKeySession.Key(code: 0x38, pressed: false, extended: true)
+private let maskDown = FollowKeySession.Key(code: 0x1D, pressed: true, extended: false)
+private let maskUp = FollowKeySession.Key(code: 0x1D, pressed: false, extended: false)
+/// The masked Hangul tap on `.korean` (design G6): E0 38 down, 1D down, 1D up, E0 38 up.
+private let hangulTap = [hangulDown, maskDown, maskUp, hangulUp]
 
 private func flags(_ base: NSEvent.ModifierFlags, device: UInt = 0) -> NSEvent.ModifierFlags {
     NSEvent.ModifierFlags(rawValue: base.rawValue | device)
@@ -189,9 +193,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
         view.keyDown(with: keyEvent(.keyDown, keyCode: 15))
 
-        XCTAssertEqual(waitForKeys(session, count: 3), [
-            hangulDown,
-            hangulUp,
+        XCTAssertEqual(waitForKeys(session, count: 5), hangulTap + [
             FollowKeySession.Key(code: 0x13, pressed: true, extended: false)
         ])
         XCTAssertTrue(delegate.logs.contains(
@@ -216,7 +218,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         reader.sourceID = "com.apple.inputmethod.Korean.3SetKorean"
         center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
 
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
         XCTAssertTrue(delegate.logs.contains(
             "RDP input-source follow: unchanged lang=ko cause=async sent=none"
         ))
@@ -235,7 +237,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         view.keyUp(with: keyEvent(.keyUp, keyCode: 49, modifierFlags: [.control]))
 
         // Only Hangul chord is sent; Space (0x39) is completely suppressed.
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
     }
 
     func testSwitchHotkeyWithoutSourceChangeForwardsSpaceNormally() {
@@ -260,7 +262,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         view.flagsChanged(with: flagsEvent(.capsLock, keyCode: 57))
         view.flagsChanged(with: flagsEvent([], keyCode: 57))
 
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
     }
 
     // MARK: I-F1 R4 & R6 right Option and 104 merging
@@ -277,7 +279,8 @@ final class RDPClientViewFollowTests: XCTestCase {
         reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
         center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
 
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        // Right Option itself is the modifier E0 38, not a masked tap (out of G6's scope).
+        XCTAssertEqual(waitForKeys(session, count: 4), [hangulDown, hangulUp])
     }
 
     func testAsyncFlipFollowedByRightOptionWithinMergeWindowSuppressesRightAlt() {
@@ -292,7 +295,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         clock.advance(by: 0.050)
         view.flagsChanged(with: flagsEvent([], keyCode: 61))
 
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
     }
 
     func testKey104MergesFollowingFlipAndSuppressesAfterFlip() {
@@ -304,7 +307,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
         center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
 
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
 
         // Wait past T_merge, flip back asynchronously, then press 104 within 300 ms -> 104 suppressed.
         session.clearKeys()
@@ -315,7 +318,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         clock.advance(by: 0.100)
         view.keyDown(with: keyEvent(.keyDown, keyCode: 104))
 
-        XCTAssertEqual(waitForKeys(session, count: 2), [hangulDown, hangulUp])
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
     }
 
     // MARK: I-F9, I-F11, I-F3, I-F8, I-F13
@@ -357,9 +360,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         view.keyDown(with: keyEvent(.keyDown, keyCode: 0))
         view.releaseHostInput()
 
-        XCTAssertEqual(waitForKeys(session, count: 6), [
-            hangulDown,
-            hangulUp,
+        XCTAssertEqual(waitForKeys(session, count: 8), hangulTap + [
             FollowKeySession.Key(code: 0x38, pressed: true, extended: false),
             FollowKeySession.Key(code: 0x1E, pressed: true, extended: false),
             FollowKeySession.Key(code: 0x1E, pressed: false, extended: false),

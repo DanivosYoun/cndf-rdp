@@ -18,7 +18,7 @@ public enum RDPKeyboardMapper {
     private static let deviceRightAlt: UInt = 0x0000_0040
 
     /// A Korean IME key the server's keyboard driver turns into VK_HANGUL or VK_HANJA.
-    public enum IMEToggle: Sendable {
+    public enum IMEToggle: Sendable, Hashable, CaseIterable {
         case hangul
         case hanja
     }
@@ -66,6 +66,23 @@ public enum RDPKeyboardMapper {
         switch profile {
         case .standard: return nil
         case .korean: return (rightAlt, rightControl)
+        }
+    }
+
+    /// The IME switch key `macKeyCode` is, whatever the profile, or nil.
+    public static func imeToggle(forMacKeyCode macKeyCode: UInt16) -> IMEToggle? {
+        imeToggleKeyCodes[macKeyCode]
+    }
+
+    /// The keys to tap for `toggle` on `profile`, in press order, or nil when it has none. The
+    /// only place a Hangul or Hanja tap is built (design G6, I-G8). On `.korean` the Hangul tap is
+    /// the right Alt masked by a left Control, so a lone right Alt never reaches Windows as a menu
+    /// activation (E8).
+    public static func imeTapChord(_ toggle: IMEToggle, profile: RDPKeyboardProfile) -> [UInt16]? {
+        guard let scancodes = imeToggleScancodes(for: profile) else { return nil }
+        switch toggle {
+        case .hangul: return [scancodes.hangul, leftControl]
+        case .hanja: return [scancodes.hanja]
         }
     }
 

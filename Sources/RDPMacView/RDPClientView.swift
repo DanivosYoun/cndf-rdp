@@ -248,19 +248,19 @@ public final class RDPClientView: NSView {
         }
         // Han/Yeong and Hanja are toggles: one tap per press, auto-repeat ignored (design I11).
         if let profile = session?.keyboardProfile,
-           let scancode = RDPKeyboardMapper.imeToggleScancode(forMacKeyCode: event.keyCode, profile: profile) {
+           RDPKeyboardMapper.imeToggleScancodes(for: profile) != nil,
+           let toggle = RDPKeyboardMapper.imeToggle(forMacKeyCode: event.keyCode) {
             if !event.isARepeat {
-                let isHangul = scancode == RDPKeyboardMapper.imeToggleScancodes(for: profile)?.hangul
-                if isHangul && isInputSourceFollowEligible && inputSourceFollower.isFocused {
+                if toggle == .hangul && isInputSourceFollowEligible && inputSourceFollower.isFocused {
                     let now = inputSourceClock()
                     if inputSourceFollower.shouldSuppressRawToggle(at: now) {
                         return
                     }
                     inputSourceFollower.rawToggleBegan(at: now)
-                    inputExecutor()?.hostChord([scancode])
+                    inputExecutor()?.hostIMETap(toggle)
                     inputSourceFollower.rawToggleEnded(at: now)
                 } else {
-                    inputExecutor()?.hostChord([scancode])
+                    inputExecutor()?.hostIMETap(toggle)
                 }
             }
             return
@@ -861,9 +861,8 @@ public final class RDPClientView: NSView {
         if fromNotification || sourceChanged || decision != .none(.unchanged) {
             logInputSourceDecision(decision, language: language, cause: cause)
         }
-        if case .sendToggle = decision,
-           let hangul = RDPKeyboardMapper.imeToggleScancodes(for: .korean)?.hangul {
-            inputExecutor()?.hostChord([hangul])
+        if case .sendToggle = decision {
+            inputExecutor()?.hostIMETap(.hangul)
         }
         return (decision, sourceChanged)
     }
