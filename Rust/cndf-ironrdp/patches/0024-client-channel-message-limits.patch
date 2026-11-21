@@ -1,0 +1,1965 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 495b86a..4dc9127 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -2632,6 +2632,8 @@ fn build_connector(
+     let h264_decoder = h264_decoders.map(crate::h264::H264DecoderFactory::create_in_background);
+ 
+     let mut drdynvc = ironrdp_dvc::DrdynvcClient::new()
++        .with_max_transport_message_size(ironrdp_dvc::DEFAULT_CLIENT_MAX_TRANSPORT_MESSAGE_SIZE)
++        .with_default_max_message_size(ironrdp_dvc::DEFAULT_CLIENT_MAX_MESSAGE_SIZE)
+         .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
+         .with_dynamic_channel(EchoClient::new())
+         .with_dynamic_channel(RdpeiClient::new(
+@@ -3151,6 +3153,11 @@ fn build_connector(
+         connector = connector.with_auto_reconnect_cookie(cookie.clone());
+     }
+ 
++    // Each channel's processor may set its own limit; the rest share the client default.
++    connector
++        .static_channels
++        .set_max_message_size(ironrdp_svc::DEFAULT_CLIENT_MAX_MESSAGE_SIZE);
++
+     Ok(connector)
+ }
+ 
+@@ -7903,6 +7910,148 @@ mod tests {
+         );
+     }
+ 
++    /// A connector built as for a session, with device redirection so the audio channels are attached too.
++    #[cfg(feature = "rdpdr")]
++    fn limited_connector() -> ironrdp_connector::ClientConnector {
++        let (input, _input_rx) = RdpInputSender::channel(1);
++        let (output, _output_rx) = crate::output_channel::output_channel(1);
++        build_connector(
++            &test_config(),
++            SocketAddr::from(([127, 0, 0, 1], 0)),
++            (&input, &output),
++            None,
++            None,
++            RdpdrDevicePolicy::ALLOW_ALL,
++            false,
++            false,
++            None,
++        )
++        .expect("test connector should build")
++    }
++
++    /// The first fragment of a static channel message declaring `length` bytes.
++    #[cfg(feature = "rdpdr")]
++    fn first_fragment(length: usize) -> Vec<u8> {
++        let mut fragment = u32::try_from(length).unwrap().to_le_bytes().to_vec();
++        fragment.extend_from_slice(&ironrdp_svc::ChannelFlags::FIRST.bits().to_le_bytes());
++        fragment.extend_from_slice(&[0; 64]);
++        fragment
++    }
++
++    /// Whether the static channel `name` accepts the first fragment of a message declaring `length` bytes.
++    #[cfg(feature = "rdpdr")]
++    fn static_channel_accepts(
++        connector: &mut ironrdp_connector::ClientConnector,
++        name: &'static [u8; 8],
++        length: usize,
++    ) -> bool {
++        let (key, _) = connector
++            .static_channels
++            .get_by_channel_name_key(&ChannelName::from_static(name))
++            .expect("static channel is attached");
++        let channel = connector.static_channels.get_by_key_mut(key).expect("static channel");
++        match channel.process(&first_fragment(length)) {
++            Ok(replies) => {
++                assert!(replies.is_empty());
++                true
++            }
++            Err(_) => false,
++        }
++    }
++
++    #[cfg(feature = "rdpdr")]
++    #[derive(Debug)]
++    struct UnlimitedChannel;
++
++    #[cfg(feature = "rdpdr")]
++    ironrdp_core::impl_as_any!(UnlimitedChannel);
++
++    #[cfg(feature = "rdpdr")]
++    impl ironrdp_svc::SvcProcessor for UnlimitedChannel {
++        fn channel_name(&self) -> ChannelName {
++            ChannelName::from_static(b"testlim\0")
++        }
++
++        fn process(&mut self, _: &[u8]) -> ironrdp_pdu::PduResult<Vec<SvcMessage>> {
++            Ok(Vec::new())
++        }
++    }
++
++    // oracle: mutant without the client default static channel limit, or without a channel's own limit.
++    #[cfg(feature = "rdpdr")]
++    #[test]
++    fn static_channels_bound_server_messages() {
++        let mib = 1024 * 1024;
++        // A channel attached after the connector is built, as an extension's is, gets the default.
++        for (name, limit) in [
++            (b"testlim\0", 16 * mib),
++            (b"drdynvc\0", mib),
++            (b"rdpsnd\0\0", 2 * mib),
++            (b"rdpdr\0\0\0", 17 * mib),
++        ] {
++            let mut connector = limited_connector();
++            connector.static_channels.insert(UnlimitedChannel);
++            assert!(
++                static_channel_accepts(&mut connector, name, limit),
++                "{name:?} rejected a message at its limit"
++            );
++            let mut connector = limited_connector();
++            connector.static_channels.insert(UnlimitedChannel);
++            assert!(
++                !static_channel_accepts(&mut connector, name, limit + 1),
++                "{name:?} accepted a message over its limit"
++            );
++        }
++    }
++
++    /// Whether the dynamic channel `name`, once opened, accepts a message declaring `length` bytes.
++    #[cfg(feature = "rdpdr")]
++    fn dynamic_channel_accepts(name: &str, length: usize) -> bool {
++        use ironrdp_dvc::pdu::{
++            CreateRequestPdu, CreationStatus, DataFirstPdu, DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu,
++        };
++
++        let mut connector = limited_connector();
++        let drdynvc = connector
++            .get_static_channel_processor_mut::<ironrdp_dvc::DrdynvcClient>()
++            .expect("DRDYNVC is attached");
++        let create = encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(7, name.to_owned()))).unwrap();
++        let responses = drdynvc.process(&create).unwrap();
++        let opened = responses.iter().any(|response| {
++            let bytes = response.encode_unframed_pdu().unwrap();
++            matches!(
++                ironrdp_core::decode::<DrdynvcClientPdu>(&bytes),
++                Ok(DrdynvcClientPdu::Create(response)) if response.creation_status() == CreationStatus::OK
++            )
++        });
++        assert!(opened, "{name} is not opened");
++        let data = DataFirstPdu::new(7, u32::try_from(length).unwrap(), vec![0; 1000]);
++        drdynvc
++            .process(&encode_vec(&DrdynvcDataPdu::DataFirst(data)).unwrap())
++            .is_ok()
++    }
++
++    // oracle: mutant without the client default DVC limit, or without a channel's own limit.
++    #[cfg(feature = "rdpdr")]
++    #[test]
++    fn dynamic_channels_bound_server_messages() {
++        let mib = 1024 * 1024;
++        for (name, limit) in [
++            (ironrdp_echo::CHANNEL_NAME, mib),
++            (ironrdp_egfx::CHANNEL_NAME, 64 * mib),
++            (ironrdp_rdpsnd::client::DVC_CHANNEL_NAME, 2 * mib),
++        ] {
++            assert!(
++                dynamic_channel_accepts(name, limit),
++                "{name} rejected a message at its limit"
++            );
++            assert!(
++                !dynamic_channel_accepts(name, limit + 1),
++                "{name} accepted a message over its limit"
++            );
++        }
++    }
++
+     #[cfg(feature = "rdpdr")]
+     #[test]
+     fn rdpdr_announces_the_factory_device_metadata() {
+diff --git a/crates/ironrdp-cliprdr/src/backend.rs b/crates/ironrdp-cliprdr/src/backend.rs
+index cd639d2..65c61d9 100644
+--- a/crates/ironrdp-cliprdr/src/backend.rs
++++ b/crates/ironrdp-cliprdr/src/backend.rs
+@@ -155,6 +155,16 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
+     /// set to `true`.
+     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>);
+ 
++    /// Called by [`crate::Cliprdr`] instead of [`Self::on_format_data_response`] when the response to
++    /// the oldest unanswered format data request exceeds [`crate::MAX_MESSAGE_SIZE`] and was dropped.
++    ///
++    /// `declared_length` is the message length the remote declared. The default implementation handles
++    /// the response as a failed one.
++    fn on_format_data_response_oversized(&mut self, declared_length: usize) {
++        let _ = declared_length;
++        self.on_format_data_response(FormatDataResponse::new_error());
++    }
++
+     /// Processes remote's request to send file contents.
+     ///
+     /// Called by [crate::Cliprdr] when server requests file contents to be copied from the client
+diff --git a/crates/ironrdp-cliprdr/src/lib.rs b/crates/ironrdp-cliprdr/src/lib.rs
+index 3adec10..1945f82 100644
+--- a/crates/ironrdp-cliprdr/src/lib.rs
++++ b/crates/ironrdp-cliprdr/src/lib.rs
+@@ -13,8 +13,8 @@ use ironrdp_core::{AsAny, EncodeResult, IntoOwned as _, decode};
+ use ironrdp_pdu::gcc::ChannelName;
+ use ironrdp_pdu::{PduResult, decode_err, encode_err};
+ use ironrdp_svc::{
+-    ChannelFlags, CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor, SvcProcessorMessages,
+-    SvcServerProcessor,
++    ChannelFlags, CompressionCondition, OversizedMessagePolicy, SvcClientProcessor, SvcMessage, SvcProcessor,
++    SvcProcessorMessages, SvcServerProcessor,
+ };
+ use pdu::{
+     Capabilities, ClientTemporaryDirectory, ClipboardFormat, ClipboardFormatId, ClipboardFormatName,
+@@ -428,6 +428,11 @@ const MAX_PENDING_FILE_REQUESTS: usize = 1000;
+ /// carries on.
+ const MAX_PENDING_FORMAT_DATA_REQUESTS: usize = 64;
+ 
++/// The largest CLIPRDR message kept: a FileGroupDescriptorW of [`pdu::MAX_FILE_COUNT`] descriptors fits.
++///
++/// A larger message is dropped and fails only its own item (see [`Cliprdr::process_oversized`]).
++pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
++
+ /// Fails one file contents request without leaving its caller waiting.
+ ///
+ /// A rejected request is a per-request failure, not a channel failure. The
+@@ -2202,6 +2207,67 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
+     fn compression_condition(&self) -> CompressionCondition {
+         CompressionCondition::WhenRdpDataIsCompressed
+     }
++
++    fn max_message_size(&self) -> Option<usize> {
++        Some(MAX_MESSAGE_SIZE)
++    }
++
++    fn oversized_message_policy(&self) -> OversizedMessagePolicy {
++        OversizedMessagePolicy::Discard
++    }
++
++    /// Fails only the item an oversized message carried, keeping requests and responses paired:
++    /// a format data response answers its request as a failure, a file contents response fails its stream,
++    /// and a format list is rejected with [`FormatListResponse::Fail`]. Any other message fails the channel.
++    fn process_oversized(&mut self, prefix: &[u8], declared_length: usize) -> PduResult<Vec<SvcMessage>> {
++        // CLIPRDR_HEADER: msgType (2), msgFlags (2), dataLen (4).
++        const MSG_TYPE_FORMAT_LIST: u16 = 0x0002;
++        const MSG_TYPE_FORMAT_DATA_RESPONSE: u16 = 0x0005;
++        const MSG_TYPE_FILE_CONTENTS_RESPONSE: u16 = 0x0009;
++
++        let msg_type = prefix.first_chunk::<2>().map(|bytes| u16::from_le_bytes(*bytes));
++        warn!(
++            msg_type = ?msg_type,
++            declared_length,
++            max = MAX_MESSAGE_SIZE,
++            "Dropping oversized clipboard message"
++        );
++        match msg_type {
++            Some(MSG_TYPE_FORMAT_DATA_RESPONSE) => {
++                // The response answers the oldest request, whatever it asked for.
++                self.pending_format_data_requests.pop_front();
++                self.backend.on_format_data_response_oversized(declared_length);
++                Ok(Vec::new())
++            }
++            Some(MSG_TYPE_FILE_CONTENTS_RESPONSE) => {
++                let Some(stream_id) = prefix
++                    .get(8..)
++                    .and_then(|body| body.first_chunk::<4>())
++                    .map(|bytes| u32::from_le_bytes(*bytes))
++                else {
++                    return Err(ironrdp_pdu::pdu_other_err!(
++                        "oversized clipboard file contents response has no stream ID"
++                    ));
++                };
++                if self.sent_file_contents_requests.remove(&stream_id).is_some() {
++                    self.backend
++                        .on_file_contents_response(FileContentsResponse::new_error(stream_id));
++                } else {
++                    warn!(
++                        stream_id,
++                        "Received FileContentsResponse for unknown streamId (no matching request sent); dropping"
++                    );
++                }
++                Ok(Vec::new())
++            }
++            Some(MSG_TYPE_FORMAT_LIST) => Ok(vec![into_cliprdr_message(ClipboardPdu::FormatListResponse(
++                FormatListResponse::Fail,
++            ))]),
++            _ => Err(ironrdp_pdu::pdu_other_err!(
++                "clipboard message exceeds the maximum size"
++            )),
++        }
++    }
+ }
+ 
+ fn into_cliprdr_message(pdu: ClipboardPdu<'static>) -> SvcMessage {
+diff --git a/crates/ironrdp-cliprdr/tests/oversized_held.rs b/crates/ironrdp-cliprdr/tests/oversized_held.rs
+new file mode 100644
+index 0000000..7b9a64c
+--- /dev/null
++++ b/crates/ironrdp-cliprdr/tests/oversized_held.rs
+@@ -0,0 +1,182 @@
++//! Bytes a client holds while the server sends a CLIPRDR message over [`MAX_MESSAGE_SIZE`].
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::cell::Cell;
++
++use bitflags as _;
++use ironrdp_cliprdr::backend::CliprdrBackend;
++use ironrdp_cliprdr::pdu::{
++    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse,
++    FormatDataRequest, FormatDataResponse, LockDataId,
++};
++use ironrdp_cliprdr::{CliprdrClient, MAX_MESSAGE_SIZE};
++use ironrdp_svc::StaticVirtualChannel;
++use tracing as _;
++#[cfg(feature = "__test")]
++use visibility as _;
++use {ironrdp_core as _, ironrdp_pdu as _};
++
++/// Counts the bytes each thread holds, so tests running in parallel do not disturb each other.
++struct CountingAllocator;
++
++thread_local! {
++    static HELD: Cell<isize> = const { Cell::new(0) };
++}
++
++fn track(delta: isize) {
++    let _ = HELD.try_with(|held| held.set(held.get() + delta));
++}
++
++// SAFETY: Forwards to the system allocator and only counts.
++unsafe impl GlobalAlloc for CountingAllocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            track(layout.size().cast_signed());
++        }
++        ptr
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            track(layout.size().cast_signed());
++        }
++        ptr
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: Same contract as the caller's.
++        unsafe { System.dealloc(ptr, layout) };
++        track(-layout.size().cast_signed());
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new_ptr.is_null() {
++            track(new_size.cast_signed() - layout.size().cast_signed());
++        }
++        new_ptr
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: CountingAllocator = CountingAllocator;
++
++fn held() -> isize {
++    HELD.with(Cell::get)
++}
++
++/// Records what reaches the app: response data lengths and failures.
++#[derive(Debug, Default)]
++struct Backend {
++    data: Vec<usize>,
++    failures: usize,
++}
++
++ironrdp_core::impl_as_any!(Backend);
++
++impl CliprdrBackend for Backend {
++    fn temporary_directory(&self) -> &str {
++        "/tmp"
++    }
++    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
++        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
++    }
++    fn on_ready(&mut self) {}
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
++    fn on_format_data_request(&mut self, _: FormatDataRequest) {}
++    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
++        if response.is_error() {
++            self.failures += 1;
++        } else {
++            self.data.push(response.data().len());
++        }
++    }
++    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: LockDataId) {}
++    fn on_unlock(&mut self, _: LockDataId) {}
++}
++
++/// One unfragmented channel message.
++fn single(message: &[u8]) -> Vec<u8> {
++    let mut fragment = u32::try_from(message.len()).unwrap().to_le_bytes().to_vec();
++    fragment.extend_from_slice(&3u32.to_le_bytes());
++    fragment.extend_from_slice(message);
++    fragment
++}
++
++// oracle: mutant reassembling a clipboard message over the limit, or one without a CLIPRDR message limit.
++#[test]
++fn an_oversized_server_response_is_not_held() {
++    let mut channel = StaticVirtualChannel::new(CliprdrClient::new(Box::new(Backend::default())));
++    // Server Capabilities (general, long format names) and Monitor Ready complete the initialization.
++    let capabilities = [
++        0x07, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0c, 0x00, 0x02, 0x00,
++        0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
++    ];
++    channel.process(&single(&capabilities)).unwrap();
++    channel
++        .process(&single(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]))
++        .unwrap();
++    let cliprdr = channel.channel_processor_downcast_mut::<CliprdrClient>().unwrap();
++    let _: Vec<_> = cliprdr.initiate_copy(&[]).unwrap().into();
++    // Format List Response (CB_RESPONSE_OK) to the client's copy.
++    channel
++        .process(&single(&[0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]))
++        .unwrap();
++    let cliprdr = channel.channel_processor_downcast_mut::<CliprdrClient>().unwrap();
++    let _: Vec<_> = cliprdr
++        .initiate_paste(ClipboardFormatId::CF_UNICODETEXT)
++        .unwrap()
++        .into();
++    let _: Vec<_> = cliprdr
++        .initiate_paste(ClipboardFormatId::CF_UNICODETEXT)
++        .unwrap()
++        .into();
++
++    // The response is one byte over the limit, sent in 1600-byte fragments from one reused buffer.
++    let total = MAX_MESSAGE_SIZE + 1;
++    let declared = u32::try_from(total).unwrap();
++    let mut fragment = Vec::with_capacity(8 + 1600);
++    let start = held();
++    let mut peak = 0;
++    let mut sent = 0;
++    while sent < total {
++        let length = 1600.min(total - sent);
++        let flags = u32::from(sent == 0) | (u32::from(sent + length == total) << 1);
++        fragment.clear();
++        fragment.extend_from_slice(&declared.to_le_bytes());
++        fragment.extend_from_slice(&flags.to_le_bytes());
++        if sent == 0 {
++            // FormatDataResponse, CB_RESPONSE_OK, dataLen.
++            fragment.extend_from_slice(&[0x05, 0x00, 0x01, 0x00]);
++            fragment.extend_from_slice(&(declared - 8).to_le_bytes());
++            fragment.resize(8 + length, b'A');
++        } else {
++            fragment.resize(8 + length, b'A');
++        }
++        let replies = channel.process(&fragment).unwrap();
++        assert!(replies.is_empty());
++        peak = peak.max(held() - start);
++        sent += length;
++    }
++    assert!(peak <= 4096, "held {peak} bytes for an oversized clipboard response");
++
++    // The next response is paired with the next paste and delivered.
++    let response = [0x05, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, b'o', 0, b'k', 0];
++    channel.process(&single(&response)).unwrap();
++    let backend = channel
++        .channel_processor_downcast_ref::<CliprdrClient>()
++        .unwrap()
++        .downcast_backend::<Backend>()
++        .unwrap();
++    assert_eq!(backend.failures, 1);
++    assert_eq!(backend.data, [4]);
++}
+diff --git a/crates/ironrdp-dvc/src/client.rs b/crates/ironrdp-dvc/src/client.rs
+index 9f3f1f3..48efee4 100644
+--- a/crates/ironrdp-dvc/src/client.rs
++++ b/crates/ironrdp-dvc/src/client.rs
+@@ -108,8 +108,9 @@ impl Drop for DynamicVirtualChannel {
+ }
+ 
+ impl DynamicVirtualChannel {
+-    fn from_boxed(processor: Box<dyn DvcClientProcessor + Send>) -> Self {
+-        let max_message_size = processor.max_message_size();
++    /// `default_max_message_size` bounds a processor that sets no message limit of its own.
++    fn from_boxed(processor: Box<dyn DvcClientProcessor + Send>, default_max_message_size: Option<usize>) -> Self {
++        let max_message_size = processor.max_message_size().or(default_max_message_size);
+         Self {
+             channel_processor: processor,
+             complete_data: CompleteData::new(max_message_size),
+@@ -146,6 +147,18 @@ impl DynamicVirtualChannel {
+ /// the close or the decline.
+ const MAX_CLIENT_CLOSED_CHANNELS: usize = 64;
+ 
++/// The DVC message limit a client applies to each channel whose processor sets none.
++pub const DEFAULT_CLIENT_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
++
++/// The DRDYNVC carrier message limit a client applies, as Remote Credential Guard does.
++pub const DEFAULT_CLIENT_MAX_TRANSPORT_MESSAGE_SIZE: usize = 1024 * 1024;
++
++/// Open channels one listener may have at once; a further Create Request is declined with NO_LISTENER.
++pub const MAX_CHANNELS_PER_NAME: usize = 2;
++
++/// Open channels a client may have at once; a further Create Request is declined with NO_LISTENER.
++pub const MAX_ACTIVE_CHANNELS: usize = 64;
++
+ /// DRDYNVC Static Virtual Channel (the Remote Desktop Protocol: Dynamic Virtual Channel Extension)
+ ///
+ /// It adds support for dynamic virtual channels (DVC).
+@@ -193,6 +206,16 @@ impl DrdynvcClient {
+         }
+     }
+ 
++    /// Bounds the reassembled messages of each dynamic channel whose processor sets no limit of its own.
++    ///
++    /// A message over the limit, declared or received, makes the DRDYNVC channel fail.
++    /// Configure it before the server opens channels; channels already open keep their limit.
++    #[must_use]
++    pub fn with_default_max_message_size(mut self, max_message_size: usize) -> Self {
++        self.dynamic_channels.default_max_message_size = Some(max_message_size);
++        self
++    }
++
+     /// Bounds inbound static-channel reassembly before any dynamic-channel dispatch.
+     ///
+     /// This limit covers each DRDYNVC carrier message, excluding its SVC header.
+@@ -801,8 +824,10 @@ struct ListenerEntry {
+ 
+ struct DynamicChannelSet {
+     listeners: BTreeMap<DynamicChannelName, ListenerEntry>,
++    /// INVARIANT: At most [`MAX_ACTIVE_CHANNELS`] channels, and [`MAX_CHANNELS_PER_NAME`] per name.
+     active_channels: BTreeMap<DynamicChannelId, DynamicVirtualChannel>,
+     type_id_to_channel_id: BTreeMap<TypeId, DynamicChannelId>,
++    default_max_message_size: Option<usize>,
+ }
+ 
+ impl DynamicChannelSet {
+@@ -812,6 +837,7 @@ impl DynamicChannelSet {
+             listeners: BTreeMap::new(),
+             active_channels: BTreeMap::new(),
+             type_id_to_channel_id: BTreeMap::new(),
++            default_max_message_size: None,
+         }
+     }
+ 
+@@ -866,7 +892,7 @@ impl DynamicChannelSet {
+             return Err(pdu_other_err!("dynamic channel ID is already attached"));
+         }
+ 
+-        let mut channel = DynamicVirtualChannel::from_boxed(channel);
++        let mut channel = DynamicVirtualChannel::from_boxed(channel, self.default_max_message_size);
+         let _messages = channel.start(channel_id)?;
+         self.active_channels.insert(channel_id, channel);
+         Ok(())
+@@ -877,9 +903,22 @@ impl DynamicChannelSet {
+         name: &DynamicChannelName,
+         channel_id: DynamicChannelId,
+     ) -> Option<&mut DynamicVirtualChannel> {
++        // A Create Request reusing an open channel's ID replaces that channel, so it is not counted.
++        let others = || {
++            self.active_channels
++                .iter()
++                .filter(move |(id, _)| **id != channel_id)
++                .map(|(_, dvc)| dvc)
++        };
++        if MAX_ACTIVE_CHANNELS <= others().count()
++            || MAX_CHANNELS_PER_NAME <= others().filter(|dvc| dvc.channel_name() == name.as_str()).count()
++        {
++            debug!(channel_id, channel_name = %name, "Too many open dynamic channels; declining");
++            return None;
++        }
+         let entry = self.listeners.get_mut(name)?;
+         let dvc = match entry.listener.create(channel_id) {
+-            Some(processor) => DynamicVirtualChannel::from_boxed(processor),
++            Some(processor) => DynamicVirtualChannel::from_boxed(processor, self.default_max_message_size),
+             None => entry.closed.take()?,
+         };
+ 
+@@ -945,7 +984,11 @@ impl DynamicChannelSet {
+             if let Some(id) = dvc.channel_id.take() {
+                 dvc.channel_processor.close(id);
+             }
+-            dvc.complete_data = CompleteData::new(dvc.channel_processor.max_message_size());
++            dvc.complete_data = CompleteData::new(
++                dvc.channel_processor
++                    .max_message_size()
++                    .or(self.default_max_message_size),
++            );
+             entry.closed = Some(dvc);
+         }
+         true
+diff --git a/crates/ironrdp-dvc/tests/client_limits.rs b/crates/ironrdp-dvc/tests/client_limits.rs
+new file mode 100644
+index 0000000..3250e6c
+--- /dev/null
++++ b/crates/ironrdp-dvc/tests/client_limits.rs
+@@ -0,0 +1,277 @@
++//! Client limits on open dynamic channels and on the messages of channels without a limit of their own.
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::cell::Cell;
++
++use ironrdp_bulk as _;
++use ironrdp_core::{Decode as _, ReadCursor, encode_vec};
++use ironrdp_dvc::pdu::{
++    ClosePdu, CreateRequestPdu, CreationStatus, DataFirstPdu, DataPdu, DrdynvcClientPdu, DrdynvcDataPdu,
++    DrdynvcServerPdu,
++};
++use ironrdp_dvc::{
++    DrdynvcClient, DvcClientProcessor, DvcMessage, DvcProcessor, MAX_ACTIVE_CHANNELS, MAX_CHANNELS_PER_NAME,
++};
++use ironrdp_pdu::PduResult;
++use ironrdp_svc::SvcProcessor as _;
++use tracing as _;
++
++/// Counts the bytes each thread holds, so tests running in parallel do not disturb each other.
++struct CountingAllocator;
++
++thread_local! {
++    static HELD: Cell<isize> = const { Cell::new(0) };
++}
++
++fn track(delta: isize) {
++    let _ = HELD.try_with(|held| held.set(held.get() + delta));
++}
++
++// SAFETY: Forwards to the system allocator and only counts.
++unsafe impl GlobalAlloc for CountingAllocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            track(layout.size().cast_signed());
++        }
++        ptr
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            track(layout.size().cast_signed());
++        }
++        ptr
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: Same contract as the caller's.
++        unsafe { System.dealloc(ptr, layout) };
++        track(-layout.size().cast_signed());
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new_ptr.is_null() {
++            track(new_size.cast_signed() - layout.size().cast_signed());
++        }
++        new_ptr
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: CountingAllocator = CountingAllocator;
++
++fn held() -> isize {
++    HELD.with(Cell::get)
++}
++
++struct Sink {
++    name: &'static str,
++    limit: Option<usize>,
++}
++
++ironrdp_core::impl_as_any!(Sink);
++
++impl DvcProcessor for Sink {
++    fn channel_name(&self) -> &str {
++        self.name
++    }
++
++    fn max_message_size(&self) -> Option<usize> {
++        self.limit
++    }
++
++    fn start(&mut self, _: u32) -> PduResult<Vec<DvcMessage>> {
++        Ok(Vec::new())
++    }
++
++    fn process(&mut self, _: u32, _: &[u8]) -> PduResult<Vec<DvcMessage>> {
++        Ok(Vec::new())
++    }
++}
++
++impl DvcClientProcessor for Sink {}
++
++const NAME: &str = "test::factory";
++
++fn names() -> impl Iterator<Item = &'static str> {
++    (0..64).map(|i| &*Box::leak(format!("test::factory{i}").into_boxed_str()))
++}
++
++fn factory_client() -> DrdynvcClient {
++    DrdynvcClient::new().with_dynamic_channel_factory(NAME, || Sink {
++        name: NAME,
++        limit: None,
++    })
++}
++
++/// Sends a Create Request and returns the creation status of the client's response.
++fn create(client: &mut DrdynvcClient, channel_id: u32, name: &str) -> CreationStatus {
++    let request = encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(
++        channel_id,
++        name.to_owned(),
++    )))
++    .unwrap();
++    let responses = client.process(&request).unwrap();
++    responses
++        .iter()
++        .find_map(|response| {
++            let bytes = response.encode_unframed_pdu().unwrap();
++            match DrdynvcClientPdu::decode(&mut ReadCursor::new(&bytes)).unwrap() {
++                DrdynvcClientPdu::Create(response) => Some(response.creation_status()),
++                _ => None,
++            }
++        })
++        .expect("a Create Response")
++}
++
++fn close(client: &mut DrdynvcClient, channel_id: u32) {
++    let request = encode_vec(&DrdynvcServerPdu::Close(ClosePdu::new(channel_id))).unwrap();
++    client.process(&request).unwrap();
++}
++
++fn data(client: &mut DrdynvcClient, pdu: DrdynvcDataPdu) -> PduResult<()> {
++    client.process(&encode_vec(&pdu).unwrap()).map(drop)
++}
++
++// oracle: mutant without the per-name limit, off by one at it, or not counting a closed channel back.
++#[test]
++fn a_factory_opens_at_most_two_channels_at_once() {
++    assert_eq!(MAX_CHANNELS_PER_NAME, 2);
++    let mut client = factory_client();
++    assert_eq!(create(&mut client, 1, NAME), CreationStatus::OK);
++    assert_eq!(create(&mut client, 2, NAME), CreationStatus::OK);
++    assert_eq!(create(&mut client, 3, NAME), CreationStatus::NO_LISTENER);
++
++    // Data the server sent on the declined channel is dropped, as for any declined channel.
++    data(&mut client, DrdynvcDataPdu::Data(DataPdu::new(3, vec![1]))).unwrap();
++
++    // A Create Request reusing an open channel's ID replaces it.
++    assert_eq!(create(&mut client, 2, NAME), CreationStatus::OK);
++
++    // Closing a channel makes room for another.
++    close(&mut client, 1);
++    assert_eq!(create(&mut client, 4, NAME), CreationStatus::OK);
++    assert_eq!(create(&mut client, 5, NAME), CreationStatus::NO_LISTENER);
++}
++
++// oracle: mutant without the total limit, or off by one at it.
++#[test]
++fn a_client_opens_at_most_64_channels_at_once() {
++    assert_eq!(MAX_ACTIVE_CHANNELS, 64);
++    let mut client = DrdynvcClient::new();
++    let names: Vec<_> = names().collect();
++    for name in &names {
++        let name: &'static str = name;
++        client = client.with_dynamic_channel_factory(name, move || Sink { name, limit: None });
++    }
++    let mut id = 0;
++    for name in names.iter().take(MAX_ACTIVE_CHANNELS / 2) {
++        for _ in 0..2 {
++            id += 1;
++            assert_eq!(create(&mut client, id, name), CreationStatus::OK, "channel {id}");
++        }
++    }
++    assert_eq!(
++        create(&mut client, 1000, names[MAX_ACTIVE_CHANNELS / 2]),
++        CreationStatus::NO_LISTENER
++    );
++    close(&mut client, 1);
++    assert_eq!(
++        create(&mut client, 1001, names[MAX_ACTIVE_CHANNELS / 2]),
++        CreationStatus::OK
++    );
++}
++
++// oracle: mutant holding a processor for every Create Request of one name.
++#[test]
++fn a_create_request_flood_holds_two_channels() {
++    let mut client = factory_client();
++    assert_eq!(create(&mut client, 1, NAME), CreationStatus::OK);
++    assert_eq!(create(&mut client, 2, NAME), CreationStatus::OK);
++    let start = held();
++    let mut opened = 0;
++    for id in 3..20_003 {
++        opened += usize::from(create(&mut client, id, NAME) == CreationStatus::OK);
++    }
++    let grown = held() - start;
++    println!("held after 20000 more Create Requests: {grown} B");
++    assert_eq!(opened, 0);
++    // Only the remembered declines (64 at most) remain.
++    assert!(grown <= 16 * 1024, "held {grown} more bytes");
++}
++
++// oracle: mutant ignoring the default limit, or letting it override a processor's own limit.
++#[test]
++fn the_default_limit_bounds_channels_without_their_own() {
++    const LIMIT: usize = 4096;
++    let mut client = DrdynvcClient::new()
++        .with_default_max_message_size(LIMIT)
++        .with_dynamic_channel_factory(NAME, || Sink {
++            name: NAME,
++            limit: None,
++        })
++        .with_dynamic_channel_factory("test::own", || Sink {
++            name: "test::own",
++            limit: Some(4 * LIMIT),
++        });
++    assert_eq!(create(&mut client, 1, NAME), CreationStatus::OK);
++    assert_eq!(create(&mut client, 2, "test::own"), CreationStatus::OK);
++
++    // At the limit, a fragmented message is accepted.
++    data(
++        &mut client,
++        DrdynvcDataPdu::DataFirst(DataFirstPdu::new(1, u32::try_from(LIMIT).unwrap(), vec![0; 1000])),
++    )
++    .unwrap();
++    data(
++        &mut client,
++        DrdynvcDataPdu::Data(DataPdu::new(1, vec![0; LIMIT - 1000])),
++    )
++    .unwrap();
++    // One byte over, it fails the channel.
++    let over = DataFirstPdu::new(1, u32::try_from(LIMIT + 1).unwrap(), vec![0; 1000]);
++    assert!(data(&mut client, DrdynvcDataPdu::DataFirst(over)).is_err());
++
++    // A processor's own limit is kept.
++    let own = DataFirstPdu::new(2, u32::try_from(4 * LIMIT).unwrap(), vec![0; 1000]);
++    data(&mut client, DrdynvcDataPdu::DataFirst(own)).unwrap();
++
++    // Without a default, the processor without a limit takes any declared length.
++    let mut client = factory_client();
++    assert_eq!(create(&mut client, 1, NAME), CreationStatus::OK);
++    data(
++        &mut client,
++        DrdynvcDataPdu::DataFirst(DataFirstPdu::new(1, u32::MAX, vec![0; 1000])),
++    )
++    .unwrap();
++}
++
++// oracle: mutant retaining a message declared over the default limit.
++#[test]
++fn a_message_declared_over_the_default_limit_holds_nothing() {
++    let mut client = DrdynvcClient::new()
++        .with_default_max_message_size(1024 * 1024)
++        .with_dynamic_channel_factory(NAME, || Sink {
++            name: NAME,
++            limit: None,
++        });
++    assert_eq!(create(&mut client, 1, NAME), CreationStatus::OK);
++    let pdu = encode_vec(&DrdynvcDataPdu::DataFirst(DataFirstPdu::new(
++        1,
++        u32::MAX,
++        vec![0; 1500],
++    )))
++    .unwrap();
++    let start = held();
++    let result = client.process(&pdu).map(drop);
++    let grown = held() - start;
++    assert!(result.is_err());
++    drop(result);
++    assert!(grown <= 1024, "held {grown} bytes");
++}
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index 746b3dd..4a32273 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -2064,11 +2064,20 @@ impl GraphicsPipelineClient {
+ 
+ impl_as_any!(GraphicsPipelineClient);
+ 
++/// The largest reassembled graphics pipeline message a client accepts, before ZGFX decompression.
++///
++/// An H.264 frame at 4K is a few megabytes; a message over this ends the session.
++pub const CLIENT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
++
+ impl DvcProcessor for GraphicsPipelineClient {
+     fn channel_name(&self) -> &str {
+         CHANNEL_NAME
+     }
+ 
++    fn max_message_size(&self) -> Option<usize> {
++        Some(CLIENT_MAX_MESSAGE_SIZE)
++    }
++
+     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+         self.state = ClientState::WaitingForConfirm;
+         if let Some(decoder) = self.h264_decoder.as_mut()
+diff --git a/crates/ironrdp-rdpdr/src/lib.rs b/crates/ironrdp-rdpdr/src/lib.rs
+index ba6f187..a3588f8 100644
+--- a/crates/ironrdp-rdpdr/src/lib.rs
++++ b/crates/ironrdp-rdpdr/src/lib.rs
+@@ -34,6 +34,10 @@ pub use self::backend::{
+ use crate::pdu::efs::ServerDriveIoRequest;
+ 
+ const MAX_PRINTER_WRITE_BYTES: u32 = 16 * 1024 * 1024;
++/// The largest device redirection message a client accepts: a printer write and its headers.
++///
++/// A message over this ends the session.
++pub const CLIENT_MAX_MESSAGE_SIZE: usize = MAX_PRINTER_WRITE_BYTES as usize + 1024 * 1024;
+ /// Largest `CachedPrinterConfigData` blob persisted from the server.
+ ///
+ /// Printer configuration is a driver DEVMODE and private data, usually a few kilobytes.
+@@ -1274,6 +1278,10 @@ impl SvcProcessor for Rdpdr {
+         Self::NAME
+     }
+ 
++    fn max_message_size(&self) -> Option<usize> {
++        Some(CLIENT_MAX_MESSAGE_SIZE)
++    }
++
+     fn compression_condition(&self) -> CompressionCondition {
+         CompressionCondition::WhenRdpDataIsCompressed
+     }
+diff --git a/crates/ironrdp-rdpsnd/src/client.rs b/crates/ironrdp-rdpsnd/src/client.rs
+index ab62dde..d701b02 100644
+--- a/crates/ironrdp-rdpsnd/src/client.rs
++++ b/crates/ironrdp-rdpsnd/src/client.rs
+@@ -822,11 +822,20 @@ impl Rdpsnd {
+ 
+ impl_as_any!(Rdpsnd);
+ 
++/// The largest audio output message a client accepts, on the static or a dynamic channel.
++///
++/// A Wave PDU carries at most 64 KiB and a format list a few KiB; a message over this ends the session.
++pub const CLIENT_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
++
+ impl SvcProcessor for Rdpsnd {
+     fn channel_name(&self) -> ChannelName {
+         Self::NAME
+     }
+ 
++    fn max_message_size(&self) -> Option<usize> {
++        Some(CLIENT_MAX_MESSAGE_SIZE)
++    }
++
+     fn compression_condition(&self) -> CompressionCondition {
+         CompressionCondition::Never
+     }
+@@ -931,6 +940,10 @@ impl DvcProcessor for RdpsndDvc {
+         self.name()
+     }
+ 
++    fn max_message_size(&self) -> Option<usize> {
++        Some(CLIENT_MAX_MESSAGE_SIZE)
++    }
++
+     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+         debug!(channel_id, channel_name = self.name(), "Audio output channel started");
+         if !self.lossy {
+diff --git a/crates/ironrdp-svc/src/lib.rs b/crates/ironrdp-svc/src/lib.rs
+index bbb4693..ec222ab 100644
+--- a/crates/ironrdp-svc/src/lib.rs
++++ b/crates/ironrdp-svc/src/lib.rs
+@@ -40,6 +40,22 @@ pub type StaticChannelId = u16;
+ /// The maximum number of optional static virtual channels negotiated in one RDP session.
+ pub const MAX_STATIC_CHANNELS: usize = 31;
+ 
++/// The message limit a client applies to each static channel whose processor sets none.
++pub const DEFAULT_CLIENT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
++
++/// The leading bytes of a discarded oversized message handed to [`SvcProcessor::process_oversized`].
++pub const OVERSIZED_MESSAGE_PREFIX_LENGTH: usize = 64;
++
++/// What a static channel does with a message over its [`SvcProcessor::max_message_size`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum OversizedMessagePolicy {
++    /// [`StaticVirtualChannel::process`] fails at the first fragment over the limit.
++    Fail,
++    /// The fragments are still validated but only the first [`OVERSIZED_MESSAGE_PREFIX_LENGTH`] bytes are kept,
++    /// and the terminal fragment calls [`SvcProcessor::process_oversized`] once.
++    Discard,
++}
++
+ /// SVC data to be sent to the server. See [`SvcMessage`] for more information.
+ /// Usually returned by the channel-specific methods.
+ pub struct SvcProcessorMessages<P: SvcProcessor> {
+@@ -145,6 +161,8 @@ impl StaticVirtualChannel {
+     pub fn new<T: SvcProcessor + 'static>(channel_processor: T) -> Self {
+         let mut chunk_processor = ChunkProcessor::new();
+         chunk_processor.max_message_size = channel_processor.max_message_size();
++        chunk_processor.discard_oversized =
++            channel_processor.oversized_message_policy() == OversizedMessagePolicy::Discard;
+         Self {
+             channel_processor: Box::new(channel_processor),
+             chunk_processor,
+@@ -177,15 +195,20 @@ impl StaticVirtualChannel {
+     /// to the server. If no PDUs are to be sent, an empty vector is returned.
+     pub fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+         let context = self.channel_processor.message_context();
+-        if let Some((context, payload)) = self
++        match self
+             .chunk_processor
+             .dechunkify(context, payload)
+             .map_err(|e| decode_err!(e))?
+         {
+-            return self.channel_processor.process_with_context(context, &payload);
++            Some(Dechunked::Complete(context, payload)) => {
++                self.channel_processor.process_with_context(context, &payload)
++            }
++            Some(Dechunked::Oversized {
++                prefix,
++                declared_length,
++            }) => self.channel_processor.process_oversized(&prefix, declared_length),
++            None => Ok(Vec::new()),
+         }
+-
+-        Ok(Vec::new())
+     }
+ 
+     pub fn chunkify(messages: Vec<SvcMessage>) -> EncodeResult<Vec<WriteBuf>> {
+@@ -323,6 +346,23 @@ pub trait SvcProcessor: AsAny + fmt::Debug + Send {
+         None
+     }
+ 
++    /// Chooses how a message over [`Self::max_message_size`] is handled. Captured with the limit.
++    /// The default fails the channel, as for a channel without a policy.
++    fn oversized_message_policy(&self) -> OversizedMessagePolicy {
++        OversizedMessagePolicy::Fail
++    }
++
++    /// Handles a message discarded under [`OversizedMessagePolicy::Discard`], given its first
++    /// [`OVERSIZED_MESSAGE_PREFIX_LENGTH`] bytes (fewer if the message is shorter) and its declared length.
++    /// Called once, at the terminal fragment, and only for an unchanged [`Self::message_context`].
++    ///
++    /// Returns a list of PDUs to be sent back. The default fails the channel.
++    fn process_oversized(&mut self, _prefix: &[u8], _declared_length: usize) -> PduResult<Vec<SvcMessage>> {
++        Err(ironrdp_pdu::pdu_other_err!(
++            "static channel message exceeds configured maximum size"
++        ))
++    }
++
+     /// Identifies the current recipient of a message, or returns `None` to discard incoming data.
+     /// Any change permanently discards the in-flight message, even if the original value returns.
+     /// Discarded fragments still undergo [3.1.5.2.2.1] Reassembly of Chunked Virtual Channel Data validation.
+@@ -367,10 +407,27 @@ pub trait SvcServerProcessor: SvcProcessor {}
+ 
+ assert_obj_safe!(SvcServerProcessor);
+ 
++/// A message [`ChunkProcessor::dechunkify`] finished.
++#[derive(Debug)]
++enum Dechunked {
++    Complete(u64, Vec<u8>),
++    /// A message over the limit, discarded under [`OversizedMessagePolicy::Discard`].
++    Oversized {
++        prefix: Vec<u8>,
++        declared_length: usize,
++    },
++}
++
+ /// ChunkProcessor is used to chunkify/de-chunkify static virtual channel PDUs.
+ #[derive(Debug)]
+ struct ChunkProcessor {
+     max_message_size: Option<usize>,
++    /// Whether a sequence declared over `max_message_size` is discarded rather than failed.
++    discard_oversized: bool,
++    /// Whether the current sequence is being discarded for exceeding `max_message_size`.
++    ///
++    /// INVARIANT: While set, `chunked_pdu` holds at most [`OVERSIZED_MESSAGE_PREFIX_LENGTH`] bytes.
++    oversized: bool,
+     /// Buffer for de-chunkification of clipboard PDUs. Everything bigger than ~1600 bytes is
+     /// usually chunked when transferred over svc.
+     chunked_pdu: Vec<u8>,
+@@ -391,6 +448,8 @@ impl ChunkProcessor {
+     fn new() -> Self {
+         Self {
+             max_message_size: None,
++            discard_oversized: false,
++            oversized: false,
+             chunked_pdu: Vec::new(),
+             expected_length: None,
+             received_length: 0,
+@@ -422,7 +481,7 @@ impl ChunkProcessor {
+     /// Returns `None` until complete, or when discarding an invalidated context.
+     ///
+     /// [3.1.5.2.2.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a542bf19-1c86-4c80-ab3e-61449653abf6
+-    fn dechunkify(&mut self, context: Option<u64>, payload: &[u8]) -> DecodeResult<Option<(u64, Vec<u8>)>> {
++    fn dechunkify(&mut self, context: Option<u64>, payload: &[u8]) -> DecodeResult<Option<Dechunked>> {
+         let mut cursor = ReadCursor::new(payload);
+         let header: ironrdp_pdu::rdp::vc::ChannelPduHeader = decode_cursor(&mut cursor)?;
+         let chunk = cursor.remaining();
+@@ -431,10 +490,10 @@ impl ChunkProcessor {
+         let first = header.flags.contains(ChannelControlFlags::FLAG_FIRST);
+         let last = header.flags.contains(ChannelControlFlags::FLAG_LAST);
+ 
+-        if self
+-            .max_message_size
+-            .is_some_and(|limit| limit < expected_length || limit < chunk.len())
+-        {
++        // Under the discard policy, a sequence declared over the limit is validated without being kept.
++        let declared_over_limit = self.max_message_size.is_some_and(|limit| limit < expected_length);
++        let discards = declared_over_limit && self.discard_oversized && (first || self.oversized);
++        if self.max_message_size.is_some_and(|limit| limit < chunk.len()) || (declared_over_limit && !discards) {
+             self.clear_sequence();
+             return Err(ironrdp_core::invalid_field_err!(
+                 "length",
+@@ -452,7 +511,7 @@ impl ChunkProcessor {
+                 ));
+             }
+ 
+-            return Ok(context.map(|context| (context, chunk.to_vec())));
++            return Ok(context.map(|context| Dechunked::Complete(context, chunk.to_vec())));
+         }
+ 
+         if first {
+@@ -467,6 +526,10 @@ impl ChunkProcessor {
+ 
+             self.expected_length = Some(expected_length);
+             self.message_context = context;
++            if discards {
++                self.oversized = true;
++                self.chunked_pdu = Vec::with_capacity(OVERSIZED_MESSAGE_PREFIX_LENGTH);
++            }
+         } else if self.expected_length != Some(expected_length) {
+             self.clear_sequence();
+             return Err(ironrdp_core::invalid_field_err!(
+@@ -484,7 +547,7 @@ impl ChunkProcessor {
+                 in: cursor
+             ));
+         };
+-        if self.max_message_size.is_some_and(|limit| limit < received_length) {
++        if !self.oversized && self.max_message_size.is_some_and(|limit| limit < received_length) {
+             self.clear_sequence();
+             return Err(ironrdp_core::invalid_field_err!(
+                 "length",
+@@ -506,7 +569,12 @@ impl ChunkProcessor {
+             self.discard_partial_message();
+         }
+         if self.message_context.is_some() {
+-            self.chunked_pdu.extend_from_slice(chunk);
++            if self.oversized {
++                let kept = OVERSIZED_MESSAGE_PREFIX_LENGTH.saturating_sub(self.chunked_pdu.len());
++                self.chunked_pdu.extend_from_slice(&chunk[..kept.min(chunk.len())]);
++            } else {
++                self.chunked_pdu.extend_from_slice(chunk);
++            }
+         }
+ 
+         if !last {
+@@ -532,10 +600,18 @@ impl ChunkProcessor {
+ 
+         self.expected_length = None;
+         self.received_length = 0;
+-        Ok(self
+-            .message_context
+-            .take()
+-            .map(|context| (context, core::mem::take(&mut self.chunked_pdu))))
++        let oversized = core::mem::take(&mut self.oversized);
++        Ok(self.message_context.take().map(|context| {
++            let payload = core::mem::take(&mut self.chunked_pdu);
++            if oversized {
++                Dechunked::Oversized {
++                    prefix: payload,
++                    declared_length: sequence_length,
++                }
++            } else {
++                Dechunked::Complete(context, payload)
++            }
++        }))
+     }
+ 
+     fn discard_partial_message(&mut self) {
+@@ -547,6 +623,7 @@ impl ChunkProcessor {
+ 
+     fn clear_sequence(&mut self) {
+         self.discard_partial_message();
++        self.oversized = false;
+         self.expected_length = None;
+         self.received_length = 0;
+     }
+diff --git a/crates/ironrdp-svc/tests/oversized_messages.rs b/crates/ironrdp-svc/tests/oversized_messages.rs
+new file mode 100644
+index 0000000..085e7b2
+--- /dev/null
++++ b/crates/ironrdp-svc/tests/oversized_messages.rs
+@@ -0,0 +1,292 @@
++//! Static channel messages over the size limit under the discard and fail policies.
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::cell::Cell;
++
++use bitflags as _;
++use ironrdp_pdu::PduResult;
++use ironrdp_pdu::gcc::ChannelName;
++use ironrdp_svc::{
++    OVERSIZED_MESSAGE_PREFIX_LENGTH, OversizedMessagePolicy, StaticVirtualChannel, SvcMessage, SvcProcessor,
++};
++
++/// Counts the bytes each thread holds, so tests running in parallel do not disturb each other.
++struct CountingAllocator;
++
++thread_local! {
++    static HELD: Cell<isize> = const { Cell::new(0) };
++}
++
++fn track(delta: isize) {
++    let _ = HELD.try_with(|held| held.set(held.get() + delta));
++}
++
++// SAFETY: Forwards to the system allocator and only counts.
++unsafe impl GlobalAlloc for CountingAllocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            track(layout.size().cast_signed());
++        }
++        ptr
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            track(layout.size().cast_signed());
++        }
++        ptr
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: Same contract as the caller's.
++        unsafe { System.dealloc(ptr, layout) };
++        track(-layout.size().cast_signed());
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: Same contract as the caller's.
++        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new_ptr.is_null() {
++            track(new_size.cast_signed() - layout.size().cast_signed());
++        }
++        new_ptr
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: CountingAllocator = CountingAllocator;
++
++fn held() -> isize {
++    HELD.with(Cell::get)
++}
++
++const FIRST: u32 = 1;
++const LAST: u32 = 2;
++const CHUNK: usize = 16 * 1024;
++const MIB: usize = 1024 * 1024;
++
++#[derive(Debug)]
++struct Recorder {
++    limit: Option<usize>,
++    policy: OversizedMessagePolicy,
++    context: Option<u64>,
++    messages: Vec<Vec<u8>>,
++    oversized: Vec<(Vec<u8>, usize)>,
++}
++
++ironrdp_core::impl_as_any!(Recorder);
++
++impl SvcProcessor for Recorder {
++    fn channel_name(&self) -> ChannelName {
++        ChannelName::from_static(b"testovr\0")
++    }
++
++    fn max_message_size(&self) -> Option<usize> {
++        self.limit
++    }
++
++    fn oversized_message_policy(&self) -> OversizedMessagePolicy {
++        self.policy
++    }
++
++    fn message_context(&self) -> Option<u64> {
++        self.context
++    }
++
++    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
++        self.messages.push(payload.to_vec());
++        Ok(Vec::new())
++    }
++
++    fn process_oversized(&mut self, prefix: &[u8], declared_length: usize) -> PduResult<Vec<SvcMessage>> {
++        self.oversized.push((prefix.to_vec(), declared_length));
++        Ok(vec![SvcMessage::from(vec![0xee])])
++    }
++}
++
++fn new_channel(limit: usize, policy: OversizedMessagePolicy) -> StaticVirtualChannel {
++    StaticVirtualChannel::new(Recorder {
++        limit: Some(limit),
++        policy,
++        context: Some(0),
++        messages: Vec::new(),
++        oversized: Vec::new(),
++    })
++}
++
++fn recorder_of(channel: &StaticVirtualChannel) -> &Recorder {
++    channel.channel_processor_downcast_ref().expect("recorder")
++}
++
++fn frame(length: u32, flags: u32, data: &[u8]) -> Vec<u8> {
++    let mut bytes = length.to_le_bytes().to_vec();
++    bytes.extend_from_slice(&flags.to_le_bytes());
++    bytes.extend_from_slice(data);
++    bytes
++}
++
++fn pattern(offset: usize, length: usize) -> Vec<u8> {
++    (offset..offset + length).map(|i| (i % 251) as u8).collect()
++}
++
++/// What the channel answered to a stream of fragments.
++#[derive(Debug, Default)]
++struct Streamed {
++    /// Fragments answered with no reply.
++    silent: usize,
++    /// The replies to the last fragment.
++    last_replies: usize,
++    failed: bool,
++    /// The most bytes held after any fragment, beyond those held before the first.
++    peak: isize,
++}
++
++/// Sends `total` bytes declared as `declared`, in `CHUNK` fragments, stopping at the first failure and before
++/// the terminal fragment unless `finish`.
++fn stream(channel: &mut StaticVirtualChannel, declared: u32, total: usize, finish: bool) -> Streamed {
++    let mut streamed = Streamed::default();
++    // One reused buffer, so the fragments themselves are not counted as held.
++    let mut buffer = Vec::with_capacity(8 + CHUNK);
++    let start = held();
++    let mut offset = 0;
++    while offset < total {
++        let length = CHUNK.min(total - offset);
++        let mut flags = 0;
++        if offset == 0 {
++            flags |= FIRST;
++        }
++        if finish && offset + length == total {
++            flags |= LAST;
++        }
++        buffer.clear();
++        buffer.extend_from_slice(&declared.to_le_bytes());
++        buffer.extend_from_slice(&flags.to_le_bytes());
++        buffer.extend((offset..offset + length).map(|i| (i % 251) as u8));
++        let result = channel.process(&buffer);
++        streamed.peak = streamed.peak.max(held() - start);
++        offset += length;
++        match result {
++            Ok(replies) if offset == total => streamed.last_replies = replies.len(),
++            Ok(replies) => {
++                assert!(replies.is_empty());
++                streamed.silent += 1;
++            }
++            Err(_) => {
++                streamed.failed = true;
++                break;
++            }
++        }
++    }
++    streamed
++}
++
++// oracle: mutant keeping the payload of a discarded message, not handing over its first bytes, or not calling
++// process_oversized once at the terminal fragment.
++#[test]
++fn discarded_message_keeps_only_its_first_bytes_and_is_reported_once() {
++    let mut channel = new_channel(MIB, OversizedMessagePolicy::Discard);
++    let total = 8 * MIB;
++    let streamed = stream(&mut channel, u32::try_from(total).unwrap(), total, true);
++
++    assert!(streamed.peak <= 1024, "held {} bytes while discarding", streamed.peak);
++    assert!(!streamed.failed);
++    assert_eq!(streamed.silent, total / CHUNK - 1);
++    assert_eq!(streamed.last_replies, 1, "the reply of process_oversized");
++    let recorder = recorder_of(&channel);
++    assert!(recorder.messages.is_empty());
++    assert_eq!(
++        recorder.oversized,
++        [(pattern(0, OVERSIZED_MESSAGE_PREFIX_LENGTH), total)]
++    );
++
++    // A following message within the limit is delivered whole.
++    let message = pattern(7, 100);
++    let replies = channel.process(&frame(100, FIRST | LAST, &message)).unwrap();
++    assert!(replies.is_empty());
++    assert_eq!(recorder_of(&channel).messages, [message]);
++    assert_eq!(recorder_of(&channel).oversized.len(), 1);
++}
++
++// oracle: mutant retaining the fragments of a sequence declared far over the limit.
++#[test]
++fn discarding_a_4gib_declaration_holds_no_payload() {
++    let mut channel = new_channel(16 * MIB, OversizedMessagePolicy::Discard);
++    let streamed = stream(&mut channel, u32::MAX, 64 * MIB, false);
++    assert!(!streamed.failed);
++    assert_eq!(streamed.last_replies, 0);
++    assert!(streamed.peak <= 1024, "held {} bytes while discarding", streamed.peak);
++}
++
++// oracle: mutant off by one at the limit.
++#[test]
++fn a_message_at_the_limit_is_delivered_and_one_byte_over_is_discarded() {
++    let limit = 4 * CHUNK;
++    let mut channel = new_channel(limit, OversizedMessagePolicy::Discard);
++    let streamed = stream(&mut channel, u32::try_from(limit).unwrap(), limit, true);
++    assert!(!streamed.failed);
++    assert_eq!(streamed.last_replies, 0);
++    assert_eq!(recorder_of(&channel).messages, [pattern(0, limit)]);
++
++    let streamed = stream(&mut channel, u32::try_from(limit + 1).unwrap(), limit + 1, true);
++    assert!(!streamed.failed);
++    assert_eq!(streamed.last_replies, 1);
++    assert_eq!(recorder_of(&channel).messages.len(), 1);
++    assert_eq!(recorder_of(&channel).oversized, [(pattern(0, 64), limit + 1)]);
++}
++
++// oracle: mutant failing or keeping fragments under the default policy.
++#[test]
++fn the_fail_policy_rejects_the_first_fragment_and_keeps_nothing() {
++    let mut channel = new_channel(16 * MIB, OversizedMessagePolicy::Fail);
++    let streamed = stream(&mut channel, u32::MAX, 64 * MIB, false);
++    assert!(streamed.failed);
++    assert_eq!(streamed.silent, 0, "fails at the first fragment");
++    assert!(streamed.peak <= 1024, "held {} bytes after failing", streamed.peak);
++    assert!(recorder_of(&channel).oversized.is_empty());
++}
++
++// oracle: mutant reporting a discarded message to a recipient that replaced the original one.
++#[test]
++fn a_changed_recipient_gets_no_oversized_report() {
++    let mut channel = new_channel(CHUNK, OversizedMessagePolicy::Discard);
++    channel
++        .process(&frame(u32::try_from(3 * CHUNK).unwrap(), FIRST, &pattern(0, CHUNK)))
++        .unwrap();
++    channel.channel_processor_downcast_mut::<Recorder>().unwrap().context = Some(1);
++    channel
++        .process(&frame(u32::try_from(3 * CHUNK).unwrap(), 0, &pattern(0, CHUNK)))
++        .unwrap();
++    let replies = channel
++        .process(&frame(u32::try_from(3 * CHUNK).unwrap(), LAST, &pattern(0, CHUNK)))
++        .unwrap();
++    assert!(replies.is_empty());
++    assert!(recorder_of(&channel).oversized.is_empty());
++}
++
++// oracle: mutant skipping fragment validation while discarding.
++#[test]
++fn discarded_fragments_are_still_validated() {
++    let declared = u32::try_from(3 * CHUNK).unwrap();
++
++    let mut channel = new_channel(CHUNK, OversizedMessagePolicy::Discard);
++    channel.process(&frame(declared, FIRST, &pattern(0, CHUNK))).unwrap();
++    assert!(channel.process(&frame(declared + 1, 0, &pattern(0, CHUNK))).is_err());
++
++    let mut channel = new_channel(CHUNK, OversizedMessagePolicy::Discard);
++    channel.process(&frame(declared, FIRST, &pattern(0, CHUNK))).unwrap();
++    channel.process(&frame(declared, 0, &pattern(0, CHUNK))).unwrap();
++    channel.process(&frame(declared, 0, &pattern(0, CHUNK))).unwrap();
++    // A fragment past the declared length fails before the terminal one.
++    assert!(channel.process(&frame(declared, 0, &pattern(0, 1))).is_err());
++    assert!(recorder_of(&channel).oversized.is_empty());
++
++    // A terminal fragment short of the declared length fails as for a kept message.
++    let mut channel = new_channel(CHUNK, OversizedMessagePolicy::Discard);
++    channel.process(&frame(declared, FIRST, &pattern(0, CHUNK))).unwrap();
++    assert!(channel.process(&frame(declared, LAST, &pattern(0, CHUNK))).is_err());
++    assert!(recorder_of(&channel).oversized.is_empty());
++}
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+index 3ddd854..cd50d18 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+@@ -12,6 +12,7 @@ mod lock_lifecycle;
+ mod lock_strategy;
+ mod lock_timeout;
+ mod loop_detector;
++mod oversized_messages;
+ mod path_sanitization;
+ mod preferred_drop_effect;
+ mod server_role;
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/oversized_messages.rs b/crates/ironrdp-testsuite-core/tests/clipboard/oversized_messages.rs
+new file mode 100644
+index 0000000..62a0c78
+--- /dev/null
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/oversized_messages.rs
+@@ -0,0 +1,252 @@
++//! CLIPRDR messages over [`ironrdp_cliprdr::MAX_MESSAGE_SIZE`] fail only the item they carry.
++
++use std::sync::{Arc, Mutex};
++
++use ironrdp_cliprdr::pdu::{
++    ClipboardFormat, ClipboardFormatId, ClipboardPdu, FileContentsFlags, FileContentsRequest, FileDescriptor,
++    FormatDataResponse, FormatListResponse,
++};
++use ironrdp_cliprdr::{CliprdrClient, MAX_MESSAGE_SIZE};
++use ironrdp_pdu::PduResult;
++use ironrdp_svc::{StaticVirtualChannel, SvcMessage};
++use ironrdp_testsuite_core::clipboard::{
++    FormatDataRecordingBackend, ReceivedResponse, RecordingBackend, init_ready_client_with_backend,
++    set_remote_file_list,
++};
++
++const FORMAT_LIST: u16 = 0x0002;
++const FORMAT_DATA_RESPONSE: u16 = 0x0005;
++const LOCK_CLIPDATA: u16 = 0x000A;
++const FILE_CONTENTS_RESPONSE: u16 = 0x0009;
++const CB_RESPONSE_OK: u16 = 0x0001;
++
++/// A CLIPRDR message with a `body_len` body of `fill` bytes after `body_start`.
++fn message(msg_type: u16, msg_flags: u16, body_start: &[u8], body_len: usize) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(8 + body_len);
++    bytes.extend_from_slice(&msg_type.to_le_bytes());
++    bytes.extend_from_slice(&msg_flags.to_le_bytes());
++    bytes.extend_from_slice(&u32::try_from(body_len).unwrap().to_le_bytes());
++    bytes.extend_from_slice(body_start);
++    bytes.resize(8 + body_len, b'A');
++    bytes
++}
++
++/// Sends `message` over the channel in fragments, as the server does, returning the replies.
++fn send(channel: &mut StaticVirtualChannel, message: &[u8]) -> PduResult<Vec<SvcMessage>> {
++    const CHUNK: usize = 1600;
++    let declared = u32::try_from(message.len()).unwrap();
++    let mut replies = Vec::new();
++    let count = message.len().div_ceil(CHUNK);
++    for (i, chunk) in message.chunks(CHUNK).enumerate() {
++        let mut flags = 0u32;
++        if i == 0 {
++            flags |= 1;
++        }
++        if i + 1 == count {
++            flags |= 2;
++        }
++        let mut fragment = declared.to_le_bytes().to_vec();
++        fragment.extend_from_slice(&flags.to_le_bytes());
++        fragment.extend_from_slice(chunk);
++        replies.extend(channel.process(&fragment)?);
++    }
++    Ok(replies)
++}
++
++fn cliprdr(channel: &mut StaticVirtualChannel) -> &mut CliprdrClient {
++    channel.channel_processor_downcast_mut().unwrap()
++}
++
++fn format_data(channel: &mut StaticVirtualChannel) -> &FormatDataRecordingBackend {
++    cliprdr(channel).downcast_backend().unwrap()
++}
++
++fn text_channel(pastes: usize) -> StaticVirtualChannel {
++    let mut client = init_ready_client_with_backend(Box::new(FormatDataRecordingBackend::default()));
++    for _ in 0..pastes {
++        let _: Vec<_> = client.initiate_paste(ClipboardFormatId::CF_UNICODETEXT).unwrap().into();
++    }
++    StaticVirtualChannel::new(client)
++}
++
++fn text_response(text: &[u8]) -> Vec<u8> {
++    ironrdp_core::encode_vec(&ClipboardPdu::FormatDataResponse(FormatDataResponse::new_data(text))).unwrap()
++}
++
++fn decoded(replies: &[SvcMessage]) -> Vec<String> {
++    replies
++        .iter()
++        .map(|reply| {
++            let bytes = reply.encode_unframed_pdu().unwrap();
++            format!("{:?}", ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap())
++        })
++        .collect()
++}
++
++// oracle: mutant not taking the pending request of an oversized response, shifting later responses onto the
++// wrong request, or delivering the oversized data.
++#[test]
++fn an_oversized_format_data_response_fails_only_its_own_request() {
++    let mut channel = text_channel(3);
++    let oversized = message(FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &[], MAX_MESSAGE_SIZE - 8 + 1);
++    assert!(send(&mut channel, &oversized).unwrap().is_empty());
++    assert!(send(&mut channel, &text_response(b"a\0")).unwrap().is_empty());
++    assert!(send(&mut channel, &text_response(b"b\0")).unwrap().is_empty());
++
++    let seen = format_data(&mut channel);
++    assert_eq!(seen.error_responses, 1);
++    assert_eq!(seen.data_responses, [b"a\0".to_vec(), b"b\0".to_vec()]);
++}
++
++// oracle: mutant classifying a clipboard message at the limit as oversized.
++#[test]
++fn a_format_data_response_at_the_limit_is_delivered() {
++    let mut channel = text_channel(1);
++    let at_limit = message(FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &[], MAX_MESSAGE_SIZE - 8);
++    assert!(send(&mut channel, &at_limit).unwrap().is_empty());
++
++    let seen = format_data(&mut channel);
++    assert_eq!(seen.error_responses, 0);
++    assert_eq!(seen.data_responses.len(), 1);
++    assert_eq!(seen.data_responses[0].len(), MAX_MESSAGE_SIZE - 8);
++}
++
++// oracle: mutant answering the request after the file list's with an oversized response for the file list.
++#[test]
++fn an_oversized_file_list_response_fails_the_file_list_request() {
++    let file_list = ClipboardFormatId::new(49534);
++    let mut client = init_ready_client_with_backend(Box::new(FormatDataRecordingBackend::default()));
++    set_remote_file_list(&mut client, vec![FileDescriptor::new("a.txt").with_file_size(1)]);
++    let _: Vec<_> = client.initiate_paste(file_list).unwrap().into();
++    let _: Vec<_> = client.initiate_paste(ClipboardFormatId::CF_UNICODETEXT).unwrap().into();
++    let mut channel = StaticVirtualChannel::new(client);
++
++    let oversized = message(FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &[], MAX_MESSAGE_SIZE);
++    assert!(send(&mut channel, &oversized).unwrap().is_empty());
++    assert!(send(&mut channel, &text_response(b"t\0")).unwrap().is_empty());
++
++    let seen = format_data(&mut channel);
++    assert_eq!(seen.error_responses, 1);
++    assert_eq!(
++        seen.file_lists.len(),
++        1,
++        "only the file list sent before the oversized response"
++    );
++    assert_eq!(seen.data_responses, [b"t\0".to_vec()]);
++}
++
++// oracle: mutant leaving the oversized response's request pending, so the next response pairs with it.
++#[test]
++fn the_response_after_an_oversized_one_pairs_with_the_next_request() {
++    let file_list = ClipboardFormatId::new(49534);
++    let mut client = init_ready_client_with_backend(Box::new(FormatDataRecordingBackend::default()));
++    set_remote_file_list(&mut client, vec![FileDescriptor::new("a.txt").with_file_size(1)]);
++    let _: Vec<_> = client.initiate_paste(ClipboardFormatId::CF_UNICODETEXT).unwrap().into();
++    let _: Vec<_> = client.initiate_paste(file_list).unwrap().into();
++    let mut channel = StaticVirtualChannel::new(client);
++
++    // The text request is answered over the limit, then the file list request with a file list.
++    let oversized = message(FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, &[], MAX_MESSAGE_SIZE);
++    assert!(send(&mut channel, &oversized).unwrap().is_empty());
++    let list = ironrdp_cliprdr::pdu::PackedFileList {
++        files: vec![FileDescriptor::new("b.txt").with_file_size(2)],
++    };
++    let response = ClipboardPdu::FormatDataResponse(FormatDataResponse::new_file_list(&list).unwrap());
++    assert!(
++        send(&mut channel, &ironrdp_core::encode_vec(&response).unwrap())
++            .unwrap()
++            .is_empty()
++    );
++
++    let seen = format_data(&mut channel);
++    assert_eq!(seen.error_responses, 1);
++    assert!(seen.data_responses.is_empty(), "the file list was taken for the text");
++    assert_eq!(seen.file_lists.len(), 2);
++    assert_eq!(seen.file_lists[1][0].name, "b.txt");
++}
++
++// oracle: mutant failing the channel, or failing a stream other than the oversized response's.
++#[test]
++fn an_oversized_file_contents_response_fails_only_its_stream() {
++    let responses = Arc::new(Mutex::new(Vec::new()));
++    let mut client = init_ready_client_with_backend(Box::new(RecordingBackend {
++        responses: Arc::clone(&responses),
++    }));
++    set_remote_file_list(&mut client, vec![FileDescriptor::new("a.bin").with_file_size(1 << 30)]);
++    for stream_id in [1, 2] {
++        client
++            .request_file_contents(FileContentsRequest {
++                stream_id,
++                index: 0,
++                flags: FileContentsFlags::RANGE,
++                position: 0,
++                requested_size: 1024,
++                data_id: None,
++            })
++            .unwrap();
++    }
++    let mut channel = StaticVirtualChannel::new(client);
++
++    let oversized = message(
++        FILE_CONTENTS_RESPONSE,
++        CB_RESPONSE_OK,
++        &1u32.to_le_bytes(),
++        MAX_MESSAGE_SIZE,
++    );
++    assert!(send(&mut channel, &oversized).unwrap().is_empty());
++    let ok = message(FILE_CONTENTS_RESPONSE, CB_RESPONSE_OK, &2u32.to_le_bytes(), 4 + 16);
++    assert!(send(&mut channel, &ok).unwrap().is_empty());
++
++    let responses = responses.lock().unwrap();
++    let seen: Vec<_> = responses
++        .iter()
++        .map(
++            |ReceivedResponse {
++                 stream_id,
++                 is_error,
++                 data_len,
++             }| (*stream_id, *is_error, *data_len),
++        )
++        .collect();
++    assert_eq!(seen, [(1, true, 0), (2, false, 16)]);
++    assert!(cliprdr(&mut channel).__test_sent_file_contents_requests().is_empty());
++}
++
++// oracle: mutant answering an oversized format list with FormatListResponse::Ok, or not answering it.
++#[test]
++fn an_oversized_format_list_is_rejected() {
++    let mut channel = text_channel(0);
++    let oversized = message(FORMAT_LIST, 0, &[], MAX_MESSAGE_SIZE);
++    let replies = send(&mut channel, &oversized).unwrap();
++    assert_eq!(
++        decoded(&replies),
++        [format!(
++            "{:?}",
++            ClipboardPdu::FormatListResponse(FormatListResponse::Fail)
++        )]
++    );
++
++    // A format list within the limit is still accepted.
++    let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
++    let format_list = ironrdp_core::encode_vec(&ClipboardPdu::FormatList(
++        ironrdp_cliprdr::pdu::FormatList::new_unicode(&formats, true).unwrap(),
++    ))
++    .unwrap();
++    let replies = send(&mut channel, &format_list).unwrap();
++    assert_eq!(
++        decoded(&replies),
++        [format!(
++            "{:?}",
++            ClipboardPdu::FormatListResponse(FormatListResponse::Ok)
++        )]
++    );
++}
++
++// oracle: mutant accepting an oversized message whose item cannot fail alone.
++#[test]
++fn another_oversized_message_fails_the_channel() {
++    let mut channel = text_channel(0);
++    // A Lock Clipboard Data PDU is 4 bytes; one this long is otherwise decoded from its start.
++    let oversized = message(LOCK_CLIPDATA, 0, &[], MAX_MESSAGE_SIZE);
++    assert!(send(&mut channel, &oversized).is_err());
++}
+diff --git a/crates/ironrdp-testsuite-extra/tests/client/remote_guard.rs b/crates/ironrdp-testsuite-extra/tests/client/remote_guard.rs
+index 399a639..a58bae1 100644
+--- a/crates/ironrdp-testsuite-extra/tests/client/remote_guard.rs
++++ b/crates/ironrdp-testsuite-extra/tests/client/remote_guard.rs
+@@ -57,7 +57,8 @@ fn remote_guard_assert_negotiation_and_carrier(connector: &mut ironrdp_connector
+     let carrier = connector
+         .get_static_channel_processor::<DrdynvcClient>()
+         .expect("DRDYNVC processor");
+-    assert_eq!(carrier.max_message_size(), enabled.then_some(1_048_576));
++    // The client bounds DRDYNVC carrier messages with or without RCG, at the RCG limit.
++    assert_eq!(carrier.max_message_size(), Some(1_048_576));
+     for channel_name in [
+         ironrdp::displaycontrol::CHANNEL_NAME,
+         ironrdp::echo::CHANNEL_NAME,
+diff --git a/crates/ironrdp-testsuite-extra/tests/e2e.rs b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+index cc76336..fd2439f 100644
+--- a/crates/ironrdp-testsuite-extra/tests/e2e.rs
++++ b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+@@ -1493,6 +1493,193 @@ async fn the_server_refuses_a_static_channel_message_over_its_limit() {
+     .await;
+ }
+ 
++/// A server static channel that sends its messages once it starts and ignores the client's.
++#[derive(Debug)]
++struct HostileChannel {
++    name: gcc::ChannelName,
++    messages: Vec<Vec<u8>>,
++}
++
++impl_as_any!(HostileChannel);
++
++impl SvcProcessor for HostileChannel {
++    fn channel_name(&self) -> gcc::ChannelName {
++        self.name.clone()
++    }
++
++    fn start(&mut self) -> pdu::PduResult<Vec<SvcMessage>> {
++        Ok(core::mem::take(&mut self.messages)
++            .into_iter()
++            .map(SvcMessage::from)
++            .collect())
++    }
++
++    fn process(&mut self, _: &[u8]) -> pdu::PduResult<Vec<SvcMessage>> {
++        Ok(Vec::new())
++    }
++}
++
++impl SvcServerProcessor for HostileChannel {}
++
++struct HostileChannelFactory(gcc::ChannelName, Vec<Vec<u8>>);
++
++impl StaticChannelFactory for HostileChannelFactory {
++    fn attach(&self, acceptor: &mut Acceptor) {
++        acceptor.attach_static_channel(HostileChannel {
++            name: self.0.clone(),
++            messages: self.1.clone(),
++        });
++    }
++}
++
++/// A CLIPRDR message with a `body_len` body of `b'A'`.
++fn cliprdr_message(msg_type: u16, body_len: usize) -> Vec<u8> {
++    let mut bytes = msg_type.to_le_bytes().to_vec();
++    bytes.extend_from_slice(&1u16.to_le_bytes());
++    bytes.extend_from_slice(&u32::try_from(body_len).unwrap().to_le_bytes());
++    bytes.resize(8 + body_len, b'A');
++    bytes
++}
++
++/// What the client clipboard handed to the app.
++#[derive(Debug, Default)]
++struct ClipboardSeen {
++    data: Vec<usize>,
++    failures: usize,
++}
++
++#[derive(Debug)]
++struct RecordingClipboard(Arc<StdMutex<ClipboardSeen>>);
++
++impl_as_any!(RecordingClipboard);
++
++impl ironrdp::cliprdr::backend::CliprdrBackend for RecordingClipboard {
++    fn temporary_directory(&self) -> &str {
++        ".cliprdr"
++    }
++
++    fn client_capabilities(&self) -> ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags {
++        ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags::empty()
++    }
++
++    fn on_ready(&mut self) {}
++
++    fn on_request_format_list(&mut self) {}
++
++    fn on_process_negotiated_capabilities(&mut self, _: ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags) {}
++
++    fn on_remote_copy(&mut self, _: &[ironrdp::cliprdr::pdu::ClipboardFormat]) {}
++
++    fn on_format_data_request(&mut self, _: ironrdp::cliprdr::pdu::FormatDataRequest) {}
++
++    fn on_format_data_response(&mut self, response: ironrdp::cliprdr::pdu::FormatDataResponse<'_>) {
++        let mut seen = self.0.lock().unwrap();
++        if response.is_error() {
++            seen.failures += 1;
++        } else {
++            seen.data.push(response.data().len());
++        }
++    }
++
++    fn on_file_contents_request(&mut self, _: ironrdp::cliprdr::pdu::FileContentsRequest) {}
++
++    fn on_file_contents_response(&mut self, _: ironrdp::cliprdr::pdu::FileContentsResponse<'_>) {}
++
++    fn on_lock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++
++    fn on_unlock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++}
++
++/// Runs the client session until `done` holds, the session fails, or 30 seconds pass; returns the failure.
++async fn run_session_until(
++    stage: &mut ActiveStage,
++    framed: &mut Framed<TokioStream<TlsStream<TcpStream>>>,
++    done: impl Fn() -> bool,
++) -> Option<String> {
++    let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
++    let deadline = Instant::now() + Duration::from_secs(30);
++    while !done() && Instant::now() < deadline {
++        match tokio::time::timeout(Duration::from_millis(150), framed.read_pdu()).await {
++            Ok(Ok((action, frame))) => match stage.process(&mut image, action, &frame, None) {
++                Ok(outputs) => {
++                    for output in outputs {
++                        if let ActiveStageOutput::ResponseFrame(frame) = output {
++                            let _ = framed.write_all(&frame).await;
++                        }
++                    }
++                }
++                Err(error) => return Some(format!("{error:?}")),
++            },
++            Ok(Err(error)) => return Some(format!("transport: {error:?}")),
++            Err(_) => {}
++        }
++    }
++    None
++}
++
++// oracle: mutant without the CLIPRDR message limit, or failing the session instead of the oversized item.
++#[tokio::test]
++async fn an_oversized_server_clipboard_response_fails_only_its_item() {
++    const CLIPRDR: gcc::ChannelName = gcc::ChannelName::from_static(b"cliprdr\0");
++    // One byte over the client's 64 MiB CLIPRDR limit, then a response within it.
++    let oversized = cliprdr_message(0x0005, ironrdp::cliprdr::MAX_MESSAGE_SIZE - 8 + 1);
++    let next = cliprdr_message(0x0005, 16);
++    let seen = Arc::new(StdMutex::new(ClipboardSeen::default()));
++    let client_seen = Arc::clone(&seen);
++
++    client_server_with_connector(
++        default_client_config(),
++        vec![Box::new(HostileChannelFactory(CLIPRDR, vec![oversized, next]))],
++        None,
++        move |connector| {
++            connector.with_static_channel(ironrdp::cliprdr::CliprdrClient::new(Box::new(RecordingClipboard(
++                client_seen,
++            ))))
++        },
++        move |mut stage, _activation_factory, mut framed, display_tx, _echo_handle| async move {
++            let _display_tx = display_tx;
++            let failure = run_session_until(&mut stage, &mut framed, || {
++                let seen = seen.lock().unwrap();
++                seen.failures + seen.data.len() >= 2
++            })
++            .await;
++            assert_eq!(failure, None, "the session failed");
++            let seen = seen.lock().unwrap();
++            assert_eq!(seen.failures, 1, "the oversized response is not failed");
++            assert_eq!(seen.data, [16], "the next response is not delivered");
++            drop(seen);
++            (stage, framed)
++        },
++    )
++    .await;
++}
++
++// oracle: mutant without the RDPSND message limit, or ending the session for another reason.
++#[tokio::test]
++async fn an_oversized_server_audio_message_ends_the_session() {
++    const RDPSND: gcc::ChannelName = gcc::ChannelName::from_static(b"rdpsnd\0\0");
++    let oversized = vec![0x07; 3 * 1024 * 1024];
++
++    client_server_with_connector(
++        default_client_config(),
++        vec![Box::new(HostileChannelFactory(RDPSND, vec![oversized]))],
++        None,
++        |connector| connector.with_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend))),
++        move |mut stage, _activation_factory, mut framed, display_tx, _echo_handle| async move {
++            let _display_tx = display_tx;
++            let failure = run_session_until(&mut stage, &mut framed, || false)
++                .await
++                .expect("the session went on");
++            assert!(
++                failure.contains("static channel message exceeds configured maximum size"),
++                "the session ended for another reason: {failure}"
++            );
++            (stage, framed)
++        },
++    )
++    .await;
++}
++
+ /// Records how the server's last connection ended: the error's debug form, or empty without one.
+ struct RecordDisconnection(Arc<StdMutex<Option<String>>>);
+ 

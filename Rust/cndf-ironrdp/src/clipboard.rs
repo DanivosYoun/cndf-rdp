@@ -809,6 +809,12 @@ mod real {
                 .offer_remote(Remote::Text(response.data().to_vec()));
         }
 
+        /// A response CLIPRDR dropped for its size answers the oldest paste, which then fails.
+        fn on_format_data_response_oversized(&mut self, declared_length: usize) {
+            lock(&self.0.state).pastes.pop_front();
+            lock(&self.0.jobs.refusals).record(Refusal::Oversized, declared_length as u64);
+        }
+
         fn on_remote_file_list(&mut self, files: &[FileDescriptor], _: Option<u32>) {
             lock(&self.0.state).pastes.pop_front();
             let files = files
@@ -1875,6 +1881,79 @@ mod real {
                     "Clipboard remote data dropped reason=oversized count=1 max_length={}",
                     MAX_REMOTE_CLIPBOARD_BYTES + std::mem::size_of::<(String, u64)>()
                 )
+            );
+        }
+
+        // oracle: mutant leaving the oversized response's paste queued, shifting the next response
+        // onto it, or logging the server data instead of the declared length.
+        #[test]
+        fn oversized_server_responses_fail_their_paste_and_log_the_declared_length() {
+            /// One byte over the CLIPRDR message limit, CLIPRDR header included.
+            const DECLARED: usize = 64 * 1024 * 1024 + 1;
+
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            let capabilities = ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                ClipboardProtocolVersion::V2,
+                Capabilities::USE_LONG_FORMAT_NAMES,
+            ));
+            let ready = ClipboardPdu::FormatListResponse(FormatListResponse::Ok);
+            for pdu in [capabilities, ready] {
+                cliprdr
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap();
+            }
+            // The server copies twice and the app pastes each copy.
+            for _ in 0..2 {
+                let copy = ClipboardPdu::FormatList(
+                    FormatList::new_unicode(&[text_format()], true).unwrap(),
+                );
+                cliprdr
+                    .process(&ironrdp_core::encode_vec(&copy).unwrap())
+                    .unwrap();
+                let Ok(RdpInputEvent::Clipboard(Message::SendInitiatePaste(id))) =
+                    ordered.try_recv()
+                else {
+                    panic!("expected a paste");
+                };
+                cliprdr.initiate_paste(id).unwrap();
+            }
+
+            // The server answers the first paste with text over the limit, in fragments.
+            let mut svc = ironrdp_svc::StaticVirtualChannel::new(cliprdr);
+            let declared = u32::try_from(DECLARED).unwrap();
+            let mut message = vec![0x05, 0x00, 0x01, 0x00];
+            message.extend_from_slice(&(declared - 8).to_le_bytes());
+            message.resize(DECLARED, b'A');
+            let count = message.len().div_ceil(1600);
+            for (i, chunk) in message.chunks(1600).enumerate() {
+                let flags = u32::from(i == 0) | (u32::from(i + 1 == count) << 1);
+                let mut fragment = declared.to_le_bytes().to_vec();
+                fragment.extend_from_slice(&flags.to_le_bytes());
+                fragment.extend_from_slice(chunk);
+                assert!(svc.process(&fragment).unwrap().is_empty());
+            }
+            drop(message);
+            // The second answer goes to the second paste.
+            let pdu =
+                ClipboardPdu::FormatDataResponse(FormatDataResponse::new_data(utf16("after")));
+            let pdu = ironrdp_core::encode_vec(&pdu).unwrap();
+            let mut fragment = u32::try_from(pdu.len()).unwrap().to_le_bytes().to_vec();
+            fragment.extend_from_slice(&3u32.to_le_bytes());
+            fragment.extend_from_slice(&pdu);
+            assert!(svc.process(&fragment).unwrap().is_empty());
+
+            assert!(lock(&channel.state).pastes.is_empty());
+            channel.jobs.flush(&connection);
+            assert_eq!(delivered.texts, ["after"]);
+            assert_eq!(
+                delivered.logs,
+                [format!(
+                    "Clipboard remote data dropped reason=oversized count=1 max_length={DECLARED}"
+                )]
             );
         }
 
