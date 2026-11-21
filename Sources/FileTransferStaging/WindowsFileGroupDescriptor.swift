@@ -6,6 +6,10 @@ public enum WindowsFileGroupDescriptor {
     private static let fileNameByteLength = 520
     private static let fileSizeHighOffset = 64
     private static let fileSizeLowOffset = 68
+    private static let flagsOffset = 0
+    private static let fileAttributesOffset = 36
+    private static let fdAttributes: UInt32 = 0x0000_0004
+    private static let fileAttributeDirectory: UInt32 = 0x0000_0010
 
     public static func decode(_ data: Data) throws -> [RDPFileListEntry] {
         guard data.count >= 4 else {
@@ -25,10 +29,14 @@ public enum WindowsFileGroupDescriptor {
             let nameData = data.subdata(in: (offset + fileNameOffset)..<(offset + fileNameOffset + fileNameByteLength))
             let decodedFileName = decodeUTF16LECString(nameData) ?? "remote-file-\(index)"
             let fileName = FileNameNormalization.normalizeForTransfer(decodedFileName)
+            // dwFileAttributes counts only when dwFlags says it is valid (FD_ATTRIBUTES).
+            let flags = data.readUInt32LE(at: offset + flagsOffset)
+            let attributes = data.readUInt32LE(at: offset + fileAttributesOffset)
             return RDPFileListEntry(
                 fileName: fileName,
                 byteCount: (high << 32) | low,
-                localURL: nil
+                localURL: nil,
+                isDirectory: flags & fdAttributes != 0 && attributes & fileAttributeDirectory != 0
             )
         }
     }

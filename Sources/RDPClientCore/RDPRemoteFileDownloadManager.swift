@@ -3,7 +3,8 @@ import Foundation
 import FreeRDPBridge
 
 final class RDPRemoteFileDownloadManager {
-    private let requestRange: (UInt32, UInt32, UInt64, UInt32) throws -> Void
+    // Internal and settable so tests can hold or answer range requests.
+    var requestRange: (UInt32, UInt32, UInt64, UInt32) throws -> Void
     private let staging: FileTransferStaging
     private let condition = NSCondition()
     private var nextStreamId: UInt32 = 1
@@ -35,35 +36,67 @@ final class RDPRemoteFileDownloadManager {
         condition.broadcast()
     }
 
-    func materialize(_ files: [RDPFileListEntry], chunkSize: UInt32 = 1024 * 1024) throws -> [URL] {
-        try staging.prepare()
+    /// Fails every range request that is still waiting (design D2, INV-L2/L4).
+    func cancelOutstanding() {
+        condition.lock()
+        defer { condition.unlock() }
+        for (streamId, response) in responses {
+            if case .waiting = response {
+                responses[streamId] = .failed
+            }
+        }
+        condition.broadcast()
+    }
 
-        var urls: [URL] = []
-        for (index, file) in files.enumerated() {
-            let destination = try staging.createRemoteDropFile(fileName: file.fileName)
-            let handle = destination.handle
-            defer { try? handle.close() }
+    /// Removes finished results that will not reach the pasteboard (INV-L3).
+    func discard(_ urls: [URL]) {
+        try? staging.removeRemoteDropItems(urls)
+    }
 
-            var offset: UInt64 = 0
-            while offset < file.byteCount {
-                let remaining = file.byteCount - offset
-                let requestLength = UInt32(min(UInt64(chunkSize), remaining))
-                let chunk = try requestChunk(
-                    listIndex: UInt32(index),
-                    offset: offset,
-                    length: requestLength
-                )
-                try handle.write(contentsOf: chunk)
-                offset += UInt64(chunk.count)
+    /// Creates the list's items under the staging root and fills its files. Folder entries become
+    /// directories and request no contents; `listIndex` stays each entry's position in `files`
+    /// (INV-F2). Returns the top-level items. `shouldContinue` is checked before each range
+    /// request. On any error every item this call created is removed (INV-L3).
+    func materialize(
+        _ files: [RDPFileListEntry],
+        chunkSize: UInt32 = 1024 * 1024,
+        shouldContinue: () -> Bool = { true }
+    ) throws -> [URL] {
+        let tree = try staging.beginRemoteDrop()
+        do {
+            for (index, file) in files.enumerated() {
+                if file.isDirectory {
+                    try tree.createDirectory(path: file.fileName)
+                    continue
+                }
+                let destination = try tree.createFile(path: file.fileName)
+                let handle = destination.handle
+                defer { try? handle.close() }
 
-                if chunk.isEmpty {
-                    break
+                var offset: UInt64 = 0
+                while offset < file.byteCount {
+                    guard shouldContinue() else { throw CancellationError() }
+                    let remaining = file.byteCount - offset
+                    let requestLength = UInt32(min(UInt64(chunkSize), remaining))
+                    let chunk = try requestChunk(
+                        listIndex: UInt32(index),
+                        offset: offset,
+                        length: requestLength
+                    )
+                    try handle.write(contentsOf: chunk)
+                    offset += UInt64(chunk.count)
+
+                    if chunk.isEmpty {
+                        break
+                    }
                 }
             }
-            urls.append(destination.url)
+        } catch {
+            discard(tree.topLevelURLs)
+            throw error
         }
 
-        return urls
+        return tree.topLevelURLs
     }
 
     private func requestChunk(listIndex: UInt32, offset: UInt64, length: UInt32) throws -> Data {

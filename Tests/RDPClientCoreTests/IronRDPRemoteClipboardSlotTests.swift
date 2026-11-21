@@ -270,7 +270,7 @@ private final class MaterializationGate {
 
     func release() { gate.signal() }
 
-    func materialize(_ manager: RDPRemoteFileDownloadManager, _ entries: [RDPFileListEntry]) throws -> [URL] {
+    func materialize(_ manager: RDPRemoteFileDownloadManager, _ entries: [RDPFileListEntry], _ shouldContinue: () -> Bool) throws -> [URL] {
         let names = entries.map(\.fileName)
         lock.lock()
         storedStarted.append(contentsOf: names)

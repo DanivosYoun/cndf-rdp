@@ -163,7 +163,9 @@ public final class IronRDPSession: RDPEngineSession {
             guard let context else { return }
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
             guard let clipboard = session.clipboardContext(for: generation) else { return }
+            // Advance before cancel: a woken materialization must already see it is stale (INV-L2).
             let freshness = session.remoteClipboardFreshness.advance()
+            clipboard.manager.cancelOutstanding()
             let text = utf8String(bytes, length)
             session.deliverNewestRemoteClipboard(generation, connection: clipboard.connection) { session in
                 session.updateStatistics { $0.remoteClipboardTextsReceived += 1 }
@@ -178,15 +180,19 @@ public final class IronRDPSession: RDPEngineSession {
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
             guard let clipboard = session.clipboardContext(for: generation) else { return }
             let freshness = session.remoteClipboardFreshness.advance()
+            clipboard.manager.cancelOutstanding()
             let descriptors = UnsafeBufferPointer(start: files, count: count).map { file in
                 (name: utf8String(file.name_utf8, file.name_length), size: file.size)
             }
             session.deliverNewestRemoteClipboard(generation, connection: clipboard.connection) { session in
                 let entries = descriptors.map { file in
-                    RDPFileListEntry(
-                        fileName: FileNameNormalization.normalizeForTransfer(file.name),
+                    // The backend marks a folder entry with one trailing "\\" (design D1).
+                    let isDirectory = file.name.hasSuffix("\\")
+                    return RDPFileListEntry(
+                        fileName: FileNameNormalization.normalizeForTransfer(isDirectory ? String(file.name.dropLast()) : file.name),
                         byteCount: file.size,
-                        localURL: nil
+                        localURL: nil,
+                        isDirectory: isDirectory
                     )
                 }
                 session.updateStatistics {
@@ -482,6 +488,8 @@ public final class IronRDPSession: RDPEngineSession {
         let generation: UInt64
         let connection: UInt64
         let freshness: UInt64
+        /// The pasteboard change count when the job was queued (design D3).
+        let changeCount: Int?
     }
 
     // Server clipboard callbacks keep only the newest text or file list for main, and file
@@ -492,8 +500,8 @@ public final class IronRDPSession: RDPEngineSession {
     // value on the pasteboard. Internal so tests can read it.
     let remoteClipboardFreshness = IronRDPRemoteClipboardFreshness()
     // Internal so tests can hold a materialization.
-    var materializeRemoteFileList: (RDPRemoteFileDownloadManager, [RDPFileListEntry]) throws -> [URL] = {
-        try $0.materialize($1)
+    var materializeRemoteFileList: (RDPRemoteFileDownloadManager, [RDPFileListEntry], () -> Bool) throws -> [URL] = {
+        try $0.materialize($1, shouldContinue: $2)
     }
 
     /// Server text and file lists. A newer one replaces a delivery still waiting for main.
@@ -510,25 +518,32 @@ public final class IronRDPSession: RDPEngineSession {
         }
     }
 
-    /// Materialization results. Each finished materialization queues one block.
+    /// Materialization results. Each finished materialization queues one block. `dropped` runs
+    /// instead of `deliver` when the connection has ended.
     private func deliverClipboard(
         _ generation: UInt64,
         connection: UInt64,
+        dropped: (() -> Void)? = nil,
         _ deliver: @escaping (IronRDPSession) -> Void
     ) {
         DispatchQueue.main.async { [weak self] in
-            self?.deliverClipboardNow(generation, connection: connection, deliver)
+            guard let self, self.deliverClipboardNow(generation, connection: connection, deliver) else {
+                dropped?()
+                return
+            }
         }
     }
 
+    @discardableResult
     private func deliverClipboardNow(
         _ generation: UInt64,
         connection: UInt64,
         _ deliver: (IronRDPSession) -> Void
-    ) {
+    ) -> Bool {
         withSessionLock {
-            guard clipboardIsCurrent(generation, connection: connection) else { return }
+            guard clipboardIsCurrent(generation, connection: connection) else { return false }
             deliver(self)
+            return true
         }
     }
 
@@ -544,7 +559,8 @@ public final class IronRDPSession: RDPEngineSession {
             manager: manager,
             generation: generation,
             connection: connection,
-            freshness: freshness
+            freshness: freshness,
+            changeCount: clipboardCoordinator?.pasteboardChangeCount
         )
         guard remoteFileMaterializations.submit(job) else { return }
         // The session stays weak while a materialization waits on range replies.
@@ -554,17 +570,25 @@ public final class IronRDPSession: RDPEngineSession {
                 guard self?.clipboardIsCurrent(generation, connection: connection) == true,
                       self?.remoteClipboardFreshness.isNewest(freshness) == true,
                       let materialize = self?.materializeRemoteFileList else { continue }
+                let manager = job.manager
                 do {
-                    let urls = try materialize(job.manager, job.entries)
-                    self?.deliverClipboard(generation, connection: connection) { session in
+                    let urls = try materialize(manager, job.entries) { [weak self] in
+                        self?.clipboardIsCurrent(generation, connection: connection) == true
+                            && self?.remoteClipboardFreshness.isNewest(freshness) == true
+                    }
+                    self?.deliverClipboard(generation, connection: connection, dropped: { manager.discard(urls) }) { session in
                         guard session.remoteClipboardFreshness.isNewest(freshness) else {
+                            manager.discard(urls)
                             session.emitLog("Remote file materialization superseded by a newer server clipboard.")
                             return
                         }
-                        session.clipboardCoordinator?.receiveRemoteFiles(urls)
-                        let fileNames = urls.map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
-                            .joined(separator: ", ")
-                        session.delegate?.rdpSession(session, didLog: "Remote files materialized to local pasteboard: \(fileNames).")
+                        guard let coordinator = session.clipboardCoordinator, let changeCount = job.changeCount,
+                              coordinator.receiveRemoteFiles(urls, ifUnchangedSince: changeCount) else {
+                            manager.discard(urls)
+                            session.emitLog("Remote file materialization discarded: the local pasteboard changed.")
+                            return
+                        }
+                        session.delegate?.rdpSession(session, didLog: "Remote files materialized to local pasteboard: \(urls.count) item(s).")
                     }
                 } catch {
                     self?.deliverClipboard(generation, connection: connection) { session in
@@ -676,10 +700,16 @@ public final class IronRDPSession: RDPEngineSession {
     /// reports the disconnect. Later callbacks of the generation are dropped as stale.
     private func endCallbackGeneration(_ generation: UInt64?) -> Bool {
         callbackLock.lock()
-        defer { callbackLock.unlock() }
-        guard let generation, callbackGeneration == generation else { return false }
+        guard let generation, callbackGeneration == generation else {
+            callbackLock.unlock()
+            return false
+        }
         callbackGeneration = nil
+        let manager = remoteFileDownloadManager
         remoteFileDownloadManager = nil
+        callbackLock.unlock()
+        // Outside callbackLock: the lock order stays callbackLock -> condition (design D2, INV-L4).
+        manager?.cancelOutstanding()
         return true
     }
 

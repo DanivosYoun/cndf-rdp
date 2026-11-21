@@ -37,6 +37,28 @@ final class WindowsFileGroupDescriptorTests: XCTestCase {
         XCTAssertEqual(files[0].fileName, "한글.txt")
         XCTAssertEqual(files[0].fileName.unicodeScalars.map(\.value), "한글.txt".unicodeScalars.map(\.value))
     }
+
+    // T1 (design D1): a folder needs FD_ATTRIBUTES in dwFlags and FILE_ATTRIBUTE_DIRECTORY.
+    func testDirectoryNeedsBothTheAttributesFlagAndTheDirectoryAttribute() throws {
+        func descriptor(flags: UInt32, attributes: UInt32, at attributesOffset: Int = 36) -> Data {
+            var data = Data(count: 4 + 592)
+            data.writeUInt32LE(1, at: 0)
+            data.writeUInt32LE(flags, at: 4)
+            data.writeUInt32LE(attributes, at: 4 + attributesOffset)
+            for (index, unit) in Array("폴더W".utf16).enumerated() {
+                data[4 + 72 + index * 2] = UInt8(unit & 0xFF)
+                data[4 + 72 + index * 2 + 1] = UInt8(unit >> 8)
+            }
+            return data
+        }
+
+        XCTAssertTrue(try WindowsFileGroupDescriptor.decode(descriptor(flags: 0x4 | 0x40, attributes: 0x10))[0].isDirectory)
+        XCTAssertFalse(try WindowsFileGroupDescriptor.decode(descriptor(flags: 0x40, attributes: 0x10))[0].isDirectory)
+        XCTAssertFalse(try WindowsFileGroupDescriptor.decode(descriptor(flags: 0x4, attributes: 0x20))[0].isDirectory)
+        // The attribute must be read at offset 36, not at the CLSID/size fields before it.
+        XCTAssertFalse(try WindowsFileGroupDescriptor.decode(descriptor(flags: 0x4, attributes: 0x10, at: 32))[0].isDirectory)
+        XCTAssertEqual(try WindowsFileGroupDescriptor.decode(descriptor(flags: 0x4, attributes: 0x10))[0].fileName, "폴더W")
+    }
 }
 
 private extension Data {
