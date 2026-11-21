@@ -1,6 +1,8 @@
 #![allow(non_camel_case_types)]
 
 mod abi;
+mod channels;
+mod clipboard;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 mod engine;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
@@ -20,6 +22,7 @@ compile_error!("Enable engine or stub");
 mod stub;
 
 pub use abi::*;
+pub use clipboard::*;
 use std::ffi::{c_char, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
@@ -113,6 +116,8 @@ struct Connection {
     stop: AtomicBool,
     #[cfg(not(feature = "stub"))]
     input: Mutex<Option<ironrdp_client::rdp::RdpInputSender>>,
+    #[cfg(feature = "stub")]
+    clipboard: Mutex<Option<mpsc::Sender<clipboard::ClipboardCommand>>>,
     callbacks: Arc<Callbacks>,
     statistics: Arc<Mutex<CNDFIronStatistics>>,
 }
@@ -146,6 +151,8 @@ struct Options {
     graphics: bool,
     log_level: CNDFIronLogLevel,
     password: Zeroizing<String>,
+    #[allow(dead_code)]
+    channels: channels::Options,
 }
 
 #[cfg_attr(feature = "stub", allow(dead_code))]
@@ -337,16 +344,31 @@ pub unsafe extern "C" fn cndf_iron_connect(
         };
         if options.is_null()
             || out_generation.is_null()
-            || options.cast::<u32>().read() < std::mem::size_of::<CNDFIronConnectOptions>() as u32
+            || options.cast::<u32>().read() < channels::V0_SIZE as u32
             || (password_utf8.is_null() && password_length != 0)
             || password_length > isize::MAX as usize
         {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
-        if ptr::addr_of!((*options).log_level).cast::<u32>().read() > 6 {
+        let Some(channel_options) = channels::Options::read(options) else {
+            return CNDF_IRON_INVALID_ARGUMENT;
+        };
+        if ptr::addr_of!((*options).log_level).cast::<u32>().read() > 6
+            || ptr::addr_of!((*options).graphics_pipeline)
+                .cast::<u8>()
+                .read()
+                > 1
+        {
             return CNDF_IRON_INVALID_ARGUMENT;
         }
-        let options = &*options;
+        // Copy only the v0 prefix. The caller may supply a shorter allocation.
+        let mut prefix = std::mem::MaybeUninit::<CNDFIronConnectOptions>::zeroed();
+        ptr::copy_nonoverlapping(
+            options.cast::<u8>(),
+            prefix.as_mut_ptr().cast(),
+            channels::V0_SIZE,
+        );
+        let options = prefix.assume_init();
         let (Some(host), Some(username)) = (text(options.host), text(options.username)) else {
             return CNDF_IRON_INVALID_ARGUMENT;
         };
@@ -380,6 +402,7 @@ pub unsafe extern "C" fn cndf_iron_connect(
             graphics: options.graphics_pipeline,
             log_level: options.log_level,
             password: Zeroizing::new(password.to_owned()),
+            channels: channel_options,
         };
         let mut state = lock(&session.state);
         if session.callbacks.closed.load(Ordering::Acquire) {
@@ -404,6 +427,8 @@ pub unsafe extern "C" fn cndf_iron_connect(
             stop: AtomicBool::new(false),
             #[cfg(not(feature = "stub"))]
             input: Mutex::default(),
+            #[cfg(feature = "stub")]
+            clipboard: Mutex::default(),
             callbacks: Arc::clone(&session.callbacks),
             statistics: Arc::clone(&session.statistics),
         });
@@ -654,6 +679,9 @@ mod tests {
             disconnect: None,
             frame: None,
             pointer: None,
+            remote_text: None,
+            remote_file_list: None,
+            remote_file_contents: None,
             context: (&mut probe as *mut Probe).cast(),
         };
         let session = unsafe { cndf_iron_session_create(&table) };
@@ -665,6 +693,8 @@ mod tests {
             stop: AtomicBool::new(false),
             #[cfg(not(feature = "stub"))]
             input: Mutex::default(),
+            #[cfg(feature = "stub")]
+            clipboard: Mutex::default(),
             callbacks: Arc::clone(&owner.callbacks),
             statistics: Arc::clone(&owner.statistics),
         });

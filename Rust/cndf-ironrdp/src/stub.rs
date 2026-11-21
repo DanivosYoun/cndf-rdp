@@ -19,18 +19,39 @@ pub(super) fn start_workers(
     let deliver = thread::Builder::new()
         .name(format!("cndf-iron-{}-deliver", connection.generation))
         .spawn(move || delivery.worker(|| deliver(&delivery, updates)))?;
+    let clip = if options.channels.clipboard {
+        let (send, receive) = mpsc::channel();
+        let clipboard = Arc::clone(&connection);
+        let worker = thread::Builder::new()
+            .name(format!("cndf-iron-{}-clip", connection.generation))
+            .spawn(move || clipboard.worker(|| clipboard::run_stub(&clipboard, receive)))?;
+        *lock(&connection.clipboard) = Some(send);
+        Some(worker)
+    } else {
+        None
+    };
+    let session_connection = Arc::clone(&connection);
     let session = thread::Builder::new()
         .name(format!("cndf-iron-{}-session", connection.generation))
         .spawn(move || {
+            let connection = session_connection;
             connection.worker(|| {
                 if ready.recv().is_ok() {
                     run(&connection, options, commands, output);
+                    lock(&connection.clipboard).take();
                 }
             })
         });
     match session {
-        Ok(session) => Ok(vec![session, deliver]),
+        Ok(session) => Ok([Some(session), Some(deliver), clip]
+            .into_iter()
+            .flatten()
+            .collect()),
         Err(error) => {
+            lock(&connection.clipboard).take();
+            if let Some(clip) = clip {
+                let _ = clip.join();
+            }
             let _ = deliver.join();
             Err(error)
         }
@@ -257,6 +278,9 @@ mod tests {
             disconnect: None,
             frame: Some(frame),
             pointer: None,
+            remote_text: None,
+            remote_file_list: None,
+            remote_file_contents: None,
             context: (&mut probe as *mut Probe).cast(),
         };
         let options = CNDFIronConnectOptions {
@@ -271,6 +295,10 @@ mod tests {
             color_depth: 32,
             graphics_pipeline: true,
             log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
+            clipboard: false,
+            drive_path: ptr::null(),
+            drive_name: ptr::null(),
+            audio_mode: CNDFIronAudioMode::CNDF_IRON_AUDIO_OFF,
         };
         let (generation, sequence, pixel) = unsafe {
             let session = cndf_iron_session_create(&callbacks);

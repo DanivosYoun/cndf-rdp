@@ -1,5 +1,55 @@
 use std::ffi::{c_char, c_void};
-pub const CNDF_IRON_ABI_VERSION: u32 = 0;
+pub const CNDF_IRON_ABI_VERSION: u32 = 1;
+pub const CNDF_IRON_CAP_CLIPBOARD: u32 = 0x1;
+pub const CNDF_IRON_CAP_DRIVE: u32 = 0x2;
+pub const CNDF_IRON_CAP_AUDIO_LOCAL: u32 = 0x4;
+pub const CNDF_IRON_CAP_AUDIO_REMOTE: u32 = 0x8;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CNDFIronAudioMode {
+    CNDF_IRON_AUDIO_OFF = 0,
+    CNDF_IRON_AUDIO_LOCAL = 1,
+    CNDF_IRON_AUDIO_REMOTE = 2,
+}
+
+#[repr(C)]
+pub struct CNDFIronRemoteFile {
+    pub name_utf8: *const u8,
+    pub name_length: usize,
+    pub size: u64,
+}
+
+#[repr(C)]
+pub struct CNDFIronLocalFile {
+    pub path: *const c_char,
+    pub name: *const c_char,
+    pub size: u64,
+}
+
+/// Clipboard callbacks run on the clip thread. Copy borrowed data before returning.
+pub type CNDFIronRemoteTextCallback =
+    Option<extern "C" fn(generation: u64, utf8: *const u8, length: usize, context: *mut c_void)>;
+pub type CNDFIronRemoteFileListCallback = Option<
+    extern "C" fn(
+        generation: u64,
+        files: *const CNDFIronRemoteFile,
+        count: usize,
+        context: *mut c_void,
+    ),
+>;
+/// On failure, bytes is NULL and length is zero.
+pub type CNDFIronRemoteFileContentsCallback = Option<
+    extern "C" fn(
+        generation: u64,
+        stream_id: u32,
+        ok: bool,
+        bytes: *const u8,
+        length: usize,
+        context: *mut c_void,
+    ),
+>;
+
 pub const CNDF_IRON_CERT_CHAIN_UNTRUSTED: u32 = 0x1;
 pub const CNDF_IRON_CERT_NAME_MISMATCH: u32 = 0x2;
 pub const CNDF_IRON_CERT_EXPIRED: u32 = 0x4;
@@ -100,6 +150,9 @@ pub struct CNDFIronCallbacks {
     pub disconnect: CNDFIronDisconnectCallback,
     pub frame: CNDFIronFrameCallback,
     pub pointer: CNDFIronPointerCallback,
+    pub remote_text: CNDFIronRemoteTextCallback,
+    pub remote_file_list: CNDFIronRemoteFileListCallback,
+    pub remote_file_contents: CNDFIronRemoteFileContentsCallback,
     pub context: *mut c_void,
 }
 
@@ -117,6 +170,13 @@ pub struct CNDFIronConnectOptions {
     pub color_depth: u32,
     pub graphics_pipeline: bool,
     pub log_level: CNDFIronLogLevel,
+    /// The v1 options default to disabled when struct_size does not cover them all.
+    pub clipboard: bool,
+    /// NULL disables drive sharing. A non-directory path is rejected.
+    pub drive_path: *const c_char,
+    /// NULL selects "RemoteShare".
+    pub drive_name: *const c_char,
+    pub audio_mode: CNDFIronAudioMode,
 }
 
 #[repr(C)]
@@ -160,6 +220,8 @@ pub struct CNDFIronStatistics {
     pub frame_bytes_delivered: u64,
     pub input_events_sent: u64,
     pub input_busy: u64,
+    pub audio_waves_received: u64,
+    pub drive_io_requests: u64,
 }
 
 /// Pointers supplied to callbacks are valid for the duration of the callback.

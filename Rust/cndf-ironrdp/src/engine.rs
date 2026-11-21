@@ -505,7 +505,12 @@ fn deliver_event(connection: &Connection, event: RdpOutputEvent, minimum: CNDFIr
                     use std::fmt::Write as _;
                     let _ = write!(message, ": {pdu}");
                 }
-                log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_ERROR, &message);
+                log(
+                    connection,
+                    minimum,
+                    CNDFIronLogLevel::CNDF_IRON_LOG_ERROR,
+                    &message,
+                );
                 if let Some(error) = errors::framebuffer_cause(error) {
                     report_active_framebuffer_failure(connection, error);
                     return;
@@ -587,6 +592,9 @@ mod tests {
             disconnect: None,
             frame: None,
             pointer: None,
+            remote_text: None,
+            remote_file_list: None,
+            remote_file_contents: None,
             context: (&mut messages as *mut Vec<String>).cast(),
         };
         let connection = Connection {

@@ -7,7 +7,15 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define CNDF_IRON_ABI_VERSION 0
+#define CNDF_IRON_ABI_VERSION 1
+
+#define CNDF_IRON_CAP_CLIPBOARD 1
+
+#define CNDF_IRON_CAP_DRIVE 2
+
+#define CNDF_IRON_CAP_AUDIO_LOCAL 4
+
+#define CNDF_IRON_CAP_AUDIO_REMOTE 8
 
 #define CNDF_IRON_CERT_CHAIN_UNTRUSTED 1
 
@@ -69,6 +77,12 @@ typedef enum CNDFIronStatus {
   CNDF_IRON_CLOSED = 4,
   CNDF_IRON_INTERNAL = 5,
 } CNDFIronStatus;
+
+typedef enum CNDFIronAudioMode {
+  CNDF_IRON_AUDIO_OFF = 0,
+  CNDF_IRON_AUDIO_LOCAL = 1,
+  CNDF_IRON_AUDIO_REMOTE = 2,
+} CNDFIronAudioMode;
 
 typedef enum CNDFIronInputKind {
   CNDF_IRON_INPUT_KEY = 0,
@@ -161,6 +175,35 @@ typedef void (*CNDFIronPointerCallback)(uint64_t generation,
                                         uint32_t hot_y,
                                         void *context);
 
+/**
+ * Clipboard callbacks run on the clip thread. Copy borrowed data before returning.
+ */
+typedef void (*CNDFIronRemoteTextCallback)(uint64_t generation,
+                                           const uint8_t *utf8,
+                                           size_t length,
+                                           void *context);
+
+typedef struct CNDFIronRemoteFile {
+  const uint8_t *name_utf8;
+  size_t name_length;
+  uint64_t size;
+} CNDFIronRemoteFile;
+
+typedef void (*CNDFIronRemoteFileListCallback)(uint64_t generation,
+                                               const struct CNDFIronRemoteFile *files,
+                                               size_t count,
+                                               void *context);
+
+/**
+ * On failure, bytes is NULL and length is zero.
+ */
+typedef void (*CNDFIronRemoteFileContentsCallback)(uint64_t generation,
+                                                   uint32_t stream_id,
+                                                   bool ok,
+                                                   const uint8_t *bytes,
+                                                   size_t length,
+                                                   void *context);
+
 typedef struct CNDFIronCallbacks {
   CNDFIronLogCallback log;
   CNDFIronCertificateTrustCallback certificate_trust;
@@ -169,6 +212,9 @@ typedef struct CNDFIronCallbacks {
   CNDFIronDisconnectCallback disconnect;
   CNDFIronFrameCallback frame;
   CNDFIronPointerCallback pointer;
+  CNDFIronRemoteTextCallback remote_text;
+  CNDFIronRemoteFileListCallback remote_file_list;
+  CNDFIronRemoteFileContentsCallback remote_file_contents;
   void *context;
 } CNDFIronCallbacks;
 
@@ -184,6 +230,19 @@ typedef struct CNDFIronConnectOptions {
   uint32_t color_depth;
   bool graphics_pipeline;
   enum CNDFIronLogLevel log_level;
+  /**
+   * The v1 options default to disabled when struct_size does not cover them all.
+   */
+  bool clipboard;
+  /**
+   * NULL disables drive sharing. A non-directory path is rejected.
+   */
+  const char *drive_path;
+  /**
+   * NULL selects "RemoteShare".
+   */
+  const char *drive_name;
+  enum CNDFIronAudioMode audio_mode;
 } CNDFIronConnectOptions;
 
 typedef struct CNDFIronInputEvent {
@@ -205,7 +264,15 @@ typedef struct CNDFIronStatistics {
   uint64_t frame_bytes_delivered;
   uint64_t input_events_sent;
   uint64_t input_busy;
+  uint64_t audio_waves_received;
+  uint64_t drive_io_requests;
 } CNDFIronStatistics;
+
+typedef struct CNDFIronLocalFile {
+  const char *path;
+  const char *name;
+  uint64_t size;
+} CNDFIronLocalFile;
 
 #ifdef __cplusplus
 extern "C" {
@@ -262,6 +329,34 @@ enum CNDFIronStatus cndf_iron_disconnect(struct CNDFIronSession *session);
  * certificate callbacks before calling destroy, and keep the context alive until it returns.
  */
 void cndf_iron_session_destroy(struct CNDFIronSession *session, uint32_t join_timeout_ms);
+
+uint32_t cndf_iron_capabilities(void);
+
+/**
+ * Copies UTF-8 text into the clipboard command queue.
+ */
+enum CNDFIronStatus cndf_iron_clipboard_offer_text(struct CNDFIronSession *session,
+                                                   uint64_t generation,
+                                                   const uint8_t *utf8,
+                                                   size_t length);
+
+/**
+ * Copies local file metadata into the clipboard command queue.
+ */
+enum CNDFIronStatus cndf_iron_clipboard_offer_files(struct CNDFIronSession *session,
+                                                    uint64_t generation,
+                                                    const struct CNDFIronLocalFile *files,
+                                                    size_t count);
+
+/**
+ * Queues a range request for an active, ready clipboard channel.
+ */
+enum CNDFIronStatus cndf_iron_clipboard_request_file_range(struct CNDFIronSession *session,
+                                                           uint64_t generation,
+                                                           uint32_t stream_id,
+                                                           uint32_t list_index,
+                                                           uint64_t offset,
+                                                           uint32_t length);
 
 #ifdef __cplusplus
 }  // extern "C"
