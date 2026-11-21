@@ -138,7 +138,7 @@ fn run(
     options: Options,
     commands: Receiver<Command>,
     output: &async_channel::Sender<Output>,
-    clip_jobs: Option<&mpsc::Sender<clipboard::Job>>,
+    clip_jobs: Option<&clipboard::ClipJobs>,
 ) {
     let rejected = Arc::new(AtomicBool::new(false));
     let trust_outcome = Arc::clone(&rejected);
@@ -324,7 +324,7 @@ async fn run_attempt(
     minimum: CNDFIronLogLevel,
     retry_config: Option<Config>,
     legacy: bool,
-    clip_jobs: Option<&mpsc::Sender<clipboard::Job>>,
+    clip_jobs: Option<&clipboard::ClipJobs>,
     drive: Option<&(String, String)>,
 ) -> Option<Config> {
     let (sender, receiver) = output_channel(128);

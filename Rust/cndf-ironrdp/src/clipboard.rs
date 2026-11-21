@@ -249,7 +249,7 @@ fn notify_range(connection: &Connection, stream_id: u32, bytes: Option<&[u8]>) {
 }
 
 #[cfg(not(feature = "stub"))]
-pub(super) use real::{Channel, ClipWork, Job};
+pub(super) use real::{Channel, ClipJobs, ClipWork};
 
 #[cfg(not(feature = "stub"))]
 mod real {
@@ -262,7 +262,9 @@ mod real {
         ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId,
         ClipboardGeneralCapabilityFlags as Capabilities, FileContentsFlags, FileContentsRequest,
         FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
+        OwnedFormatDataResponse,
     };
+    use ironrdp_cliprdr::CliprdrInstance;
     use ironrdp_core::IntoOwned;
     use std::collections::{HashSet, VecDeque};
     use tokio::sync::oneshot;
@@ -279,34 +281,85 @@ mod real {
         )
     }
 
-    /// Bytes the RANGE read allocates: the requested length clipped at end of file, or nothing.
-    fn range_length(file: &LocalFile, offset: u64, length: u32) -> u64 {
-        if length > MAX_FILE_RANGE_LENGTH {
-            return 0;
-        }
-        file.size
-            .checked_sub(offset)
-            .map_or(0, |available| u64::from(length).min(available))
-    }
-
-    fn read_file_contents_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
+    /// The bytes a RANGE reads: the requested length clipped at end of file.
+    ///
+    /// `None` if the request is longer than served or starts past the end of the file.
+    fn range_length(file: &LocalFile, offset: u64, length: u32) -> Option<u32> {
         if length > MAX_FILE_RANGE_LENGTH {
             return None;
         }
         // Windows requests a full buffer even if fewer bytes remain in the file.
         let available = file.size.checked_sub(offset)?;
-        let length = u64::from(length).min(available) as u32;
-        read_range(file, offset, length)
+        Some(u64::from(length).min(available) as u32)
     }
 
     pub(crate) type Job = Box<dyn FnOnce(&Connection) + Send>;
+
+    /// Why a RANGE was answered with a failure on the session thread.
+    #[derive(Clone, Copy)]
+    enum Refusal {
+        Budget,
+        MissingFile,
+        InvalidRange,
+    }
+
+    const REFUSALS: [(Refusal, &str); 3] = [
+        (Refusal::Budget, "budget"),
+        (Refusal::MissingFile, "missing-file"),
+        (Refusal::InvalidRange, "invalid-range"),
+    ];
+
+    /// RANGE failures not yet logged: a count and the longest requested length per reason.
+    ///
+    /// INVARIANT: Fixed size, so a request flood adds no queued work or log record.
+    #[derive(Default)]
+    struct Refusals([(u64, u32); REFUSALS.len()]);
+
+    impl Refusals {
+        fn record(&mut self, refusal: Refusal, length: u32) {
+            let (count, longest) = &mut self.0[refusal as usize];
+            *count += 1;
+            *longest = (*longest).max(length);
+        }
+    }
+
+    /// The clip worker's inputs: its job queue and the RANGE failures it logs.
+    #[derive(Clone)]
+    pub(crate) struct ClipJobs {
+        work: mpsc::Sender<Job>,
+        refusals: Arc<Mutex<Refusals>>,
+    }
+
+    impl ClipJobs {
+        fn new() -> (Self, mpsc::Receiver<Job>) {
+            let (work, jobs) = mpsc::channel::<Job>();
+            let refusals = Arc::default();
+            (Self { work, refusals }, jobs)
+        }
+
+        /// Logs the RANGE failures recorded since the previous call.
+        fn log_refusals(&self, connection: &Connection) {
+            let refusals = std::mem::take(&mut *lock(&self.refusals));
+            for ((_, reason), (count, longest)) in REFUSALS.iter().zip(refusals.0) {
+                if count != 0 {
+                    connection.clip_log(
+                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                        &format!(
+                            "Clipboard RANGE failed reason={reason} count={count} max_length={longest}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
 
     pub(crate) struct ClipWork;
     impl ClipWork {
         pub(crate) fn spawn(
             connection: Arc<Connection>,
-        ) -> std::io::Result<(mpsc::Sender<Job>, JoinHandle<()>)> {
-            let (send, recv) = mpsc::channel::<Job>();
+        ) -> std::io::Result<(ClipJobs, JoinHandle<()>)> {
+            let (jobs, recv) = ClipJobs::new();
+            let logs = jobs.clone();
             let worker = thread::Builder::new()
                 .name(format!("cndf-iron-{}-clip", connection.generation))
                 .spawn(move || {
@@ -317,10 +370,11 @@ mod real {
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             }
+                            logs.log_refusals(&connection);
                         }
                     })
                 })?;
-            Ok((send, worker))
+            Ok((jobs, worker))
         }
     }
 
@@ -344,8 +398,6 @@ mod real {
         requests: HashSet<u32>,
         /// RANGE responses accepted for the server and not yet handled by the session.
         range_responses: Vec<(oneshot::Receiver<()>, u64)>,
-        /// The text response that may still be queued for the session.
-        text_response: Option<oneshot::Receiver<()>>,
     }
 
     impl State {
@@ -369,17 +421,17 @@ mod real {
     pub(crate) struct Channel {
         state: Arc<Mutex<State>>,
         input: RdpInputSender,
-        work: mpsc::Sender<Job>,
+        jobs: ClipJobs,
         #[cfg(test)]
         messages: Option<mpsc::Sender<Message>>,
     }
 
     impl Channel {
-        pub(crate) fn new(input: RdpInputSender, work: mpsc::Sender<Job>) -> Self {
+        pub(crate) fn new(input: RdpInputSender, jobs: ClipJobs) -> Self {
             Self {
                 state: Arc::default(),
                 input,
-                work,
+                jobs,
                 #[cfg(test)]
                 messages: None,
             }
@@ -393,19 +445,19 @@ mod real {
             self.input.send_clipboard(message).is_ok()
         }
 
-        fn send_with_completion(&self, message: Message, completion: oneshot::Sender<()>) -> bool {
-            #[cfg(test)]
-            if self.messages.is_some() {
-                // The capture hook records only the message; dropping the completion retires it.
-                return self.send(message);
-            }
-            self.input
-                .send_clipboard_with_completion(message, completion)
-                .is_ok()
+        fn queue(&self, job: impl FnOnce(&Connection) + Send + 'static) -> bool {
+            self.jobs.work.send(Box::new(job)).is_ok()
         }
 
-        fn queue(&self, job: impl FnOnce(&Connection) + Send + 'static) {
-            let _ = self.work.send(Box::new(job));
+        /// Answers a RANGE the session thread cannot serve, recording why for the clip worker's log.
+        fn refuse(
+            &self,
+            stream: u32,
+            refusal: Refusal,
+            length: u32,
+        ) -> FileContentsResponse<'static> {
+            lock(&self.jobs.refusals).record(refusal, length);
+            FileContentsResponse::new_error(stream)
         }
 
         fn advertise(&self, state: &mut State) -> bool {
@@ -634,37 +686,25 @@ mod real {
             }
         }
 
-        fn on_format_data_request(&mut self, request: FormatDataRequest) {
-            let mut state = lock(&self.0.state);
-            let wants_text = matches!(state.offer, Offer::Text(_))
-                && request.format == ClipboardFormatId::CF_UNICODETEXT;
-            // Every request would otherwise queue another copy of the text while writes are blocked.
-            let busy = wants_text && state.text_response.as_mut().is_some_and(pending);
-            let response = match &state.offer {
-                Offer::Text(text) if wants_text && !busy => {
-                    FormatDataResponse::new_unicode_string(text)
+        // CLIPRDR calls `respond_to_format_data_request` instead.
+        fn on_format_data_request(&mut self, _: FormatDataRequest) {}
+
+        /// Answers in the iteration that received the request, so a blocked write holds one copy of
+        /// the text and responses keep the order of the requests.
+        fn respond_to_format_data_request(
+            &mut self,
+            request: FormatDataRequest,
+        ) -> Option<OwnedFormatDataResponse> {
+            let state = lock(&self.0.state);
+            Some(
+                match &state.offer {
+                    Offer::Text(text) if request.format == ClipboardFormatId::CF_UNICODETEXT => {
+                        FormatDataResponse::new_unicode_string(text)
+                    }
+                    _ => FormatDataResponse::new_error(),
                 }
-                _ => FormatDataResponse::new_error(),
-            }
-            .into_owned();
-            if !wants_text || busy {
-                drop(state);
-                self.0.send(Message::SendFormatData(response));
-                if busy {
-                    self.0.queue(|connection| {
-                        connection.clip_log(
-                            CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
-                            "Clipboard format data rejected reason=busy",
-                        );
-                    });
-                }
-                return;
-            }
-            let (completion, handled) = oneshot::channel();
-            state.text_response = Some(handled);
-            drop(state);
-            self.0
-                .send_with_completion(Message::SendFormatData(response), completion);
+                .into_owned(),
+            )
         }
 
         fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
@@ -705,59 +745,58 @@ mod real {
             });
         }
 
-        fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-            let mut state = lock(&self.0.state);
-            let file = state.advertised.get(request.index as usize).cloned();
+        // CLIPRDR calls `respond_to_file_contents_request` instead.
+        fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
+
+        /// Answers in the iteration that received the request unless a file read is needed. Only an
+        /// accepted read is deferred, holding a RANGE reservation until the session handles its frame.
+        fn respond_to_file_contents_request(
+            &mut self,
+            request: FileContentsRequest,
+            instance: CliprdrInstance,
+        ) -> Option<FileContentsResponse<'static>> {
             let stream = request.stream_id;
-            if let Some(file) = file
-                .as_ref()
-                .filter(|_| request.flags == FileContentsFlags::SIZE)
-            {
-                drop(state);
-                self.0.send(Message::SendFileContentsResponse(
-                    FileContentsResponse::new_size_response(stream, file.size),
-                ));
-                return;
-            }
             let length = request.requested_size;
-            let bytes = file
-                .as_deref()
-                .map_or(0, |file| range_length(file, request.position, length));
-            let completion = state.reserve_range(bytes);
-            drop(state);
-            let Some(completion) = completion else {
-                self.0.send(Message::SendFileContentsResponse(
-                    FileContentsResponse::new_error(stream),
-                ));
-                self.0.queue(move |connection| {
-                    connection.clip_log(
-                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
-                        &format!("Clipboard RANGE failed reason=budget length={length}"),
-                    );
-                });
-                return;
+            let mut state = lock(&self.0.state);
+            let Some(file) = state.advertised.get(request.index as usize).cloned() else {
+                return Some(self.0.refuse(stream, Refusal::MissingFile, length));
             };
+            if request.flags == FileContentsFlags::SIZE {
+                return Some(FileContentsResponse::new_size_response(stream, file.size));
+            }
+            let Some(read) = range_length(&file, request.position, length) else {
+                return Some(self.0.refuse(stream, Refusal::InvalidRange, length));
+            };
+            let Some(completion) = state.reserve_range(u64::from(read)) else {
+                return Some(self.0.refuse(stream, Refusal::Budget, length));
+            };
+            drop(state);
             let input = self.0.input.clone();
-            self.0.queue(move |connection| {
-                let data = file.ok_or("missing-file").and_then(|file| {
-                    read_file_contents_range(&file, request.position, length).ok_or("range-read")
-                });
-                let response = match data {
-                    Ok(bytes) => FileContentsResponse::new_data_response(stream, bytes),
-                    Err(reason) => {
+            let queued = self.0.queue(move |connection| {
+                // A stopping session takes no more reads; dropping the completion releases them.
+                if connection.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let response = match read_range(&file, request.position, read) {
+                    Some(bytes) => FileContentsResponse::new_data_response(stream, bytes),
+                    None => {
                         connection.clip_log(
                             CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
-                            &format!("Clipboard RANGE failed reason={reason} length={length}"),
+                            &format!("Clipboard RANGE failed reason=range-read length={length}"),
                         );
                         FileContentsResponse::new_error(stream)
                     }
                 };
-                // The session drops or signals the completion once it has handled the frame.
-                let _ = input.send_clipboard_with_completion(
+                // The session drops or signals the completion once it has handled the frame, and
+                // discards the response if the CLIPRDR channel that requested it is gone.
+                let _ = input.send_clipboard_for_instance(
+                    instance,
                     Message::SendFileContentsResponse(response),
                     completion,
                 );
             });
+            // The rejected job, and with it the reservation, is dropped already.
+            (!queued).then(|| FileContentsResponse::new_error(stream))
         }
 
         fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
@@ -776,7 +815,13 @@ mod real {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use ironrdp_cliprdr::pdu::ClipboardFormatName;
+        use ironrdp_client::rdp::RdpInputEvent;
+        use ironrdp_cliprdr::pdu::{
+            Capabilities as ChannelCapabilities, ClipboardFormatName, ClipboardPdu,
+            ClipboardProtocolVersion, FormatListResponse,
+        };
+        use ironrdp_cliprdr::CliprdrClient;
+        use ironrdp_svc::{SvcMessage, SvcProcessor as _};
 
         #[test]
         fn file_contents_range_returns_the_remaining_bytes_at_eof() {
@@ -791,10 +836,13 @@ mod real {
                 size: 4,
             };
 
-            let short = read_file_contents_range(&file, 1, 256 * 1024);
-            let at_eof = read_file_contents_range(&file, 4, 1);
-            let past_eof = read_file_contents_range(&file, 5, 1);
-            let over_limit = read_file_contents_range(&file, 1, 64 * 1024 * 1024 + 1);
+            let read = |offset, length| {
+                range_length(&file, offset, length).and_then(|read| read_range(&file, offset, read))
+            };
+            let short = read(1, 256 * 1024);
+            let at_eof = read(4, 1);
+            let past_eof = read(5, 1);
+            let over_limit = read(1, 64 * 1024 * 1024 + 1);
             std::fs::remove_file(path).unwrap();
 
             assert_eq!(short.as_deref(), Some(&b"NDF"[..]));
@@ -811,9 +859,8 @@ mod real {
         #[test]
         fn clipboard_defers_offers_until_ready_and_gates_file_streaming() {
             let (input, _events) = RdpInputSender::channel(1);
-            let (work, jobs) = mpsc::channel();
+            let (mut channel, jobs) = test_channel(input);
             let (messages, receive) = mpsc::channel();
-            let mut channel = Channel::new(input, work);
             channel.messages = Some(messages);
             let mut backend = CndfCliprdrBackend(channel.clone());
 
@@ -843,13 +890,14 @@ mod real {
                 receive.try_recv().unwrap(),
                 Message::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
             ));
-            backend.on_format_data_request(FormatDataRequest {
+            let response = backend.respond_to_format_data_request(FormatDataRequest {
                 format: ClipboardFormatId::CF_UNICODETEXT,
             });
-            assert!(
-                matches!(receive.try_recv().unwrap(), Message::SendFormatData(response)
-                if decode_text(response.data()).as_deref() == Some("한글"))
+            assert_eq!(
+                response.map(|response| decode_text(response.data())),
+                Some(Some("한글".into()))
             );
+            assert!(receive.try_recv().is_err());
 
             let file = LocalFile {
                 path: "/unused".into(),
@@ -869,10 +917,6 @@ mod real {
 
         #[test]
         fn rejected_ranges_leave_clipboard_ready_for_the_next_request() {
-            use ironrdp_cliprdr::pdu::{ClipboardPdu, FormatListResponse};
-            use ironrdp_cliprdr::CliprdrClient;
-            use ironrdp_svc::SvcProcessor as _;
-
             type Responses = Vec<(u32, Option<Vec<u8>>)>;
             extern "C" fn record_range(
                 _: u64,
@@ -909,9 +953,8 @@ mod real {
             };
 
             let (input, _events) = RdpInputSender::channel(1);
-            let (work, jobs) = mpsc::channel();
+            let (mut channel, jobs) = test_channel(input);
             let (messages, receive) = mpsc::channel();
-            let mut channel = Channel::new(input, work);
             channel.messages = Some(messages);
             let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
             let ready = ClipboardPdu::FormatListResponse(FormatListResponse::Ok);
@@ -996,8 +1039,7 @@ mod real {
             };
 
             let (input, _events) = RdpInputSender::channel(1);
-            let (work, jobs) = mpsc::channel();
-            let channel = Channel::new(input, work);
+            let (channel, jobs) = test_channel(input);
             let mut backend = CndfCliprdrBackend(channel.clone());
             backend.on_process_negotiated_capabilities(Capabilities::STREAM_FILECLIP_ENABLED);
             backend.on_ready();
@@ -1008,26 +1050,33 @@ mod real {
             }]));
             backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
             backend.on_format_data_response(FormatDataResponse::new_error());
-            backend.on_file_contents_request(FileContentsRequest {
-                stream_id: 1,
-                index: 0,
-                flags: FileContentsFlags::RANGE,
-                position: 0,
-                requested_size: 8,
-                data_id: None,
-            });
+            let missing =
+                backend.respond_to_file_contents_request(range(1, 0, 8), other_instance());
+            assert!(missing.is_some_and(|response| response.is_error()));
 
             while let Ok(job) = jobs.try_recv() {
                 job(&connection);
             }
+            channel.jobs.log_refusals(&connection);
             assert_eq!(
                 logs,
                 [
                     "Clipboard file offer rejected descriptors count=1",
                     "Clipboard format data rejected reason=remote-failure",
-                    "Clipboard RANGE failed reason=missing-file length=8",
+                    "Clipboard RANGE failed reason=missing-file count=1 max_length=8",
                 ]
             );
+        }
+
+        fn test_channel(input: RdpInputSender) -> (Channel, mpsc::Receiver<Job>) {
+            let (jobs, work) = ClipJobs::new();
+            (Channel::new(input, jobs), work)
+        }
+
+        /// The instance of a CLIPRDR processor that is not the one under test.
+        fn other_instance() -> CliprdrInstance {
+            let (input, _events) = RdpInputSender::channel(1);
+            CliprdrClient::new(test_channel(input).0.build_cliprdr_backend()).instance()
         }
 
         fn range_connection(logs: &mut Vec<String>) -> Connection {
@@ -1071,35 +1120,146 @@ mod real {
             }
         }
 
-        /// A file the backend offers, sparse so reads cost no disk space.
-        fn offered_sparse_file(
-            name: &str,
-            size: u64,
-        ) -> (
-            Fixture,
-            Channel,
-            CndfCliprdrBackend,
-            mpsc::Receiver<Job>,
-            tokio::sync::mpsc::UnboundedReceiver<ironrdp_client::rdp::RdpInputEvent>,
-        ) {
+        /// A sparse file, so reads cost no disk space.
+        fn sparse_file(name: &str, size: u64) -> (Fixture, LocalFile) {
             let path =
                 std::env::temp_dir().join(format!("cndf-iron-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
             let file = std::fs::File::create_new(&path).unwrap();
             let fixture = Fixture(path.clone());
             file.set_len(size).unwrap();
-            drop(file);
-            let (input, _events, ordered) = RdpInputSender::channel_with_ordered_queue(1);
-            let (work, jobs) = mpsc::channel();
-            let channel = Channel::new(input, work);
-            let mut backend = CndfCliprdrBackend(channel.clone());
-            backend.on_process_negotiated_capabilities(Capabilities::STREAM_FILECLIP_ENABLED);
-            backend.on_ready();
-            channel.submit(ClipboardCommand::Files(vec![LocalFile {
+            let file = LocalFile {
                 path: path.to_str().unwrap().to_owned(),
                 name: name.into(),
                 size,
-            }]));
-            (fixture, channel, backend, jobs, ordered)
+            };
+            (fixture, file)
+        }
+
+        /// A CLIPRDR client channel of a session offering local files, with the queues the session and
+        /// the clip worker would consume.
+        struct Offered {
+            channel: Channel,
+            cliprdr: CliprdrClient,
+            jobs: mpsc::Receiver<Job>,
+            ordered: tokio::sync::mpsc::UnboundedReceiver<RdpInputEvent>,
+            _events: tokio::sync::mpsc::Receiver<RdpInputEvent>,
+        }
+
+        impl Offered {
+            fn new(files: Vec<LocalFile>) -> Self {
+                let (input, _events, ordered) = RdpInputSender::channel_with_ordered_queue(1);
+                let (channel, jobs) = test_channel(input);
+                let cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+                let mut offered = Self {
+                    channel,
+                    cliprdr,
+                    jobs,
+                    ordered,
+                    _events,
+                };
+                offered.ready();
+                offered.channel.submit(ClipboardCommand::Files(files));
+                offered.hand_offer_to_cliprdr();
+                offered
+            }
+
+            /// Negotiates file streaming and completes the CLIPRDR initialization.
+            fn ready(&mut self) {
+                let capabilities = ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    Capabilities::STREAM_FILECLIP_ENABLED | Capabilities::USE_LONG_FORMAT_NAMES,
+                ));
+                let ready = ClipboardPdu::FormatListResponse(FormatListResponse::Ok);
+                for pdu in [capabilities, ready] {
+                    assert!(self
+                        .cliprdr
+                        .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                        .unwrap()
+                        .is_empty());
+                }
+            }
+
+            /// Does what the session does with the backend's file offer.
+            fn hand_offer_to_cliprdr(&mut self) {
+                while let Ok(event) = self.ordered.try_recv() {
+                    if let RdpInputEvent::Clipboard(Message::SendInitiateFileCopy(files)) = event {
+                        self.cliprdr.initiate_file_copy(files).unwrap();
+                    }
+                }
+            }
+
+            /// Delivers a server request and returns the answers in the output of that iteration.
+            fn request(&mut self, request: FileContentsRequest) -> Vec<(u32, Option<usize>)> {
+                let pdu = ClipboardPdu::FileContentsRequest(request);
+                answers(
+                    self.cliprdr
+                        .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                        .unwrap(),
+                )
+            }
+
+            fn run_jobs(&self, connection: &Connection) -> usize {
+                let mut count = 0;
+                while let Ok(job) = self.jobs.try_recv() {
+                    job(connection);
+                    count += 1;
+                }
+                count
+            }
+
+            /// Takes the deferred responses the session has not written yet.
+            fn hold(&mut self, held: &mut Held) {
+                while let Ok(event) = self.ordered.try_recv() {
+                    let RdpInputEvent::ClipboardForInstance(
+                        instance,
+                        Message::SendFileContentsResponse(response),
+                        completion,
+                    ) = event
+                    else {
+                        panic!("unexpected clipboard event {event:?}");
+                    };
+                    let data = (!response.is_error()).then(|| response.data().len());
+                    held.push(Deferred {
+                        instance,
+                        stream: response.stream_id(),
+                        data,
+                        completion,
+                    });
+                }
+            }
+
+            /// RANGE reservations: count and bytes.
+            fn reserved(&self) -> (usize, u64) {
+                let mut state = lock(&self.channel.state);
+                state
+                    .range_responses
+                    .retain_mut(|(completion, _)| pending(completion));
+                (
+                    state.range_responses.len(),
+                    state.range_responses.iter().map(|(_, bytes)| bytes).sum(),
+                )
+            }
+
+            fn refused(&self, refusal: Refusal) -> u64 {
+                lock(&self.channel.jobs.refusals).0[refusal as usize].0
+            }
+        }
+
+        fn answers(output: Vec<SvcMessage>) -> Vec<(u32, Option<usize>)> {
+            output
+                .iter()
+                .map(|message| {
+                    let bytes = message.encode_unframed_pdu().unwrap();
+                    match ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap() {
+                        ClipboardPdu::FileContentsResponse(response) => (
+                            response.stream_id(),
+                            (!response.is_error()).then(|| response.data().len()),
+                        ),
+                        other => panic!("unexpected answer {other:?}"),
+                    }
+                })
+                .collect()
         }
 
         fn range(stream_id: u32, position: u64, requested_size: u32) -> FileContentsRequest {
@@ -1113,33 +1273,58 @@ mod real {
             }
         }
 
-        /// Data responses still queued, as a session that cannot write would hold them.
-        type Held = Vec<(u32, usize, oneshot::Sender<()>)>;
+        /// A deferred response the session took from its queue but has not written.
+        struct Deferred {
+            instance: CliprdrInstance,
+            stream: u32,
+            data: Option<usize>,
+            completion: oneshot::Sender<()>,
+        }
 
-        fn drain(
-            ordered: &mut tokio::sync::mpsc::UnboundedReceiver<ironrdp_client::rdp::RdpInputEvent>,
-            held: &mut Held,
-        ) -> Vec<u32> {
-            use ironrdp_client::rdp::RdpInputEvent;
-            let mut failed = Vec::new();
-            while let Ok(event) = ordered.try_recv() {
-                match event {
-                    RdpInputEvent::ClipboardWithCompletion(
-                        Message::SendFileContentsResponse(response),
-                        completion,
-                    ) if !response.is_error() => {
-                        held.push((response.stream_id(), response.data().len(), completion));
-                    }
-                    RdpInputEvent::Clipboard(Message::SendFileContentsResponse(response))
-                        if response.is_error() =>
-                    {
-                        failed.push(response.stream_id());
-                    }
-                    RdpInputEvent::Clipboard(Message::SendInitiateFileCopy(_)) => {}
-                    other => panic!("unexpected clipboard event {other:?}"),
-                }
+        type Held = Vec<Deferred>;
+
+        fn held_bytes(held: &Held) -> u64 {
+            held.iter()
+                .map(|response| response.data.unwrap_or(0) as u64)
+                .sum()
+        }
+
+        // oracle: mutant answering a refused RANGE through the session's clipboard queue or queuing
+        // its log for the clip worker.
+        #[test]
+        fn refused_ranges_are_answered_in_the_current_iteration_without_queuing() {
+            const MIB: u32 = 1024 * 1024;
+            let mut logs = Vec::new();
+            let connection = range_connection(&mut logs);
+            let (_fixture, file) = sparse_file("range-refused", 1 << 30);
+            let mut offered = Offered::new(vec![file]);
+            let mut held = Held::new();
+            for stream_id in 0..MAX_RANGE_RESPONSES_IN_FLIGHT as u32 {
+                assert!(offered.request(range(stream_id, 0, MIB)).is_empty());
             }
-            failed
+            assert_eq!(offered.run_jobs(&connection), MAX_RANGE_RESPONSES_IN_FLIGHT);
+            offered.hold(&mut held);
+            assert_eq!(held.len(), MAX_RANGE_RESPONSES_IN_FLIGHT);
+
+            // The writes are blocked: the limit is reached and the next request is refused.
+            assert_eq!(offered.request(range(16, 0, MIB)), [(16, None)]);
+            assert!(
+                offered.ordered.try_recv().is_err(),
+                "the refusal was queued for the session"
+            );
+            assert!(
+                offered.jobs.try_recv().is_err(),
+                "the refusal queued clip work"
+            );
+            assert_eq!(offered.refused(Refusal::Budget), 1);
+            assert_eq!(offered.reserved(), (16, 16 * u64::from(MIB)));
+
+            offered.channel.jobs.log_refusals(&connection);
+            assert_eq!(
+                logs,
+                ["Clipboard RANGE failed reason=budget count=1 max_length=1048576"]
+            );
+            drop(held);
         }
 
         // oracle: mutant releasing a reservation when the RANGE is read or queued instead of when
@@ -1149,125 +1334,264 @@ mod real {
             const MIB: u32 = 1024 * 1024;
             let mut logs = Vec::new();
             let connection = range_connection(&mut logs);
-            let (_fixture, _channel, mut backend, jobs, mut ordered) =
-                offered_sparse_file("range-budget", 1 << 30);
+            let (_fixture, file) = sparse_file("range-budget", 1 << 30);
+            let mut offered = Offered::new(vec![file]);
             let mut held = Held::new();
+            let within_budget = |offered: &Offered, held: &Held| {
+                let (count, bytes) = offered.reserved();
+                assert!(count <= MAX_RANGE_RESPONSES_IN_FLIGHT);
+                assert!(bytes <= MAX_RANGE_BYTES_IN_FLIGHT);
+                assert!(held.len() <= count && held_bytes(held) <= bytes);
+            };
 
-            // Count limit: 100 small requests in one burst.
+            // Count limit: 100 small requests in one burst, each answered or deferred at once.
+            let mut refused = Vec::new();
             for stream_id in 0..100 {
-                backend.on_file_contents_request(range(
-                    stream_id,
-                    u64::from(stream_id) * u64::from(MIB),
-                    MIB,
-                ));
+                let answer =
+                    offered.request(range(stream_id, u64::from(stream_id) * u64::from(MIB), MIB));
+                assert!(answer.len() <= 1);
+                refused.extend(answer.into_iter().map(|(stream, data)| {
+                    assert!(data.is_none());
+                    stream
+                }));
+                within_budget(&offered, &held);
             }
-            while let Ok(job) = jobs.try_recv() {
-                job(&connection);
-            }
-            let failed = drain(&mut ordered, &mut held);
+            assert_eq!(refused, (16..100).collect::<Vec<_>>());
+            assert_eq!(offered.run_jobs(&connection), MAX_RANGE_RESPONSES_IN_FLIGHT);
+            offered.hold(&mut held);
+            within_budget(&offered, &held);
             assert_eq!(held.len(), MAX_RANGE_RESPONSES_IN_FLIGHT);
-            assert_eq!(failed, (16..100).collect::<Vec<_>>());
+            assert!(held
+                .iter()
+                .all(|response| response.instance == offered.cliprdr.instance()
+                    && response.data == Some(MIB as usize)));
 
             // Nothing more is served until the session writes a held frame.
-            backend.on_file_contents_request(range(100, 0, MIB));
-            assert_eq!(drain(&mut ordered, &mut held), [100]);
-            let (_, _, written) = held.remove(0);
-            let _ = written.send(());
-            backend.on_file_contents_request(range(101, 0, MIB));
-            while let Ok(job) = jobs.try_recv() {
-                job(&connection);
-            }
-            assert!(drain(&mut ordered, &mut held).is_empty());
+            assert_eq!(offered.request(range(100, 0, MIB)), [(100, None)]);
+            let _ = held.remove(0).completion.send(());
+            assert!(offered.request(range(101, 0, MIB)).is_empty());
+            offered.run_jobs(&connection);
+            offered.hold(&mut held);
+            within_budget(&offered, &held);
             assert_eq!(held.len(), MAX_RANGE_RESPONSES_IN_FLIGHT);
 
             // Byte limit: the largest requests fit twice.
-            for (_, _, completion) in held.drain(..) {
-                let _ = completion.send(());
+            for response in held.drain(..) {
+                let _ = response.completion.send(());
             }
+            let mut refused = Vec::new();
             for stream_id in 200..204 {
-                backend.on_file_contents_request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH));
+                refused.extend(offered.request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH)));
+                within_budget(&offered, &held);
             }
-            while let Ok(job) = jobs.try_recv() {
-                job(&connection);
-            }
-            assert_eq!(drain(&mut ordered, &mut held), [202, 203]);
-            let queued: usize = held.iter().map(|(_, bytes, _)| bytes).sum();
-            assert_eq!(queued as u64, MAX_RANGE_BYTES_IN_FLIGHT);
-            assert!(logs.iter().all(|line| !line.contains('/')));
+            assert_eq!(refused, [(202, None), (203, None)]);
+            offered.run_jobs(&connection);
+            offered.hold(&mut held);
+            within_budget(&offered, &held);
+            assert_eq!(held_bytes(&held), MAX_RANGE_BYTES_IN_FLIGHT);
+
+            offered.channel.jobs.log_refusals(&connection);
             assert_eq!(
-                logs.iter()
-                    .filter(|line| line.contains("reason=budget"))
-                    .count(),
-                84 + 1 + 2
+                logs,
+                ["Clipboard RANGE failed reason=budget count=87 max_length=16777216"]
             );
         }
 
-        // oracle: mutant keeping a reservation whose frame or job the session or clip thread dropped.
+        // oracle: mutant keeping a reservation whose frame the session dropped or failed to write, or
+        // whose job never ran or could not be submitted.
         #[test]
         fn dropped_responses_and_jobs_release_their_reservations() {
             let mut logs = Vec::new();
             let connection = range_connection(&mut logs);
-            let (_fixture, channel, mut backend, jobs, mut ordered) =
-                offered_sparse_file("range-release", 1 << 30);
+            let (_fixture, file) = sparse_file("range-release", 1 << 30);
+            let mut offered = Offered::new(vec![file]);
             let mut held = Held::new();
             for stream_id in 0..2 {
-                backend.on_file_contents_request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH));
+                assert!(offered
+                    .request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH))
+                    .is_empty());
             }
-            // One response reaches the queue and is discarded there; the other job never runs.
-            jobs.try_recv().unwrap()(&connection);
-            drain(&mut ordered, &mut held);
+            // One response reaches the session and its write fails or is canceled; the other job
+            // never runs.
+            offered.jobs.try_recv().unwrap()(&connection);
+            offered.hold(&mut held);
             assert_eq!(held.len(), 1);
+            assert_eq!(offered.reserved().0, 2);
             held.clear();
+            assert_eq!(offered.reserved().0, 1);
+            let Offered {
+                channel,
+                mut cliprdr,
+                jobs,
+                ..
+            } = offered;
             drop(jobs);
+            assert_eq!(lock(&channel.state).range_responses.len(), 1);
+
+            // The clip worker is gone: the RANGE fails at once and keeps no reservation.
+            let pdu = ClipboardPdu::FileContentsRequest(range(2, 0, MAX_FILE_RANGE_LENGTH));
+            let answer = answers(
+                cliprdr
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap(),
+            );
+            assert_eq!(answer, [(2, None)]);
             let mut state = lock(&channel.state);
             assert!(state.reserve_range(MAX_RANGE_BYTES_IN_FLIGHT).is_some());
         }
 
-        // oracle: mutant queuing a second copy of the text before the first response is handled.
+        // oracle: mutant reading a RANGE after the session started stopping.
         #[test]
-        fn text_responses_queue_one_copy_at_a_time() {
-            use ironrdp_client::rdp::RdpInputEvent;
-            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
-            let (work, _jobs) = mpsc::channel();
-            let channel = Channel::new(input, work);
-            let mut backend = CndfCliprdrBackend(channel.clone());
-            backend.on_ready();
-            channel.submit(ClipboardCommand::Text("가".repeat(1024)));
-            let text = FormatDataRequest {
-                format: ClipboardFormatId::CF_UNICODETEXT,
-            };
-            backend.on_format_data_request(text.clone());
-            backend.on_format_data_request(text.clone());
-            let mut responses = Vec::new();
-            while let Ok(event) = ordered.try_recv() {
-                match event {
-                    RdpInputEvent::ClipboardWithCompletion(
-                        Message::SendFormatData(response),
-                        completion,
-                    ) => {
-                        responses.push((response.is_error(), Some(completion)));
-                    }
-                    RdpInputEvent::Clipboard(Message::SendFormatData(response)) => {
-                        responses.push((response.is_error(), None));
-                    }
-                    _ => {}
-                }
+        fn stopping_sessions_start_no_more_reads() {
+            let mut logs = Vec::new();
+            let connection = range_connection(&mut logs);
+            let (fixture, file) = sparse_file("range-stop", 8);
+            let mut offered = Offered::new(vec![file]);
+            assert!(offered.request(range(1, 0, 8)).is_empty());
+            connection.stop.store(true, Ordering::Release);
+            // A read would fail and log once the file is gone.
+            drop(fixture);
+            assert_eq!(offered.run_jobs(&connection), 1);
+            assert!(offered.ordered.try_recv().is_err());
+            assert_eq!(offered.reserved(), (0, 0));
+            assert!(logs.is_empty());
+        }
+
+        // oracle: mutant resetting the budget when the session builds a new CLIPRDR processor, or
+        // naming another processor in a deferred response.
+        #[test]
+        fn new_clipboard_channels_share_the_budget_and_name_their_requests() {
+            let mut logs = Vec::new();
+            let connection = range_connection(&mut logs);
+            let (_fixture, file) = sparse_file("range-reconnect", 1 << 30);
+            let mut offered = Offered::new(vec![file]);
+            let mut held = Held::new();
+            for stream_id in 0..2 {
+                assert!(offered
+                    .request(range(stream_id, 0, MAX_FILE_RANGE_LENGTH))
+                    .is_empty());
             }
-            assert_eq!(
-                responses
-                    .iter()
-                    .map(|(error, _)| *error)
-                    .collect::<Vec<_>>(),
-                [false, true]
-            );
-            drop(responses);
-            backend.on_format_data_request(text);
-            let Ok(RdpInputEvent::ClipboardWithCompletion(Message::SendFormatData(response), _)) =
-                ordered.try_recv()
-            else {
-                panic!("expected a text response");
+            offered.run_jobs(&connection);
+            offered.hold(&mut held);
+            let previous = offered.cliprdr.instance();
+
+            // The same client connects again, here as after a server redirection.
+            offered.cliprdr = CliprdrClient::new(offered.channel.build_cliprdr_backend());
+            offered.ready();
+            let files = lock(&offered.channel.state)
+                .advertised
+                .iter()
+                .map(|file| LocalFile::clone(file))
+                .collect();
+            offered.channel.submit(ClipboardCommand::Files(files));
+            offered.hand_offer_to_cliprdr();
+            assert_ne!(offered.cliprdr.instance(), previous);
+            assert!(held.iter().all(|response| response.instance == previous));
+            assert_eq!(offered.request(range(2, 0, 1)), [(2, None)]);
+
+            held.clear();
+            assert!(offered.request(range(3, 0, 1)).is_empty());
+            offered.run_jobs(&connection);
+            offered.hold(&mut held);
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].instance, offered.cliprdr.instance());
+        }
+
+        // oracle: mutant deferring a response that needs no file read, or answering a request twice.
+        #[test]
+        fn each_file_contents_request_is_answered_once_with_its_stream() {
+            let mut logs = Vec::new();
+            let connection = range_connection(&mut logs);
+            let (_small, small) = sparse_file("range-outcomes-small", 10);
+            let (gone_fixture, gone) = sparse_file("range-outcomes-gone", 10);
+            let mut offered = Offered::new(vec![small, gone]);
+            let mut held = Held::new();
+            drop(gone_fixture);
+
+            let size = FileContentsRequest {
+                flags: FileContentsFlags::SIZE,
+                requested_size: 8,
+                ..range(1, 0, 8)
             };
-            assert!(!response.is_error());
+            assert_eq!(offered.request(size), [(1, Some(8))]);
+            // Upstream validation: an index past the offered files.
+            assert_eq!(
+                offered.request(FileContentsRequest {
+                    index: 2,
+                    ..range(2, 0, 1)
+                }),
+                [(2, None)]
+            );
+            assert_eq!(offered.request(range(3, 11, 1)), [(3, None)]);
+            assert_eq!(
+                offered.request(range(4, 0, MAX_FILE_RANGE_LENGTH + 1)),
+                [(4, None)]
+            );
+            // Windows asks for a full buffer at the end of a file.
+            assert!(offered.request(range(5, 7, 256 * 1024)).is_empty());
+            assert!(offered.request(range(6, 10, 1)).is_empty());
+            assert!(offered
+                .request(FileContentsRequest {
+                    index: 1,
+                    ..range(7, 0, 4)
+                })
+                .is_empty());
+            assert_eq!(offered.run_jobs(&connection), 3);
+            offered.hold(&mut held);
+            let deferred: Vec<_> = held
+                .iter()
+                .map(|response| (response.stream, response.data))
+                .collect();
+            assert_eq!(deferred, [(5, Some(3)), (6, Some(0)), (7, None)]);
+            assert!(offered.ordered.try_recv().is_err());
+            assert_eq!(offered.refused(Refusal::InvalidRange), 2);
+            assert_eq!(logs, ["Clipboard RANGE failed reason=range-read length=4"]);
+        }
+
+        // oracle: mutant queuing a text response for the session, which a blocked write would let
+        // pile up and a later failure overtake.
+        #[test]
+        fn text_responses_are_answered_in_request_order() {
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (channel, jobs) = test_channel(input);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            let ready = ClipboardPdu::FormatListResponse(FormatListResponse::Ok);
+            cliprdr
+                .process(&ironrdp_core::encode_vec(&ready).unwrap())
+                .unwrap();
+            channel.submit(ClipboardCommand::Text("가".repeat(1024)));
+            while ordered.try_recv().is_ok() {}
+
+            let mut answers = Vec::new();
+            for format in [
+                ClipboardFormatId::CF_UNICODETEXT,
+                ClipboardFormatId::CF_TEXT,
+                ClipboardFormatId::CF_UNICODETEXT,
+            ] {
+                let pdu = ClipboardPdu::FormatDataRequest(FormatDataRequest { format });
+                let output = cliprdr
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap();
+                assert_eq!(output.len(), 1);
+                let bytes = output[0].encode_unframed_pdu().unwrap();
+                let ClipboardPdu::FormatDataResponse(response) =
+                    ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap()
+                else {
+                    panic!("expected a format data response");
+                };
+                answers.push((response.is_error(), decode_text(response.data())));
+            }
+            let text = Some("가".repeat(1024));
+            assert_eq!(
+                answers,
+                [
+                    (false, text.clone()),
+                    (true, Some(String::new())),
+                    (false, text)
+                ]
+            );
+            assert!(ordered.try_recv().is_err());
+            assert!(jobs.try_recv().is_err());
         }
 
         #[test]
