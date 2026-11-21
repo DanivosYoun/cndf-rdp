@@ -1,0 +1,15 @@
+{
+  "name": "k1-b3-keyboard",
+  "runs": [
+    {"id": "b3-keyboard-standard", "host": "127.0.0.1", "port": 33894, "username": "harness", "passwordEnv": "HARNESS_B3_PASS",
+     "keyboardProfile": "standard",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 30},
+               {"op": "idle", "seconds": 2}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true}},
+    {"id": "b3-keyboard-korean", "host": "127.0.0.1", "port": 33894, "username": "harness", "passwordEnv": "HARNESS_B3_PASS",
+     "keyboardProfile": "korean",
+     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 30},
+               {"op": "idle", "seconds": 2}, {"op": "shutdown"}],
+     "expect": {"connected": true, "firstFrame": true}}
+  ]
+}

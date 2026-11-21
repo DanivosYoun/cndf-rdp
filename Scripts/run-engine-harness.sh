@@ -365,6 +365,62 @@ m3_b3() {
   return "$failed"
 }
 
+# K1 (Korean input design V2): the GCC keyboard fields each engine sends, per profile. B1 (IronRDP
+# server at debug level) logs the decoded Client Core Data; B3 (stock xrdp) logs the keymap it
+# loads for the layout. Fresh containers per engine so each log has only that engine's two
+# connections (standard, then korean). Passes when both runs connect and the extracted fields
+# match between the engines.
+keyboard_fields() {
+  local engine avail failed=0
+  avail="$(free -g | awk '/^Mem:/ {print $7}')"
+  (( avail >= 20 )) || { log "less than 20G available"; return 1; }
+  docker build --label "${LABEL}" -t "${B1_IMAGE}" "${ROOT_DIR}/Harness/docker/b1-ironrdp"
+  docker pull -q "${B3_IMAGE}" >/dev/null
+  secrets
+  # shellcheck disable=SC1091
+  source "${WORK}/secrets.env"
+  mac_build
+  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
+  mac "chmod 600 \$HOME/${MAC_DIR}/secrets.env"
+  tunnel_up "${PORT_B1}" "${PORT_B3}"
+  printf '999 harness %s sudo\n' "$(openssl passwd -6 "${HARNESS_B3_PASS}")" > "${WORK}/users.list"
+  chmod 644 "${WORK}/users.list"
+  for engine in freerdp ironrdp; do
+    mkdir -p "${WORK}/results/${engine}"
+    docker rm -fv "$(name b1)" >/dev/null 2>&1 || true
+    docker run -d --label "${LABEL}" --name "$(name b1)" -p "${BIND_IP}:${PORT_B1}:3389" \
+      -e IRONRDP_LOG=info,ironrdp_acceptor=debug -e NO_COLOR=1 -v "${WORK}/certs:/certs:ro" "${B1_IMAGE}" \
+      --sec hybrid --user harness --pass "${HARNESS_B1_PASS}" --cert /certs/a.pem --key /certs/a-key.pem >/dev/null
+    wait_port "${PORT_B1}"
+    ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/k1-b1-keyboard.json" --reset-trust 1 --drop-trust 1
+    docker logs "$(name b1)" > "${WORK}/results/${engine}/b1-server.log" 2>&1
+    { grep -oE 'keyboard_layout: [0-9]+|keyboard_type: KeyboardType\([0-9]+\)|keyboard_subtype: [0-9]+|keyboard_functional_keys_count: [0-9]+|ime_file_name: "[^"]*"' \
+        "${WORK}/results/${engine}/b1-server.log" || true; } | paste -d' ' - - - - - > "${WORK}/results/${engine}/b1-keyboard.txt"
+    docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
+    docker run -d --label "${LABEL}" --name "$(name b3)" -p "${BIND_IP}:${PORT_B3}:3389" --shm-size 1g \
+      -v "${WORK}/users.list:/etc/users.list:ro" "${B3_IMAGE}" >/dev/null
+    wait_port "${PORT_B3}"
+    ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/k1-b3-keyboard.json" --reset-trust 1 --drop-trust 1
+    docker exec "$(name b3)" cat /var/log/xrdp.log > "${WORK}/results/${engine}/b3-xrdp.log" 2>&1
+    { grep -oE '(Loading|Cannot find) keymap file [^ ]+' "${WORK}/results/${engine}/b3-xrdp.log" || true; } \
+      > "${WORK}/results/${engine}/b3-keyboard.txt"
+    mv "${WORK}/results"/k1-b[13]-keyboard.* "${WORK}/results/${engine}/"
+    local scenario
+    for scenario in k1-b1-keyboard k1-b3-keyboard; do
+      python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
+        "${WORK}/results/${engine}/${scenario}.json" || failed=1
+    done
+    rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync --include '*keyboard*.session.log' --exclude '*' \
+      "${MAC}:${MAC_DIR}/work/" "${WORK}/results/${engine}/sessions/" || failed=1
+    { grep -ohE 'RDP keyboard profile=[a-z]+ layout=0x[0-9a-f]+ type=[0-9]+ subtype=[0-9]+ fn=[0-9]+' \
+        "${WORK}/results/${engine}/sessions/"*.session.log || true; } | sort -u > "${WORK}/results/${engine}/client-keyboard.txt"
+  done
+  for file in client-keyboard.txt b1-keyboard.txt b3-keyboard.txt; do
+    diff -u "${WORK}/results/freerdp/${file}" "${WORK}/results/ironrdp/${file}" || failed=1
+  done
+  return "$failed"
+}
+
 down() {
   local n
   for n in b1 b1chain b2 b3 b4tls10 b4tls11 b4tls12; do
@@ -390,6 +446,10 @@ case "${1:-}" in
     trap down EXIT
     m3_b3 "${2:-both}"
     ;;
+  keyboard)
+    trap down EXIT
+    keyboard_fields
+    ;;
   m3-b1)
     trap down EXIT
     m3_b1 "${2:-both}"
@@ -408,7 +468,7 @@ case "${1:-}" in
     scenarios
     ;;
   *)
-    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls|m3-b1|m3-b3 [both|freerdp|ironrdp]" >&2
+    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls|m3-b1|m3-b3 [both|freerdp|ironrdp]|keyboard" >&2
     exit 2
     ;;
 esac

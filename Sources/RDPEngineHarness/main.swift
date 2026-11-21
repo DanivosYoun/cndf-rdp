@@ -419,7 +419,8 @@ private func runIteration(
         networkAutoDetect: run.networkAutoDetect ?? false,
         graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic,
         engine: engine,
-        pasteboardName: pasteboard?.name.rawValue
+        pasteboardName: pasteboard?.name.rawValue,
+        keyboardProfile: RDPKeyboardProfile(rawValue: run.keyboardProfile ?? "standard") ?? .standard
     )
 
     let size = run.window ?? HarnessSize(width: 1280, height: 800)
@@ -641,6 +642,25 @@ private func runIteration(
             result.audioWavesReceived = waves
             result.steps.append("audioExpectWaves:\(ok ? "ok" : "failed")")
             aborted = !ok
+        case "keys", "sharedKeys":
+            var shared: RDPSharedInputSession?
+            if step.op == "sharedKeys" {
+                let handle = MainActor.assumeIsolated { view.makeSharedInputSession() }
+                guard handle.activate() else {
+                    result.steps.append("sharedKeys:inactive")
+                    aborted = true
+                    continue
+                }
+                shared = handle
+            }
+            var script = KeyScript(view: view, window: window, shared: shared)
+            let unknown = script.play(step.text ?? "", pause: drainRunLoop)
+            if let shared {
+                shared.beginClose()
+                drainRunLoop(0.5)
+            }
+            drainRunLoop(step.seconds ?? 0.5)
+            result.steps.append("\(step.op):\(unknown.isEmpty ? "ok" : "unknown " + unknown.joined(separator: ","))")
         case "shutdown":
             result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {
