@@ -177,10 +177,10 @@ index 981f1fb..fcb681e 100644
  mod server_role;
 diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/paste_correlation.rs b/crates/ironrdp-testsuite-core/tests/clipboard/paste_correlation.rs
 new file mode 100644
-index 0000000..d3ec3bb
+index 0000000..48a3521
 --- /dev/null
 +++ b/crates/ironrdp-testsuite-core/tests/clipboard/paste_correlation.rs
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,226 @@
 +use std::sync::{Arc, Mutex};
 +
 +use ironrdp_cliprdr::CliprdrClient;
@@ -192,7 +192,7 @@ index 0000000..d3ec3bb
 +};
 +use ironrdp_core::encode_vec;
 +use ironrdp_svc::{SvcMessage, SvcProcessor as _};
-+use ironrdp_testsuite_core::clipboard::{HANDSHAKE_SERVER_FLAGS, TestBackend, real_now_ms};
++use ironrdp_testsuite_core::clipboard::{HANDSHAKE_SERVER_FLAGS, real_now_ms};
 +
 +fn file_list_id() -> ClipboardFormatId {
 +    ClipboardFormatId::new(49534)
@@ -207,7 +207,6 @@ index 0000000..d3ec3bb
 +#[derive(Debug)]
 +struct Backend {
 +    calls: Arc<Mutex<Calls>>,
-+    inline: bool,
 +    ready: bool,
 +    deferred: Option<ClipboardFormatId>,
 +}
@@ -235,7 +234,7 @@ index 0000000..d3ec3bb
 +    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
 +    fn paste_on_remote_copy(&mut self, formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
 +        let choice = formats.first().map(|format| format.id);
-+        if self.ready && self.inline {
++        if self.ready {
 +            choice
 +        } else {
 +            self.deferred = choice;
@@ -257,11 +256,10 @@ index 0000000..d3ec3bb
 +    }
 +}
 +
-+fn client(inline: bool) -> (CliprdrClient, Arc<Mutex<Calls>>) {
++fn client() -> (CliprdrClient, Arc<Mutex<Calls>>) {
 +    let calls = Arc::new(Mutex::new(Calls::default()));
 +    let mut cliprdr = CliprdrClient::new(Box::new(Backend {
 +        calls: Arc::clone(&calls),
-+        inline,
 +        ready: false,
 +        deferred: None,
 +    }));
@@ -290,24 +288,15 @@ index 0000000..d3ec3bb
 +    ClipboardFormat::new(file_list_id()).with_name(ClipboardFormatName::FILE_LIST)
 +}
 +
-+/// The PDU type of each output message, with the format list's formats and the requested format.
 +fn decoded(messages: Vec<SvcMessage>) -> Vec<String> {
 +    messages
 +        .iter()
 +        .map(|message| {
 +            let bytes = message.encode_unframed_pdu().unwrap();
 +            match ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap() {
-+                ClipboardPdu::Capabilities(_) => "Capabilities".to_owned(),
-+                ClipboardPdu::TemporaryDirectory(_) => "TemporaryDirectory".to_owned(),
-+                ClipboardPdu::FormatList(list) => {
-+                    let ids: Vec<u32> = list.get_formats(true).unwrap().iter().map(|f| f.id.value()).collect();
-+                    format!("FormatList{ids:?}")
-+                }
 +                ClipboardPdu::FormatListResponse(FormatListResponse::Ok) => "FormatListResponse::Ok".to_owned(),
-+                ClipboardPdu::FormatListResponse(FormatListResponse::Fail) => "FormatListResponse::Fail".to_owned(),
-+                ClipboardPdu::LockData(_) => "LockData".to_owned(),
 +                ClipboardPdu::FormatDataRequest(request) => format!("FormatDataRequest({})", request.format.value()),
-+                other => format!("{other:?}"),
++                other => panic!("unexpected output: {other:?}"),
 +            }
 +        })
 +        .collect()
@@ -327,20 +316,51 @@ index 0000000..d3ec3bb
 +
 +#[test]
 +fn ready_outputs_the_deferred_paste_once() {
-+    let (mut cliprdr, calls) = client(true);
++    let (mut cliprdr, calls) = client();
 +    cliprdr.process(&remote_copy(&[text_format()])).unwrap();
 +    assert_eq!(ready(&mut cliprdr), ["FormatDataRequest(13)"]);
 +    assert!(ready(&mut cliprdr).is_empty());
 +    assert_eq!(calls.lock().unwrap().ready, 1);
 +}
 +
++#[derive(Debug)]
++struct DefaultReadyBackend(Arc<Mutex<u32>>);
++
++ironrdp_core::impl_as_any!(DefaultReadyBackend);
++
++impl CliprdrBackend for DefaultReadyBackend {
++    fn temporary_directory(&self) -> &str {
++        ""
++    }
++    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
++        ClipboardGeneralCapabilityFlags::empty()
++    }
++    fn on_ready(&mut self) {
++        *self.0.lock().unwrap() += 1;
++    }
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
++    fn on_format_data_request(&mut self, _: FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
++    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: LockDataId) {}
++    fn on_unlock(&mut self, _: LockDataId) {}
++    fn now_ms(&self) -> u64 {
++        real_now_ms()
++    }
++}
++
 +#[test]
 +fn default_backend_becomes_ready_without_output() {
-+    let mut cliprdr = CliprdrClient::new(Box::new(TestBackend));
++    let calls = Arc::new(Mutex::new(0));
++    let mut cliprdr = CliprdrClient::new(Box::new(DefaultReadyBackend(Arc::clone(&calls))));
 +    cliprdr.process(&server_capabilities()).unwrap();
 +    assert!(ready(&mut cliprdr).is_empty());
 +    assert!(cliprdr.is_ready());
 +    assert!(ready(&mut cliprdr).is_empty());
++    assert_eq!(*calls.lock().unwrap(), 1);
 +}
 +
 +fn answer(cliprdr: &mut CliprdrClient, response: FormatDataResponse<'_>) {
@@ -353,7 +373,7 @@ index 0000000..d3ec3bb
 +fn answer_kind_is_recorded_at_send_time() {
 +    use RequestedFormat::{FileList, Other};
 +
-+    let (mut cliprdr, calls) = client(true);
++    let (mut cliprdr, calls) = client();
 +    ready(&mut cliprdr);
 +    cliprdr.process(&remote_copy(&[file_list_format()])).unwrap();
 +    cliprdr.process(&remote_copy(&[text_format()])).unwrap();
@@ -370,7 +390,7 @@ index 0000000..d3ec3bb
 +fn local_refusal_reports_its_own_kind_without_a_pending_entry() {
 +    use RequestedFormat::{FileList, Other};
 +
-+    let (mut cliprdr, calls) = client(true);
++    let (mut cliprdr, calls) = client();
 +    ready(&mut cliprdr);
 +    for _ in 0..64 {
 +        cliprdr.process(&remote_copy(&[text_format()])).unwrap();
