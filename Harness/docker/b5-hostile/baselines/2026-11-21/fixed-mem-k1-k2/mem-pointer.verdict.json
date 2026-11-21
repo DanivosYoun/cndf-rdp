@@ -1,0 +1,36 @@
+{
+  "scenario": "mem-pointer",
+  "attack": "pointer",
+  "args": {
+    "count": 512
+  },
+  "warmupFootprintMaxBytes": 26133272,
+  "attackFootprintMaxBytes": 53232480,
+  "growthBytes": 27099208,
+  "growthMiB": 25.8,
+  "limitBytes": 100663296,
+  "limitMiB": 96.0,
+  "wireBytes": 18890752,
+  "serverAttackLine": "b5 connection=2 attack=Pointer done wire=18890752 pointers=512 edge=384 after_bitmap_sent=true",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": null,
+  "attackFramesReceived": 2,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:25.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "connected",
+  "logPattern": null,
+  "logLines": [],
+  "checks": {
+    "budget": true,
+    "warmup": true,
+    "outcome": true
+  },
+  "passed": true
+}

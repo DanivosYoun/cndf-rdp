@@ -1,0 +1,80 @@
+{
+  "name": "mem-svc-rdpsnd",
+  "engine": "ironrdp",
+  "b5": {
+    "attack": "svc-rdpsnd",
+    "args": {
+      "bytes": 268435456
+    },
+    "pathBudgetBytes": 2097152,
+    "marginBytes": 67108864,
+    "outcome": "ended",
+    "note": "D1 rdpsnd message: 2 MiB, over it the session ends. The static rdpsnd channel exists with audio off only next to RDPDR, so the runs share Home. One 256 MiB message (1/4 of P1)."
+  },
+  "runs": [
+    {
+      "id": "warmup",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    },
+    {
+      "id": "attack",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 60
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    }
+  ]
+}

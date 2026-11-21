@@ -1,0 +1,79 @@
+{
+  "name": "mem-fp-mppc",
+  "engine": "ironrdp",
+  "b5": {
+    "attack": "fp-mppc",
+    "args": {
+      "bytes": 134217728
+    },
+    "pathBudgetBytes": 16777216,
+    "marginBytes": 67108864,
+    "outcome": "connected",
+    "note": "D1 fast-path reassembly: advertised MultifragmentUpdate 8 MiB, held <= 16 MiB (design I1-I3 test). 128 MiB reassembled from MPPC-64K Next fragments = 1/8 of design probe P2b (1000 MiB).",
+    "logPattern": "/crates/ironrdp-session/src/fast_path.rs:"
+  },
+  "runs": [
+    {
+      "id": "warmup",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    },
+    {
+      "id": "attack",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 20
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    }
+  ]
+}

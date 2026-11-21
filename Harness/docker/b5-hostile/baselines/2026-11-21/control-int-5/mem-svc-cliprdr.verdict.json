@@ -1,0 +1,37 @@
+{
+  "scenario": "mem-svc-cliprdr",
+  "attack": "svc-cliprdr",
+  "args": {
+    "bytes": 268435456
+  },
+  "warmupFootprintMaxBytes": 26116864,
+  "attackFootprintMaxBytes": 304743432,
+  "growthBytes": 278626568,
+  "growthMiB": 265.7,
+  "limitBytes": 134217728,
+  "limitMiB": 128.0,
+  "wireBytes": 268821350,
+  "serverAttackLine": "b5 connection=2 attack=SvcCliprdr done wire=268821350 channel=1005 message=268435456 after_bitmap_sent=true",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": null,
+  "attackFramesReceived": 2,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:60.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "connected",
+  "logPattern": "/crates/ironrdp-cliprdr/src/lib.rs:",
+  "logLines": [],
+  "checks": {
+    "budget": false,
+    "warmup": true,
+    "outcome": true,
+    "log": false
+  },
+  "passed": false
+}

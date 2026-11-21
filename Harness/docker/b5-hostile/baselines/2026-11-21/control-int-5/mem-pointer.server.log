@@ -1,0 +1,11 @@
+b5 listening 0.0.0.0:3389 attack=Pointer warmup=1 bytes=0 count=512 partial=0
+b5 accepted 192.168.131.240:43206
+b5 192.168.131.240:43206 error=[read frame by hint] custom error
+b5 accepted 192.168.131.240:52134
+b5 connection=1 active user=1002 cliprdr=None rdpsnd=None drdynvc=Some(1004)
+b5 connection=1 warmup
+b5 connection=1 closed client_bytes=32
+b5 accepted 192.168.131.240:50078
+b5 connection=2 active user=1002 cliprdr=None rdpsnd=None drdynvc=Some(1004)
+b5 connection=2 attack=Pointer done wire=18890752 pointers=512 edge=384 after_bitmap_sent=true
+b5 connection=2 closed client_bytes=32

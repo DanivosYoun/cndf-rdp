@@ -1,0 +1,11 @@
+b5 listening 0.0.0.0:3389 attack=SvcRdpsnd warmup=1 bytes=268435456 count=0 partial=0
+b5 accepted 192.168.131.240:34882
+b5 192.168.131.240:34882 error=[read frame by hint] custom error
+b5 accepted 192.168.131.240:34888
+b5 connection=1 active user=1002 cliprdr=None rdpsnd=Some(1005) drdynvc=Some(1006)
+b5 connection=1 warmup
+b5 connection=1 closed client_bytes=32
+b5 accepted 192.168.131.240:40686
+b5 connection=2 active user=1002 cliprdr=None rdpsnd=Some(1005) drdynvc=Some(1006)
+b5 connection=2 attack=SvcRdpsnd done wire=268821350 channel=1005 message=268435456 after_bitmap_sent=true
+b5 connection=2 closed client_bytes=32

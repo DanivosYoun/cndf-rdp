@@ -1,0 +1,81 @@
+{
+  "name": "mem-dvc-fanout",
+  "engine": "ironrdp",
+  "b5": {
+    "attack": "dvc-fanout",
+    "args": {
+      "count": 4000,
+      "partial": 60000
+    },
+    "pathBudgetBytes": 4194304,
+    "marginBytes": 67108864,
+    "outcome": "ended",
+    "note": "D1 DVC: audio DVC 2 MiB per message, 2 instances per factory name; a DataFirst declaring u32::MAX ends the session. 4000 Creates with 60 000 B each (P5b had 2000)."
+  },
+  "runs": [
+    {
+      "id": "warmup",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 8
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    },
+    {
+      "id": "attack",
+      "host": "127.0.0.1",
+      "port": 33899,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B5_PASS",
+      "shareHome": true,
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "idle",
+          "seconds": 60
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true
+      }
+    }
+  ]
+}

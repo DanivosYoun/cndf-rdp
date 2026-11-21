@@ -1,0 +1,37 @@
+{
+  "scenario": "mem-dvc-fanout",
+  "attack": "dvc-fanout",
+  "args": {
+    "count": 4000,
+    "partial": 60000
+  },
+  "warmupFootprintMaxBytes": 26166016,
+  "attackFootprintMaxBytes": 299205616,
+  "growthBytes": 273039600,
+  "growthMiB": 260.4,
+  "limitBytes": 71303168,
+  "limitMiB": 68.0,
+  "wireBytes": 240571490,
+  "serverAttackLine": "b5 connection=2 attack=DvcFanout done wire=240571490 creates=4000 partial=60000 after_bitmap_sent=true",
+  "attackConnected": true,
+  "attackFailure": null,
+  "attackFailureDetail": null,
+  "attackDisconnectBeforeShutdown": null,
+  "attackFramesReceived": 3,
+  "attackSteps": [
+    "connect:ok",
+    "waitConnected:ok",
+    "waitFirstFrame:ok",
+    "idle:60.0s",
+    "shutdown:ok"
+  ],
+  "expectedOutcome": "ended",
+  "logPattern": null,
+  "logLines": [],
+  "checks": {
+    "budget": false,
+    "warmup": true,
+    "outcome": false
+  },
+  "passed": false
+}
