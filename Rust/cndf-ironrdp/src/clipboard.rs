@@ -395,6 +395,15 @@ mod real {
                 descriptors.push(descriptor);
                 state.advertised.push(Arc::new(file.clone()));
             }
+            let rejected = files.len() - descriptors.len();
+            if rejected != 0 {
+                self.queue(move |connection| {
+                    connection.clip_log(
+                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                        &format!("Clipboard file offer rejected descriptors count={rejected}"),
+                    );
+                });
+            }
             if descriptors.is_empty() {
                 return self.send(Message::SendInitiateCopy(Vec::new()));
             }
@@ -581,7 +590,17 @@ mod real {
         }
 
         fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-            if lock(&self.0.state).pastes.pop_front() != Some(false) || response.is_error() {
+            let requested_file = lock(&self.0.state).pastes.pop_front();
+            if response.is_error() {
+                self.0.queue(|connection| {
+                    connection.clip_log(
+                        CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                        "Clipboard format data rejected reason=remote-failure",
+                    );
+                });
+                return;
+            }
+            if requested_file != Some(false) {
                 return;
             }
             let bytes = response.data().to_vec();
@@ -624,13 +643,20 @@ mod real {
                 return;
             }
             let input = self.0.input.clone();
-            self.0.queue(move |_| {
-                let data = file.and_then(|file| {
-                    read_file_contents_range(&file, request.position, request.requested_size)
+            self.0.queue(move |connection| {
+                let length = request.requested_size;
+                let data = file.ok_or("missing-file").and_then(|file| {
+                    read_file_contents_range(&file, request.position, length).ok_or("range-read")
                 });
                 let response = match data {
-                    Some(bytes) => FileContentsResponse::new_data_response(stream, bytes),
-                    None => FileContentsResponse::new_error(stream),
+                    Ok(bytes) => FileContentsResponse::new_data_response(stream, bytes),
+                    Err(reason) => {
+                        connection.clip_log(
+                            CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                            &format!("Clipboard RANGE failed reason={reason} length={length}"),
+                        );
+                        FileContentsResponse::new_error(stream)
+                    }
                 };
                 let _ = input.send_clipboard(Message::SendFileContentsResponse(response));
             });
@@ -835,6 +861,75 @@ mod real {
             }
             assert_eq!(responses, [(1, None), (2, None), (3, Some(vec![3]))]);
             assert!(cliprdr.process(&[]).is_err());
+        }
+
+        #[test]
+        fn clipboard_failures_log_only_reason_and_counts() {
+            extern "C" fn record_log(
+                _: u64,
+                _: CNDFIronLogLevel,
+                bytes: *const u8,
+                length: usize,
+                context: *mut std::ffi::c_void,
+            ) {
+                let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+                unsafe { &mut *context.cast::<Vec<String>>() }
+                    .push(String::from_utf8_lossy(bytes).into_owned());
+            }
+
+            let mut logs = Vec::<String>::new();
+            let connection = Connection {
+                generation: 1,
+                connected: AtomicBool::new(true),
+                stop: AtomicBool::new(false),
+                input: Mutex::default(),
+                clipboard: Mutex::default(),
+                log_level: CNDFIronLogLevel::CNDF_IRON_LOG_WARN,
+                callbacks: Arc::new(Callbacks {
+                    table: CNDFIronCallbacks {
+                        log: Some(record_log),
+                        context: (&mut logs as *mut Vec<String>).cast(),
+                        ..unsafe { std::mem::zeroed() }
+                    },
+                    gate: Mutex::default(),
+                    closed: AtomicBool::new(false),
+                }),
+                statistics: Arc::default(),
+            };
+
+            let (input, _events) = RdpInputSender::channel(1);
+            let (work, jobs) = mpsc::channel();
+            let channel = Channel::new(input, work);
+            let mut backend = CndfCliprdrBackend(channel.clone());
+            backend.on_process_negotiated_capabilities(Capabilities::STREAM_FILECLIP_ENABLED);
+            backend.on_ready();
+            channel.submit(ClipboardCommand::Files(vec![LocalFile {
+                path: "/private/path".into(),
+                name: "/private-name".into(),
+                size: 4,
+            }]));
+            backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+            backend.on_format_data_response(FormatDataResponse::new_error());
+            backend.on_file_contents_request(FileContentsRequest {
+                stream_id: 1,
+                index: 0,
+                flags: FileContentsFlags::RANGE,
+                position: 0,
+                requested_size: 8,
+                data_id: None,
+            });
+
+            while let Ok(job) = jobs.try_recv() {
+                job(&connection);
+            }
+            assert_eq!(
+                logs,
+                [
+                    "Clipboard file offer rejected descriptors count=1",
+                    "Clipboard format data rejected reason=remote-failure",
+                    "Clipboard RANGE failed reason=missing-file length=8",
+                ]
+            );
         }
 
         #[test]

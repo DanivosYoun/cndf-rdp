@@ -374,7 +374,7 @@ public final class IronRDPSession: RDPEngineSession {
             } catch ClipboardBridgeError.noSupportedPasteboardContent {
                 return
             } catch {
-                delegate?.rdpSession(self, didLog: "Local clipboard sync failed: \(error)")
+                emitLog("Local clipboard sync failed: \(error)")
                 throw error
             }
         }
@@ -396,7 +396,7 @@ public final class IronRDPSession: RDPEngineSession {
                 }
             }
         } catch {
-            delegate?.rdpSession(self, didLog: "Local file offer failed: \(error)")
+            emitLog("Local file offer failed: \(error)")
             throw error
         }
     }
@@ -475,7 +475,7 @@ public final class IronRDPSession: RDPEngineSession {
                 }
             } catch {
                 self?.deliverClipboard(generation, connection: connection) { session in
-                    session.delegate?.rdpSession(session, didLog: "Remote file materialization failed: \(error)")
+                    session.emitLog("Remote file materialization failed: \(error)")
                 }
             }
         }

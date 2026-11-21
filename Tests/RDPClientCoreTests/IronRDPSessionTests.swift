@@ -438,6 +438,7 @@ final class IronRDPSessionTests: XCTestCase {
         board.setString("unchanged", forType: .string)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
+        let log = root.appendingPathComponent("session.log")
         let session = try IronRDPSession(
             resizeCoordinator: DisplayResizeCoordinator(),
             certificateTrustTimeout: 5,
@@ -446,9 +447,17 @@ final class IronRDPSessionTests: XCTestCase {
         let recorder = Recorder(trust: true)
         session.delegate = recorder
         defer { try? session.disconnect() }
-        try session.connect(RDPConnectionOptions(host: "localhost", pasteboardName: board.name.rawValue),
+        try session.connect(RDPConnectionOptions(host: "localhost", logFileURL: log, pasteboardName: board.name.rawValue),
                             initialPointSize: CGSize(width: 800, height: 600), scale: 1)
         XCTAssertTrue(waitUntil { session.isConnected })
+
+        let missing = root.appendingPathComponent("missing.txt")
+        XCTAssertThrowsError(try session.sendLocalFiles([missing]))
+        board.clearContents()
+        board.writeObjects([missing as NSURL])
+        XCTAssertThrowsError(try session.pollLocalClipboard())
+        board.clearContents()
+        board.setString("unchanged", forType: .string)
 
         // The stub has no file at index zero. Its range reply must drive the failure path.
         Array("unavailable.txt".utf8).withUnsafeBufferPointer { name in
@@ -458,6 +467,10 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertTrue(waitUntil(timeout: 3) {
             recorder.logs.contains { $0.hasPrefix("Remote file materialization failed:") }
         })
+        let contents = try String(contentsOf: log, encoding: .utf8)
+        XCTAssertTrue(contents.contains("Local file offer failed:"))
+        XCTAssertTrue(contents.contains("Local clipboard sync failed:"))
+        XCTAssertTrue(contents.contains("Remote file materialization failed:"))
         XCTAssertEqual(board.string(forType: .string), "unchanged")
     }
 

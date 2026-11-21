@@ -1,0 +1,87 @@
+diff --git a/crates/ironrdp-rdpsnd-native/Cargo.toml b/crates/ironrdp-rdpsnd-native/Cargo.toml
+index 28e1564..a15d6ca 100644
+--- a/crates/ironrdp-rdpsnd-native/Cargo.toml
++++ b/crates/ironrdp-rdpsnd-native/Cargo.toml
+@@ -13,7 +13,6 @@ categories.workspace = true
+ 
+ [lib]
+ doctest = false
+-test = false
+ 
+ [features]
+ default = ["opus", "aac"]
+diff --git a/crates/ironrdp-rdpsnd-native/src/cpal.rs b/crates/ironrdp-rdpsnd-native/src/cpal.rs
+index 71edb3e..eb5fbac 100644
+--- a/crates/ironrdp-rdpsnd-native/src/cpal.rs
++++ b/crates/ironrdp-rdpsnd-native/src/cpal.rs
+@@ -371,9 +371,7 @@ impl RdpsndBackend {
+                 sample_rate,
+                 buffer_size: cpal::BufferSize::Default,
+             };
+-            thread::Builder::new()
+-                .name("rdpsnd-playback".to_owned())
+-                .spawn(move || run_stream(&selector, &config, playout, &shared, &volume))
++            spawn_playback(move || run_stream(&selector, &config, playout, &shared, &volume))
+                 .map_err(|e| {
+                     RdpsndNativeError::new("spawning the playback thread", RdpsndNativeErrorKind::StreamBuild)
+                         .with_source(e)
+@@ -395,6 +393,13 @@ impl RdpsndBackend {
+     }
+ }
+ 
++fn spawn_playback(run: impl FnOnce() + Send + 'static) -> std::io::Result<JoinHandle<()>> {
++    let dispatch = tracing::dispatcher::get_default(Clone::clone);
++    thread::Builder::new()
++        .name("rdpsnd-playback".to_owned())
++        .spawn(move || tracing::dispatcher::with_default(&dispatch, run))
++}
++
+ /// Formats advertised when the server's list is not consulted (see `choose_formats`).
+ fn fallback_formats() -> Vec<AudioFormat> {
+     let pcm = |channels: u16, rate: u32| AudioFormat {
+@@ -740,3 +745,45 @@ fn build_stream(
+ 
+     Ok(stream)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::AtomicUsize;
++    use tracing_subscriber::layer::{Context, SubscriberExt};
++    use tracing_subscriber::Layer;
++
++    struct CountFailures(Arc<AtomicUsize>);
++
++    impl<S: tracing::Subscriber> Layer<S> for CountFailures {
++        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
++            if matches!(*event.metadata().level(), tracing::Level::WARN | tracing::Level::ERROR) {
++                self.0.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++    }
++
++    #[test]
++    fn playback_thread_emits_to_its_own_session_dispatch() {
++        let first = Arc::new(AtomicUsize::new(0));
++        let second = Arc::new(AtomicUsize::new(0));
++        let first_session = tracing_subscriber::registry().with(CountFailures(Arc::clone(&first)));
++        let second_session = tracing_subscriber::registry().with(CountFailures(Arc::clone(&second)));
++
++        let first_worker = tracing::subscriber::with_default(first_session, || {
++            spawn_playback(|| warn!("playback warning")).unwrap()
++        });
++        let second_worker = tracing::subscriber::with_default(second_session, || {
++            spawn_playback(|| {
++                warn!("playback warning");
++                error!("playback error");
++            })
++            .unwrap()
++        });
++        first_worker.join().unwrap();
++        second_worker.join().unwrap();
++
++        assert_eq!(first.load(Ordering::Relaxed), 1);
++        assert_eq!(second.load(Ordering::Relaxed), 2);
++    }
++}

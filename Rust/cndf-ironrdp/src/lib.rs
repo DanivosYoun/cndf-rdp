@@ -290,10 +290,25 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=13\0"
+            " ironrdp=15b4a03ff552 patches=18\0"
         );
         version.as_ptr().cast()
     })
+}
+
+#[cfg(test)]
+#[test]
+fn version_reports_the_patch_count() {
+    #[cfg(feature = "stub")]
+    let count = 0;
+    #[cfg(not(feature = "stub"))]
+    let count = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/patches"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "patch"))
+        .count();
+    let version = unsafe { std::ffi::CStr::from_ptr(cndf_iron_version()) };
+    assert!(version.to_str().unwrap().ends_with(&format!(" patches={count}")));
 }
 
 #[no_mangle]
