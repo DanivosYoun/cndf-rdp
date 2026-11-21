@@ -1,0 +1,408 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index a748a76..67ab0f2 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -649,6 +649,11 @@ pub enum RdpInputEvent {
+     Close,
+     #[cfg(feature = "clipboard")]
+     Clipboard(ClipboardMessage),
++    /// A clipboard message whose completion is signaled once the session has handled it.
++    ///
++    /// See [`RdpInputSender::send_clipboard_with_completion`].
++    #[cfg(feature = "clipboard")]
++    ClipboardWithCompletion(ClipboardMessage, oneshot::Sender<()>),
+     SendDvcMessages {
+         channel_id: u32,
+         messages: Vec<SvcMessage>,
+@@ -785,6 +790,23 @@ impl RdpInputSender {
+         (sender, receiver)
+     }
+ 
++    /// Creates input queues for integration tests, returning the ordered queue that carries
++    /// clipboard, USB and PnP events as well.
++    ///
++    /// # Panics
++    ///
++    /// Panics if `capacity` is zero.
++    pub fn channel_with_ordered_queue(
++        capacity: usize,
++    ) -> (
++        Self,
++        mpsc::Receiver<RdpInputEvent>,
++        mpsc::UnboundedReceiver<RdpInputEvent>,
++    ) {
++        let (sender, receiver, ordered, _, _) = Self::channel_with_close_signal(capacity);
++        (sender, receiver, ordered)
++    }
++
+     pub(crate) fn channel_with_close_signal(
+         capacity: usize,
+     ) -> (
+@@ -888,6 +910,23 @@ impl RdpInputSender {
+         self.clipboard_sender.send(RdpInputEvent::Clipboard(message))
+     }
+ 
++    /// Enqueues a clipboard protocol message like [`Self::send_clipboard`] and signals `completion`
++    /// once the session has handled it, including the transport write of the frame it produced.
++    ///
++    /// Await or poll the receiver before producing more clipboard data to bound queued data.
++    /// The receiver returns an error if the session ends before handling the message, or if handling
++    /// it or writing its frame fails. Messages handled without output, such as those dropped before
++    /// the channel is ready, also complete. Completion does not confirm that the peer accepted the data.
++    #[cfg(feature = "clipboard")]
++    pub fn send_clipboard_with_completion(
++        &self,
++        message: ClipboardMessage,
++        completion: oneshot::Sender<()>,
++    ) -> Result<(), mpsc::error::SendError<RdpInputEvent>> {
++        self.clipboard_sender
++            .send(RdpInputEvent::ClipboardWithCompletion(message, completion))
++    }
++
+     /// Enqueues a USB redirection event independently of ordinary bounded input.
+     ///
+     /// Dropping a USB completion would leave the server-side driver waiting for its request forever.
+@@ -4883,6 +4922,10 @@ async fn active_session(
+         } else {
+             None
+         };
++        // INVARIANT: Holds the completion of the clipboard message this iteration handles until
++        // every output frame of the iteration is written, or drops it if the session ends first.
++        #[cfg(feature = "clipboard")]
++        let mut clipboard_completion: Option<oneshot::Sender<()>> = None;
+         let mut iteration = if let Some(outputs) = initial_outputs.take() {
+             ActiveSessionIteration::outputs(outputs)
+         } else if let Some(iteration) = buffered_udp_iteration {
+@@ -5052,6 +5095,11 @@ async fn active_session(
+                             Some(RdpInputEvent::Clipboard(event)) => {
+                                 ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
+                             }
++                            #[cfg(feature = "clipboard")]
++                            Some(RdpInputEvent::ClipboardWithCompletion(event, completion)) => {
++                                clipboard_completion = Some(completion);
++                                ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
++                            }
+                             #[cfg(feature = "usb")]
+                             Some(RdpInputEvent::Urbdrc(event)) => urbdrc_iteration(&mut active_stage, event)?,
+                             #[cfg(feature = "pnp")]
+@@ -5213,6 +5261,11 @@ async fn active_session(
+                     RdpInputEvent::Clipboard(event) => {
+                         ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
+                     }
++                    #[cfg(feature = "clipboard")]
++                    RdpInputEvent::ClipboardWithCompletion(event, completion) => {
++                        clipboard_completion = Some(completion);
++                        ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
++                    }
+                     RdpInputEvent::SendDvcMessages { channel_id, messages } => {
+                         trace!(channel_id, ?messages, "Send DVC messages");
+                         ActiveSessionIteration::dvc(
+@@ -6220,6 +6273,12 @@ async fn active_session(
+             }
+         }
+ 
++        #[cfg(feature = "clipboard")]
++        if let Some(completion) = clipboard_completion.take() {
++            // The producer may have stopped waiting.
++            let _ = completion.send(());
++        }
++
+         let current_rdpei_input_state = active_stage.rdpei_input_state();
+         if rdpei_input_state != Some(current_rdpei_input_state) {
+             rdpei_input_state = Some(current_rdpei_input_state);
+@@ -8266,6 +8325,43 @@ mod tests {
+         ));
+     }
+ 
++    // oracle: mutant routing completions through the bounded input queue or leaving a discarded
++    // completion open.
++    #[cfg(feature = "clipboard")]
++    #[test]
++    fn clipboard_completions_use_the_ordered_queue_and_close_when_discarded() {
++        let (sender, _input_receiver, mut clipboard_receiver, _, _) = RdpInputSender::channel_with_close_signal(1);
++        sender
++            .try_send(RdpInputEvent::Resize {
++                width: 1024,
++                height: 768,
++                scale_factor: 100,
++                physical_size: None,
++            })
++            .expect("the first event fits");
++
++        let (completion, mut handled) = oneshot::channel();
++        sender
++            .send_clipboard_with_completion(ClipboardMessage::SendInitiateCopy(Vec::new()), completion)
++            .expect("clipboard messages use a dedicated queue");
++        let Ok(RdpInputEvent::ClipboardWithCompletion(ClipboardMessage::SendInitiateCopy(_), completion)) =
++            clipboard_receiver.try_recv()
++        else {
++            panic!("expected the clipboard message with its completion");
++        };
++        assert_eq!(handled.try_recv(), Err(oneshot::error::TryRecvError::Empty));
++        drop(completion);
++        assert_eq!(handled.try_recv(), Err(oneshot::error::TryRecvError::Closed));
++
++        drop(clipboard_receiver);
++        let (completion, mut handled) = oneshot::channel();
++        let rejected =
++            sender.send_clipboard_with_completion(ClipboardMessage::SendInitiateCopy(Vec::new()), completion);
++        assert!(rejected.is_err());
++        drop(rejected);
++        assert_eq!(handled.try_recv(), Err(oneshot::error::TryRecvError::Closed));
++    }
++
+     // oracle: mutant (orders dropped or altered between the session loop and the output consumer)
+     #[tokio::test]
+     async fn windowing_orders_are_delivered_to_the_output_consumer() {
+diff --git a/crates/ironrdp-testsuite-extra/tests/e2e.rs b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+index 83b5086..6a7a308 100644
+--- a/crates/ironrdp-testsuite-extra/tests/e2e.rs
++++ b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+@@ -6587,6 +6587,247 @@ async fn client_session_result(
+     .await
+ }
+ 
++/// Client clipboard backend that requests the initial empty Format List and reports when the channel is ready.
++struct ReadyClipboard {
++    input: ironrdp_client::rdp::RdpInputSender,
++    ready: Option<oneshot::Sender<()>>,
++}
++
++impl core::fmt::Debug for ReadyClipboard {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("ReadyClipboard").finish_non_exhaustive()
++    }
++}
++
++impl_as_any!(ReadyClipboard);
++
++impl ironrdp::cliprdr::backend::CliprdrBackend for ReadyClipboard {
++    fn temporary_directory(&self) -> &str {
++        ".cliprdr"
++    }
++    fn client_capabilities(&self) -> ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags {
++        ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags::empty()
++    }
++    fn on_ready(&mut self) {
++        if let Some(ready) = self.ready.take() {
++            let _ = ready.send(());
++        }
++    }
++    fn on_request_format_list(&mut self) {
++        let _ = self
++            .input
++            .send_clipboard(ironrdp::cliprdr::backend::ClipboardMessage::SendInitiateCopy(Vec::new()));
++    }
++    fn on_process_negotiated_capabilities(&mut self, _: ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ironrdp::cliprdr::pdu::ClipboardFormat]) {}
++    fn on_format_data_request(&mut self, _: ironrdp::cliprdr::pdu::FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: ironrdp::cliprdr::pdu::FormatDataResponse<'_>) {}
++    fn on_file_contents_request(&mut self, _: ironrdp::cliprdr::pdu::FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, _: ironrdp::cliprdr::pdu::FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++    fn on_unlock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++}
++
++struct ReadyClipboardFactory {
++    input: ironrdp_client::rdp::RdpInputSender,
++    ready: StdMutex<Option<oneshot::Sender<()>>>,
++}
++
++impl ironrdp::cliprdr::backend::CliprdrBackendFactory for ReadyClipboardFactory {
++    fn build_cliprdr_backend(&self) -> Box<dyn ironrdp::cliprdr::backend::CliprdrBackend> {
++        Box::new(ReadyClipboard {
++            input: self.input.clone(),
++            ready: self.ready.lock().unwrap().take(),
++        })
++    }
++}
++
++/// Relays one connection to `server`, and stops reading from the client while `paused` is set, so the client's
++/// socket writes block once the socket buffers fill.
++async fn pausable_proxy(server: SocketAddr, mut paused: tokio::sync::watch::Receiver<bool>) -> SocketAddr {
++    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
++
++    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
++    socket.set_recv_buffer_size(4096).expect("SO_RCVBUF");
++    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
++    let listener = socket.listen(1).expect("listen");
++    let address = listener.local_addr().expect("proxy address");
++    tokio::task::spawn_local(async move {
++        let (client, _) = listener.accept().await.expect("the client connects");
++        let upstream = TcpStream::connect(server).await.expect("the server accepts");
++        let (mut client_read, mut client_write) = client.into_split();
++        let (mut upstream_read, mut upstream_write) = upstream.into_split();
++        let down = async move {
++            let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
++            let _ = client_write.shutdown().await;
++        };
++        let up = async move {
++            let mut buffer = vec![0; 64 * 1024];
++            loop {
++                while *paused.borrow_and_update() {
++                    if paused.changed().await.is_err() {
++                        return;
++                    }
++                }
++                let read = match client_read.read(&mut buffer).await {
++                    Ok(0) | Err(_) => break,
++                    Ok(read) => read,
++                };
++                if upstream_write.write_all(&buffer[..read]).await.is_err() {
++                    break;
++                }
++            }
++            let _ = upstream_write.shutdown().await;
++        };
++        tokio::join!(down, up);
++    });
++    address
++}
++
++/// Connects an `RdpClient` with a clipboard channel to a cliprdr server through [`pausable_proxy`], and runs `test`
++/// once the clipboard channel is ready.
++async fn with_ready_client_clipboard<F>(
++    test: impl FnOnce(
++        ironrdp_client::rdp::RdpInputSender,
++        tokio::sync::watch::Sender<bool>,
++        tokio::task::JoinHandle<()>,
++    ) -> F,
++) where
++    F: Future<Output = ()>,
++{
++    use ironrdp_client::rdp::{RdpClient, RdpOutputEvent};
++
++    let identity = test_tls_identity();
++    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
++    let (_display_tx, display_rx) = mpsc::unbounded_channel();
++    let mut server = RdpServer::builder()
++        .with_addr(([127, 0, 0, 1], 0))
++        .with_hybrid(acceptor, identity.pub_key)
++        .with_input_handler(TestInputHandler)
++        .with_display_handler(TestDisplay {
++            rx: Arc::new(Mutex::new(display_rx)),
++            offers_display_control: true,
++        })
++        .with_cliprdr_factory(Some(Box::new(NoClipboardFactory)))
++        .build();
++    server.set_credentials(Some(server::Credentials {
++        username: HYBRID_USER.into(),
++        password: HYBRID_PASSWORD.into(),
++        domain: None,
++    }));
++    let handle = server.handle().clone();
++    let local = tokio::task::LocalSet::new();
++    Box::pin(local.run_until(async move {
++        let server_task = tokio::task::spawn_local(async move {
++            let _ = server.run().await;
++        });
++        let server_address = handle.local_addr().await.unwrap().unwrap();
++        let (pause, paused) = tokio::sync::watch::channel(false);
++        let proxy_address = pausable_proxy(server_address, paused).await;
++        let config = ironrdp_client::config::ConfigBuilder::new()
++            .with_destination(ironrdp_client::config::Destination::from_parts(
++                "127.0.0.1",
++                proxy_address.port(),
++            ))
++            .with_username(HYBRID_USER)
++            .with_password(HYBRID_PASSWORD)
++            .with_credssp(true)
++            .with_client_build(1)
++            .with_client_dir("C:\\")
++            .with_platform(MajorPlatformType::WINDOWS)
++            .with_client_name("client")
++            .with_clipboard(ironrdp_client::config::ClipboardType::Enable)
++            .build()
++            .expect("client configuration");
++        let (output_tx, mut output_rx) = ironrdp_client::output_channel::output_channel(64);
++        let client = RdpClient::new(config, output_tx);
++        let input = client.input_sender();
++        let (ready_tx, ready_rx) = oneshot::channel();
++        let client = client.with_cliprdr_backend_factory(Box::new(ReadyClipboardFactory {
++            input: input.clone(),
++            ready: StdMutex::new(Some(ready_tx)),
++        }));
++        let client_task = tokio::task::spawn_local(client.run());
++        let events = tokio::task::spawn_local(async move {
++            while let Some(event) = output_rx.recv().await {
++                assert!(
++                    !matches!(event, RdpOutputEvent::ConnectionFailure(_)),
++                    "the client failed: {event:?}"
++                );
++            }
++        });
++        tokio::time::timeout(Duration::from_secs(20), ready_rx)
++            .await
++            .expect("the clipboard channel becomes ready in time")
++            .expect("the clipboard channel becomes ready");
++        test(input, pause, client_task).await;
++        events.abort();
++        server_task.abort();
++    }))
++    .await;
++}
++
++/// A clipboard message larger than what the socket buffers on both sides of the proxy hold.
++fn large_file_contents_response() -> ironrdp::cliprdr::backend::ClipboardMessage {
++    ironrdp::cliprdr::backend::ClipboardMessage::SendFileContentsResponse(
++        ironrdp::cliprdr::pdu::FileContentsResponse::new_data_response(1, vec![0x5A; 16 * 1024 * 1024]),
++    )
++}
++
++/// The completion of a clipboard message stays pending while its frame cannot be written, and is signaled
++/// once the write finishes.
++// oracle: mutant signaling the completion before the iteration's frames are written
++#[tokio::test]
++async fn client_clipboard_completion_waits_for_a_blocked_write() {
++    with_ready_client_clipboard(|input, pause, client_task| async move {
++        pause.send(true).unwrap();
++        let (completion, mut handled) = oneshot::channel();
++        input
++            .send_clipboard_with_completion(large_file_contents_response(), completion)
++            .expect("the session is running");
++        tokio::time::sleep(Duration::from_millis(500)).await;
++        assert_eq!(
++            handled.try_recv(),
++            Err(oneshot::error::TryRecvError::Empty),
++            "the completion was signaled before the frame was written"
++        );
++        pause.send(false).unwrap();
++        tokio::time::timeout(Duration::from_secs(10), handled)
++            .await
++            .expect("the completion arrives once the write finishes")
++            .expect("the session signals rather than drops the completion");
++        input.request_close();
++        let _ = tokio::time::timeout(Duration::from_secs(5), client_task).await;
++    })
++    .await;
++}
++
++/// Closing the session while a clipboard frame is blocked drops its completion without signaling it.
++// oracle: mutant signaling the completion when the blocked write is canceled, or keeping it after the session ends
++#[tokio::test]
++async fn client_clipboard_completion_closes_when_the_session_ends() {
++    with_ready_client_clipboard(|input, pause, client_task| async move {
++        pause.send(true).unwrap();
++        let (completion, mut handled) = oneshot::channel();
++        input
++            .send_clipboard_with_completion(large_file_contents_response(), completion)
++            .expect("the session is running");
++        tokio::time::sleep(Duration::from_millis(500)).await;
++        assert_eq!(handled.try_recv(), Err(oneshot::error::TryRecvError::Empty));
++        input.request_close();
++        let closed = tokio::time::timeout(Duration::from_secs(2), handled)
++            .await
++            .expect("the completion closes when the session ends");
++        assert!(closed.is_err(), "the completion was signaled for an unwritten frame");
++        tokio::time::timeout(Duration::from_secs(2), client_task)
++            .await
++            .expect("the client stops")
++            .unwrap();
++        drop(pause);
++    })
++    .await;
++}
++
+ /// An `RdpClient` follows a Server Redirection PDU received during its session to the target, here the same
+ /// server since the PDU carries no port.
+ /// The new connection carries the load-balancing information as the X.224 routing token, the session ID in the
