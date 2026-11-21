@@ -748,29 +748,44 @@ mod real {
             }
         }
 
-        fn on_request_format_list(&mut self) {
+        // CLIPRDR calls `initial_format_list` instead.
+        fn on_request_format_list(&mut self) {}
+
+        /// Returns the format list in the iteration of the server's Monitor Ready, so a repeated
+        /// Monitor Ready queues nothing for the session.
+        fn initial_format_list(&mut self) -> Option<Vec<ClipboardFormat>> {
             let mut state = lock(&self.0.state);
             state.dirty_offer = matches!(state.offer, Offer::Files(_));
-            let formats = if matches!(state.offer, Offer::Text(_)) {
+            Some(if matches!(state.offer, Offer::Text(_)) {
                 vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
             } else {
                 Vec::new()
-            };
-            self.0.send(Message::SendInitiateCopy(formats));
+            })
         }
 
         fn on_process_negotiated_capabilities(&mut self, capabilities: Capabilities) {
             lock(&self.0.state).negotiated = Some(capabilities);
         }
 
-        fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+        // CLIPRDR calls `paste_on_remote_copy` instead.
+        fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
+
+        /// Pastes in the iteration of the server's Format List, so a repeated copy queues nothing
+        /// for the session. Before the channel is ready the choice waits for `on_ready`.
+        fn paste_on_remote_copy(
+            &mut self,
+            formats: &[ClipboardFormat],
+        ) -> Option<ClipboardFormatId> {
             let mut state = lock(&self.0.state);
             let choice = choose_format(formats);
             if !state.ready {
                 state.deferred_paste = choice;
-            } else if let Some((id, file)) = choice {
-                self.0.paste(&mut state, id, file);
+                return None;
             }
+            let (id, file) = choice?;
+            // A paste CLIPRDR does not send is failed locally, which takes this entry back.
+            state.pastes.push_back(file);
+            Some(id)
         }
 
         // CLIPRDR calls `respond_to_format_data_request` instead.
@@ -953,13 +968,18 @@ mod real {
                 }),
                 CNDF_IRON_NOT_CONNECTED
             );
-            backend.on_request_format_list();
-            assert!(
-                matches!(receive.try_recv().unwrap(), Message::SendInitiateCopy(formats) if formats.is_empty())
-            );
+            assert!(backend
+                .initial_format_list()
+                .is_some_and(|formats| formats.is_empty()));
+            assert!(receive.try_recv().is_err());
             channel.submit(ClipboardCommand::Text("한글".into()));
             assert!(receive.try_recv().is_err());
-            backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+            assert_eq!(
+                backend.paste_on_remote_copy(&[ClipboardFormat::new(
+                    ClipboardFormatId::CF_UNICODETEXT
+                )]),
+                None
+            );
             backend.on_ready();
             assert!(
                 matches!(receive.try_recv().unwrap(), Message::SendInitiateCopy(formats)
@@ -1127,7 +1147,8 @@ mod real {
                 name: "/private-name".into(),
                 size: 4,
             }]));
-            backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+            backend
+                .paste_on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
             backend.on_format_data_response(FormatDataResponse::new_error());
             let missing =
                 backend.respond_to_file_contents_request(range(1, 0, 8), other_instance());
@@ -1328,15 +1349,15 @@ mod real {
             fn remote_paste(&mut self, format: ClipboardFormat, response: OwnedFormatDataResponse) {
                 let copy =
                     ClipboardPdu::FormatList(FormatList::new_unicode(&[format], true).unwrap());
-                self.cliprdr
+                let output = self
+                    .cliprdr
                     .process(&ironrdp_core::encode_vec(&copy).unwrap())
                     .unwrap();
-                let Ok(RdpInputEvent::Clipboard(Message::SendInitiatePaste(id))) =
-                    self.ordered.try_recv()
-                else {
-                    panic!("expected a paste");
-                };
-                self.cliprdr.initiate_paste(id).unwrap();
+                assert_eq!(
+                    kinds(&output).last().map(String::as_str),
+                    Some("FormatDataRequest")
+                );
+                assert!(self.ordered.try_recv().is_err());
                 let pdu = ClipboardPdu::FormatDataResponse(response);
                 assert!(self
                     .cliprdr
@@ -1445,6 +1466,19 @@ mod real {
                 files: vec![FileDescriptor::new(name).with_file_size(size)],
             })
             .unwrap()
+        }
+
+        /// The CLIPRDR PDU type of each message in `output`.
+        fn kinds(output: &[SvcMessage]) -> Vec<String> {
+            output
+                .iter()
+                .map(|message| {
+                    let bytes = message.encode_unframed_pdu().unwrap();
+                    let pdu = ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap();
+                    let debug = format!("{pdu:?}");
+                    debug.split('(').next().unwrap().to_owned()
+                })
+                .collect()
         }
 
         fn answers(output: Vec<SvcMessage>) -> Vec<(u32, Option<usize>)> {
@@ -1911,16 +1945,15 @@ mod real {
                 let copy = ClipboardPdu::FormatList(
                     FormatList::new_unicode(&[text_format()], true).unwrap(),
                 );
-                cliprdr
+                let output = cliprdr
                     .process(&ironrdp_core::encode_vec(&copy).unwrap())
                     .unwrap();
-                let Ok(RdpInputEvent::Clipboard(Message::SendInitiatePaste(id))) =
-                    ordered.try_recv()
-                else {
-                    panic!("expected a paste");
-                };
-                cliprdr.initiate_paste(id).unwrap();
+                assert_eq!(
+                    kinds(&output).last().map(String::as_str),
+                    Some("FormatDataRequest")
+                );
             }
+            assert!(ordered.try_recv().is_err());
 
             // The server answers the first paste with text over the limit, in fragments.
             let mut svc = ironrdp_svc::StaticVirtualChannel::new(cliprdr);
@@ -1955,6 +1988,58 @@ mod real {
                     "Clipboard remote data dropped reason=oversized count=1 max_length={DECLARED}"
                 )]
             );
+        }
+
+        // oracle: mutant answering Monitor Ready or Format List through the session's ordered queue,
+        // advertising the app's clipboard on connection, not counting a sent paste, or pasting past
+        // the bound on unanswered requests.
+        #[test]
+        fn repeated_monitor_ready_and_copies_are_answered_without_queuing_for_the_session() {
+            let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            let mut process = |pdu: ClipboardPdu<'_>| {
+                cliprdr
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap()
+            };
+            let capabilities = ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                ClipboardProtocolVersion::V2,
+                Capabilities::USE_LONG_FORMAT_NAMES,
+            ));
+            assert!(process(capabilities).is_empty());
+
+            // A new connection advertises an empty format list in the initialization batch.
+            let output = process(ClipboardPdu::MonitorReady);
+            assert_eq!(
+                kinds(&output),
+                ["Capabilities", "TemporaryDirectory", "FormatList"]
+            );
+            let bytes = output[2].encode_unframed_pdu().unwrap();
+            let ClipboardPdu::FormatList(list) = ironrdp_core::decode(&bytes).unwrap() else {
+                panic!("expected a format list");
+            };
+            assert!(list.get_formats(true).unwrap().is_empty());
+            assert!(process(ClipboardPdu::FormatListResponse(FormatListResponse::Ok)).is_empty());
+
+            let mut requests = 0;
+            for _ in 0..1000 {
+                assert_eq!(kinds(&process(ClipboardPdu::MonitorReady)), ["FormatList"]);
+                let copy = ClipboardPdu::FormatList(
+                    FormatList::new_unicode(&[text_format()], true).unwrap(),
+                );
+                let output = kinds(&process(copy));
+                assert_eq!(output[0], "FormatListResponse");
+                assert!(output[1..].iter().all(|kind| kind == "FormatDataRequest"));
+                requests += output.len() - 1;
+            }
+            let mut queued = 0;
+            while ordered.try_recv().is_ok() {
+                queued += 1;
+            }
+            assert_eq!(queued, 0);
+            assert_eq!(requests, 64);
+            assert_eq!(lock(&channel.state).pastes.len(), 64);
         }
 
         // oracle: mutant clip worker that never delivers the held server data.
