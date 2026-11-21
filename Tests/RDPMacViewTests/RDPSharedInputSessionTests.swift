@@ -562,6 +562,57 @@ final class RDPSharedInputSessionTests: XCTestCase {
         ])
     }
 
+    /// The local view quantizes AppKit lines itself and flips the horizontal sign once; a share
+    /// submits the same AppKit-signed rotation and the session flips it once. Both must reach the
+    /// engine as the same rotation, saturating symmetrically at ±255.
+    @MainActor
+    func testLocalViewAndSharedSessionSendTheSameWheelRotation() throws {
+        try checkLocalViewAndSharedSessionSendTheSameWheelRotation(try RDPSession())
+        try checkLocalViewAndSharedSessionSendTheSameWheelRotation(try IronRDPSession())
+    }
+
+    @MainActor
+    private func checkLocalViewAndSharedSessionSendTheSameWheelRotation(_ native: RDPEngineSession) throws {
+        let queue = ManualQueue()
+        let sender = FakeSender()
+        _ = RDPInputExecutorRegistry.executor(for: native, schedule: queue.schedule, makeSender: { _, _ in sender })
+        let view = RDPClientView(frame: .zero)
+        view.session = native
+        let share = view.makeSharedInputSession()
+        XCTAssertTrue(share.activate())
+
+        func wheel(y: Int32, x: Int32) throws -> NSEvent {
+            let cgEvent = try XCTUnwrap(CGEvent(
+                scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0
+            ))
+            return try XCTUnwrap(NSEvent(cgEvent: cgEvent))
+        }
+        func deltas() -> [[Int32]] {
+            sender.events.compactMap {
+                if case let .scroll(_, _, dx, dy) = $0 { return [dx, dy] }
+                return nil
+            }
+        }
+
+        for (y, x) in [(Int32(1), Int32(1)), (-1, -1), (3, 3), (-3, -3)] {
+            sender.events.removeAll()
+            view.scrollWheel(with: try wheel(y: y, x: x))
+            queue.runAll()
+            let local = deltas()
+            var quantizer = RDPWheelQuantizer()
+            let rotation = quantizer.quantize(deltaX: Double(x), deltaY: Double(y))
+            sender.events.removeAll()
+            XCTAssertTrue(share.submit(.scroll(x: 0, y: 0, deltaY: rotation.y, deltaX: rotation.x, modifiers: [])))
+            queue.runAll()
+            XCTAssertEqual(local, deltas(), "y=\(y) x=\(x)")
+            let notch = min(Int32(255), 120 * abs(y))
+            XCTAssertEqual(local, [[-notch * x.signum(), notch * y.signum()]], "right is server-negative after the flip")
+        }
+        share.beginClose()
+        queue.runAll()
+        view.session = nil
+    }
+
     func testChordPressesInOrderReleasesInReverseAndKeepsAlreadyHeldInputs() async {
         let h = Harness()
         let session = h.activeSession()
