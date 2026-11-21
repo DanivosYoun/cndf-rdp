@@ -1,0 +1,108 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 0feb7b0..fa5ca39 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -1136,6 +1136,27 @@ impl ResizeQueue {
+         self.in_flight = None;
+     }
+ 
++    fn discard_timed_out_request(&mut self, reason: DisplayResizeFallbackReason) {
++        match reason {
++            DisplayResizeFallbackReason::ReactivationTimedOut => self.completed(),
++            DisplayResizeFallbackReason::CapabilitiesTimedOut => self.pending = None,
++            DisplayResizeFallbackReason::DisplayControlUnavailable => {}
++        }
++    }
++
++    fn complete_graphics_resize(&mut self, extent: (u16, u16)) {
++        if self.in_flight.as_ref().is_some_and(|resize| {
++            let request = &resize.request;
++            let expected = request.layout.as_ref().map_or_else(
++                || MonitorLayoutEntry::adjust_display_size(u32::from(request.width), u32::from(request.height)),
++                DisplayControlMonitorLayout::desktop_size,
++            );
++            expected == (u32::from(extent.0), u32::from(extent.1))
++        }) {
++            self.completed();
++        }
++    }
++
+     fn timed_out_request(&self, now: tokio::time::Instant) -> Option<(ResizeRequest, DisplayResizeFallbackReason)> {
+         if let Some(in_flight) = self.in_flight.as_ref()
+             && now >= in_flight.deadline
+@@ -4808,6 +4829,7 @@ async fn active_session(
+     let mut connection_telemetry = crate::telemetry::ConnectionTelemetry::new(connection_started);
+ 
+     let disconnect_reason = 'outer: loop {
++        let previous_extent = (image.width(), image.height());
+         let shutting_down = graceful_shutdown_sent && initial_outputs.is_none();
+         let resize_deadline = resize_queue.deadline();
+         let input_batch_deadline = input_batcher.deadline();
+@@ -5457,7 +5479,7 @@ async fn active_session(
+                 if reconnect_on_display_resize_failure {
+                     return Ok(request.reconnect_with_new_size(reason));
+                 }
+-                resize_queue = ResizeQueue::default();
++                resize_queue.discard_timed_out_request(reason);
+                 report_resize_fallback(output_event_sender, close_receiver, reason).await?;
+                 ActiveSessionIteration::outputs(Vec::new())
+                 }
+@@ -5519,6 +5541,12 @@ async fn active_session(
+             }
+         };
+ 
++        // EGFX ResetGraphics can resize the image without a Deactivate-All sequence.
++        let extent = (image.width(), image.height());
++        if extent != previous_extent {
++            resize_queue.complete_graphics_resize(extent);
++        }
++
+         #[cfg(feature = "telemetry")]
+         {
+             // The report waits for an iteration without another dynamic channel batch.
+@@ -5910,7 +5938,7 @@ async fn active_session(
+                                     }
+                                     // The peer already deactivated the session. Keep reading the
+                                     // activation sequence, without the expired resize deadline.
+-                                    resize_queue = ResizeQueue::default();
++                                    resize_queue.discard_timed_out_request(reason);
+                                     report_resize_fallback(output_event_sender, close_receiver, reason).await?;
+                                     continue 'activation_seq;
+                                 }
+@@ -6921,6 +6949,36 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn reactivation_timeout_releases_in_flight_resize_and_keeps_latest_request() {
++        let mut queue = ResizeQueue::default();
++        queue.mark_in_flight(resize_request(1024, 768));
++        let deadline = queue.deadline().unwrap();
++        queue.defer(resize_request(1200, 800));
++        let final_request = resize_request(1280, 800);
++        queue.defer(final_request.clone());
++
++        let (_, reason) = queue.timed_out_request(deadline).unwrap();
++        queue.discard_timed_out_request(reason);
++
++        assert!(queue.in_flight.is_none());
++        assert_eq!(queue.pending.unwrap().request, final_request);
++    }
++
++    #[test]
++    fn graphics_resize_completes_only_the_matching_in_flight_extent() {
++        let mut queue = ResizeQueue::default();
++        queue.mark_in_flight(resize_request(1024, 768));
++        let latest = resize_request(1280, 800);
++        queue.defer(latest.clone());
++
++        queue.complete_graphics_resize((800, 600));
++        assert!(queue.in_flight.is_some());
++        queue.complete_graphics_resize((1024, 768));
++        assert!(queue.in_flight.is_none());
++        assert_eq!(queue.pending.unwrap().request, latest);
++    }
++
+     #[test]
+     fn monitor_layout_requests_fall_back_to_the_matching_gcc_monitors() {
+         let layout = DisplayControlMonitorLayout::new(&[

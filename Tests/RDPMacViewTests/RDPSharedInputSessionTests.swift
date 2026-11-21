@@ -558,7 +558,7 @@ final class RDPSharedInputSessionTests: XCTestCase {
             .move(7, 8),
             .button(.left, 7, 8, pressed: true),
             down(shift),
-            .scroll(9, 10, dx: 3, dy: -120)
+            .scroll(9, 10, dx: -3, dy: -120)
         ])
     }
 

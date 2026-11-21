@@ -93,6 +93,7 @@ struct IterationResult: Encodable {
     /// size seen during the step (nil = no frame arrived).
     var connectedAfterResize: Bool?
     var resizeFrameSize: [Int]?
+    var requestedResizeFrameSize: [Int]?
     var shutdownMs: Double?
     var shutdownDiagnostics: [String: Int]?
     /// Delegate callbacks delivered after `shutdown()` returned (must be 0).

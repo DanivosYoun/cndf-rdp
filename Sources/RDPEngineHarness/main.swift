@@ -448,6 +448,17 @@ private func runIteration(
                 previousTap?(buffer, time)
             }
             window.setContentSize(NSSize(width: width, height: height))
+            let requestedSize = DisplayResizeCoordinator().candidateSize(
+                pointWidth: width, pointHeight: height, scale: window.backingScaleFactor,
+                preferDeviceNativeResolution: options.preferDeviceNativeResolution,
+                forcedDesktopSize: options.forcedDesktopSize
+            )
+            // Display Control limits dimensions to 200...8192 and requires even widths.
+            let pixelWidth = requestedSize.pixelWidth
+            result.requestedResizeFrameSize = [
+                min(8192, max(200, Int(pixelWidth - pixelWidth % 2))),
+                min(8192, max(200, Int(requestedSize.pixelHeight)))
+            ]
             view.frame = NSRect(x: 0, y: 0, width: width, height: height)
             drainRunLoop(step.seconds ?? 2)
             view.onRenderedFrame = previousTap
@@ -588,6 +599,15 @@ func evaluate(_ iteration: IterationResult, against expect: HarnessExpectation?)
     if expect.resizeKeepsSession == true,
        iteration.connectedAfterResize != true || iteration.connectRises > 1 {
         failures.append("\(prefix) resize: connectedAfterResize=\(iteration.connectedAfterResize.map(String.init) ?? "nil"), connectRises=\(iteration.connectRises)")
+    }
+    if expect.resizeKeepsSession == true {
+        if let requested = iteration.requestedResizeFrameSize {
+            if iteration.resizeFrameSize != requested {
+                failures.append("\(prefix) resize: frame size \(iteration.resizeFrameSize.map { String(describing: $0) } ?? "nil"), expected \(requested)")
+            }
+        } else {
+            failures.append("\(prefix) resize: no requested frame size")
+        }
     }
     if let maxShutdownMs = expect.maxShutdownMs, let shutdownMs = iteration.shutdownMs,
        shutdownMs > Double(maxShutdownMs) {

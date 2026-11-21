@@ -172,7 +172,7 @@ public final class RDPClientView: NSView {
         func units(_ lines: CGFloat) -> Int32 {
             Int32(max(-32_768, min(32_767, (lines * 120).rounded())))
         }
-        return (units(event.deltaX), units(event.deltaY))
+        return (rdpHorizontalWheelRotation(units(event.deltaX)), units(event.deltaY))
     }
 
     // Mac numeric-keypad digit (0-9) and decimal keycodes. Their RDP keypad scancodes

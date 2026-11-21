@@ -18,7 +18,8 @@ final class RDPScrollWheelRotationTests: XCTestCase {
     func testOneWheelClickIsOneNotch() throws {
         XCTAssertEqual(RDPClientView.wheelRotation(for: try event(.line, y: -1)).y, -120)
         XCTAssertEqual(RDPClientView.wheelRotation(for: try event(.line, y: 1)).y, 120)
-        XCTAssertEqual(RDPClientView.wheelRotation(for: try event(.line, y: 0, x: -1)).x, -120)
+        XCTAssertEqual(RDPClientView.wheelRotation(for: try event(.line, y: 0, x: -1)).x, 120)
+        XCTAssertEqual(RDPClientView.wheelRotation(for: try event(.line, y: 0, x: 1)).x, -120)
     }
 
     func testTrackpadPixelsScaleByLines() throws {

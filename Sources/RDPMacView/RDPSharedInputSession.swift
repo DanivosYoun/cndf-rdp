@@ -1,6 +1,11 @@
 import Foundation
 import RDPClientCore
 
+/// Converts AppKit's left-positive horizontal delta to Windows' right-positive rotation.
+func rdpHorizontalWheelRotation(_ delta: Int32) -> Int32 {
+    Int32(clamping: -Int64(delta))
+}
+
 public enum RDPSharedInputCommand: Sendable {
     case key(scanCode: UInt16, pressed: Bool, modifiers: [UInt16])
     case mouse(x: Int32, y: Int32, button: RDPMouseButton?, flags: RDPMouseFlags, modifiers: [UInt16])
@@ -507,7 +512,8 @@ final class RDPInputExecutor: @unchecked Sendable {
             mouse(owner, at: RDPPointerLocation(clampingX: x, y: y), button: button, flags: flags)
         case let .scroll(x, y, deltaY, deltaX, modifiers):
             syncModifiers(owner, to: modifiers)
-            scroll(at: RDPPointerLocation(clampingX: x, y: y), deltaX: deltaX, deltaY: deltaY)
+            scroll(at: RDPPointerLocation(clampingX: x, y: y),
+                   deltaX: rdpHorizontalWheelRotation(deltaX), deltaY: deltaY)
         case let .modifiers(modifiers):
             syncModifiers(owner, to: modifiers)
         case let .chord(scanCodes):
