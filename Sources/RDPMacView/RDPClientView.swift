@@ -28,10 +28,7 @@ public final class RDPClientView: NSView {
     private var isViewFocusedForInputSourceFollow: (() -> Bool)?
     private var switchHotkeysOverride: [RDPSwitchHotkey]?
     private var inputSourceSettleWorkItem: DispatchWorkItem?
-    private var lastObservedSourceID: String?
-    private var suppressedSwitchKeyCodes: Set<UInt16> = []
-    private var isRawRightOptionActive = false
-    private var isSuppressingRightOption = false
+    private var followGate = RDPFollowKeyGate()
 
     private var trackingArea: NSTrackingArea?
     private var remoteFrameSize: CGSize = .zero
@@ -237,33 +234,24 @@ public final class RDPClientView: NSView {
 
     public override func keyDown(with event: NSEvent) {
         let preCheck = evaluateInputSourceChange(cause: .async, fromNotification: false)
-        if inputSourceFollow {
-            if suppressedSwitchKeyCodes.contains(event.keyCode) {
-                return
-            }
-            if preCheck.sourceChanged && isSwitchHotkeyCandidate(event) {
-                suppressedSwitchKeyCodes.insert(event.keyCode)
-                return
-            }
-        }
-        // Han/Yeong and Hanja are toggles: one tap per press, auto-repeat ignored (design I11).
-        if let profile = session?.keyboardProfile,
-           RDPKeyboardMapper.imeToggleScancodes(for: profile) != nil,
-           let toggle = RDPKeyboardMapper.imeToggle(forMacKeyCode: event.keyCode) {
-            if !event.isARepeat {
-                if toggle == .hangul && isInputSourceFollowEligible && inputSourceFollower.isFocused {
-                    let now = inputSourceClock()
-                    if inputSourceFollower.shouldSuppressRawToggle(at: now) {
-                        return
-                    }
-                    inputSourceFollower.rawToggleBegan(at: now)
-                    inputExecutor()?.hostIMETap(toggle)
-                    inputSourceFollower.rawToggleEnded(at: now)
-                } else {
-                    inputExecutor()?.hostIMETap(toggle)
-                }
-            }
+        let action = followGate.keyDown(
+            keyCode: event.keyCode,
+            isRepeat: event.isARepeat,
+            sourceChanged: preCheck.sourceChanged,
+            isSwitchCandidate: preCheck.sourceChanged && isSwitchHotkeyCandidate(event),
+            followActive: isInputSourceFollowEligible && inputSourceFollower.isFocused,
+            follower: &inputSourceFollower,
+            now: inputSourceClock()
+        )
+        switch action {
+        case .drop:
             return
+        case let .imeTap(toggle):
+            // Han/Yeong and Hanja are toggles: one tap per press (design I11, G6).
+            inputExecutor()?.hostIMETap(toggle)
+            return
+        case .forward:
+            break
         }
         if sendCommandShortcutIfNeeded(event) {
             return
@@ -278,7 +266,7 @@ public final class RDPClientView: NSView {
 
     public override func keyUp(with event: NSEvent) {
         _ = evaluateInputSourceChange(cause: .async, fromNotification: false)
-        if suppressedSwitchKeyCodes.remove(event.keyCode) != nil {
+        if followGate.keyUp(keyCode: event.keyCode, follower: &inputSourceFollower, now: inputSourceClock()) == .drop {
             return
         }
         if event.modifierFlags.contains(.command),
@@ -294,33 +282,15 @@ public final class RDPClientView: NSView {
 
     public override func flagsChanged(with event: NSEvent) {
         _ = evaluateInputSourceChange(cause: .async, fromNotification: false)
-        var scancodes = RDPKeyboardMapper.modifierScancodes(for: event.modifierFlags)
-        if isInputSourceFollowEligible && inputSourceFollower.isFocused {
-            let now = inputSourceClock()
-            let isRightOptionNow = RDPKeyboardMapper.isRightOptionOnly(event.modifierFlags)
-            if isRightOptionNow {
-                if !isRawRightOptionActive && !isSuppressingRightOption {
-                    if inputSourceFollower.shouldSuppressRawToggle(at: now) {
-                        isSuppressingRightOption = true
-                    } else {
-                        isRawRightOptionActive = true
-                        inputSourceFollower.rawToggleBegan(at: now)
-                    }
-                }
-                if isSuppressingRightOption {
-                    scancodes.removeAll { $0 == RDPKeyboardMapper.rightAlt }
-                }
-            } else {
-                if isRawRightOptionActive {
-                    isRawRightOptionActive = false
-                    inputSourceFollower.rawToggleEnded(at: now)
-                }
-                if isSuppressingRightOption {
-                    isSuppressingRightOption = false
-                }
-            }
+        let frames = followGate.modifiersChanged(
+            event.modifierFlags,
+            followActive: isInputSourceFollowEligible && inputSourceFollower.isFocused,
+            follower: &inputSourceFollower,
+            now: inputSourceClock()
+        )
+        for frame in frames {
+            inputExecutor()?.hostModifiers(RDPKeyboardMapper.modifierScancodes(for: frame))
         }
-        inputExecutor()?.hostModifiers(scancodes)
     }
 
     /// Releases every key, modifier and button the local view holds, so nothing stays down on
@@ -787,6 +757,18 @@ public final class RDPClientView: NSView {
         handleInputSourceFocusLost()
     }
 
+    /// Re-arms or disarms follow at a connection boundary (design G4, I-G6). Called by
+    /// `RDPConnectionView` when the session reports connected or disconnected.
+    public func inputSourceConnectionDidChange() {
+        if isInputSourceFollowEligible {
+            if !inputSourceFollower.isFocused && isEffectivelyFocusedForInputSourceFollow() {
+                handleInputSourceFocusGained()
+            }
+        } else if inputSourceFollower.isFocused {
+            handleInputSourceFocusLost()
+        }
+    }
+
     func handleInputSourceFocusGained() {
         inputSourceSettleWorkItem?.cancel()
         inputSourceSettleWorkItem = nil
@@ -795,7 +777,7 @@ public final class RDPClientView: NSView {
         }
         let now = inputSourceClock()
         let language = inputSourceReader.currentLanguage()
-        lastObservedSourceID = inputSourceReader.currentSourceID()
+        followGate.resetSource(to: inputSourceReader.currentSourceID())
         inputSourceFollower.focusGained(at: now, language: language)
         let workItem = DispatchWorkItem { [weak self] in
             self?.handleInputSourceSettleElapsed()
@@ -814,17 +796,14 @@ public final class RDPClientView: NSView {
         }
         let now = inputSourceClock()
         let language = inputSourceReader.currentLanguage()
-        lastObservedSourceID = inputSourceReader.currentSourceID()
+        followGate.resetSource(to: inputSourceReader.currentSourceID())
         inputSourceFollower.settleElapsed(at: now, language: language)
     }
 
     func handleInputSourceFocusLost() {
         inputSourceSettleWorkItem?.cancel()
         inputSourceSettleWorkItem = nil
-        suppressedSwitchKeyCodes.removeAll()
-        isRawRightOptionActive = false
-        isSuppressingRightOption = false
-        lastObservedSourceID = nil
+        followGate.reset()
         inputSourceFollower.focusLost()
     }
 
@@ -848,14 +827,11 @@ public final class RDPClientView: NSView {
         }
 
         let language = inputSourceReader.currentLanguage()
-        let sourceID = inputSourceReader.currentSourceID()
-        let sourceChanged: Bool
-        if let sourceID, let previousID = lastObservedSourceID {
-            sourceChanged = (sourceID != previousID)
-        } else {
-            sourceChanged = (language != inputSourceFollower.baseline)
-        }
-        lastObservedSourceID = sourceID
+        let sourceChanged = followGate.sourceChanged(
+            id: inputSourceReader.currentSourceID(),
+            language: language,
+            baseline: inputSourceFollower.baseline
+        )
 
         let decision = inputSourceFollower.observe(language, at: inputSourceClock(), cause: cause)
         if fromNotification || sourceChanged || decision != .none(.unchanged) {

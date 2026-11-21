@@ -441,6 +441,9 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
             } else if message == "FreeRDP disconnected." || message == "IronRDP disconnected." {
                 self.evaluateOutputSuppression()
             }
+            if connected || message == "FreeRDP disconnected." || message == "IronRDP disconnected." {
+                self.clientView.inputSourceConnectionDidChange()
+            }
             self.delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
         }
     }

@@ -380,4 +380,125 @@ final class RDPClientViewFollowTests: XCTestCase {
             FollowKeySession.Key(code: 0x39, pressed: false, extended: false)
         ])
     }
+
+    // MARK: Design G2-G4, G7 on the local view
+
+    private let space = FollowKeySession.Key(code: 0x39, pressed: true, extended: false)
+    private let spaceUp = FollowKeySession.Key(code: 0x39, pressed: false, extended: false)
+    private let controlDown = FollowKeySession.Key(code: 0x1D, pressed: true, extended: false)
+    private let controlUp = FollowKeySession.Key(code: 0x1D, pressed: false, extended: false)
+
+    /// REPRO4: a key whose keyDown went out keeps its keyUp even when a later repeat looks like a
+    /// switch hotkey with the source changed.
+    func testForwardedKeyUpSurvivesALaterSwitchCandidateRepeat() {
+        let (view, session, reader, _, _, _) = makeFixture()
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 49))
+        view.flagsChanged(with: flagsEvent(.control, keyCode: 59))
+        reader.language = .korean
+        reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 49, modifierFlags: [.control], isARepeat: true))
+        view.keyUp(with: keyEvent(.keyUp, keyCode: 49, modifierFlags: [.control]))
+        view.flagsChanged(with: flagsEvent([], keyCode: 59))
+
+        // The follow tap waits for Control to go up (G7).
+        XCTAssertEqual(waitForKeys(session, count: 9), [space, controlDown, space, spaceUp, controlUp] + hangulTap)
+    }
+
+    /// G2: with the source unchanged, Control+Space reaches the host with Control held.
+    func testControlSpaceWithoutSourceChangeIsForwardedWithControl() {
+        let (view, session, _, _, _, _) = makeFixture()
+        view.flagsChanged(with: flagsEvent(.control, keyCode: 59))
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 49, modifierFlags: [.control]))
+        view.keyUp(with: keyEvent(.keyUp, keyCode: 49, modifierFlags: [.control]))
+        XCTAssertEqual(waitForKeys(session, count: 3), [controlDown, space, spaceUp])
+    }
+
+    /// G3: the raw Hangul key stays a raw toggle until its keyUp, so a flip while it is still
+    /// held merges with it.
+    func testHeldHangulKeyMergesAFlipUntilItsKeyUp() {
+        let (view, session, reader, clock, center, _) = makeFixture()
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 104))
+        clock.advance(by: 0.400)
+        reader.language = .korean
+        reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
+        center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
+        view.keyUp(with: keyEvent(.keyUp, keyCode: 104))
+        XCTAssertEqual(waitForKeys(session, count: 8), hangulTap)
+    }
+
+    /// REPRO3: a 104 press R6 swallowed swallows its repeat and keyUp, and a later press taps.
+    func testR6Suppressed104SwallowsItsRepeatAndKeyUp() {
+        let (view, session, reader, clock, center, _) = makeFixture()
+        reader.language = .korean
+        reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
+        center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
+        clock.advance(by: 0.100)
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 104))
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 104, isARepeat: true))
+        view.keyUp(with: keyEvent(.keyUp, keyCode: 104))
+        clock.advance(by: 0.500)
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 104))
+        view.keyUp(with: keyEvent(.keyUp, keyCode: 104))
+        XCTAssertEqual(waitForKeys(session, count: 8), hangulTap + hangulTap)
+    }
+
+    /// E3b: the Hangul key pressed with Control and Option held taps after both go up.
+    func testHangulKeyWithControlAndOptionHeldTapsAfterRelease() {
+        let (view, session, _, _, _, _) = makeFixture()
+        view.flagsChanged(with: flagsEvent(.control, keyCode: 59))
+        view.flagsChanged(with: flagsEvent(flags([.control, .option], device: deviceLeftAlt), keyCode: 58))
+        view.keyDown(with: keyEvent(.keyDown, keyCode: 104, modifierFlags: [.control, .option]))
+        let altDown = FollowKeySession.Key(code: 0x38, pressed: true, extended: false)
+        let altUp = FollowKeySession.Key(code: 0x38, pressed: false, extended: false)
+        XCTAssertEqual(waitForKeys(session, count: 3), [controlDown, altDown])
+        view.flagsChanged(with: flagsEvent(.control, keyCode: 58))
+        view.flagsChanged(with: flagsEvent([], keyCode: 59))
+        XCTAssertEqual(waitForKeys(session, count: 8), [controlDown, altDown, altUp, controlUp] + hangulTap)
+    }
+
+    /// G4: follow armed while unconnected starts at the connected boundary, so a flip after the
+    /// settle window sends one tap instead of being absorbed by a late arm.
+    func testConnectedBoundaryArmsFollow() {
+        let connection = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        let view = connection.clientView
+        let session = FollowKeySession(profile: .korean)
+        session.isConnected = false
+        let reader = FakeInputSourceReader(language: .other, sourceID: "com.apple.keylayout.ABC")
+        let clock = FakeClock(100.0)
+        let center = NotificationCenter()
+        view.configureInputSourceFollowForTesting(
+            reader: reader,
+            observer: RDPMacInputSourceObserver(center: center),
+            clock: { clock.now },
+            isFocused: { true },
+            switchHotkeys: []
+        )
+        view.session = session
+        view.inputSourceFollow = true
+        addTeardownBlock { [session] in
+            connection.shutdown()
+            _ = session
+        }
+
+        session.isConnected = true
+        connection.rdpSession(session, didLog: "FreeRDP connected.")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        clock.advance(by: 5)
+        view.handleInputSourceSettleElapsed()
+        reader.language = .korean
+        reader.sourceID = "com.apple.inputmethod.Korean.2SetKorean"
+        center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
+        XCTAssertEqual(waitForKeys(session, count: 4), hangulTap)
+
+        // The disconnected boundary disarms: a flip after it sends nothing.
+        session.clearKeys()
+        session.isConnected = false
+        connection.rdpSession(session, didLog: "FreeRDP disconnected.")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        session.isConnected = true
+        reader.language = .other
+        reader.sourceID = "com.apple.keylayout.ABC"
+        center.post(name: RDPMacInputSourceObserver.notificationName, object: nil)
+        XCTAssertEqual(waitForKeys(session, count: 1), [])
+    }
 }
