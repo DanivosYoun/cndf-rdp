@@ -1,0 +1,659 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 67ab0f2..495b86a 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -654,6 +654,12 @@ pub enum RdpInputEvent {
+     /// See [`RdpInputSender::send_clipboard_with_completion`].
+     #[cfg(feature = "clipboard")]
+     ClipboardWithCompletion(ClipboardMessage, oneshot::Sender<()>),
++    /// A clipboard message prepared for one CLIPRDR processor, handled like
++    /// [`Self::ClipboardWithCompletion`] only while that processor is the session's channel.
++    ///
++    /// See [`RdpInputSender::send_clipboard_for_instance`].
++    #[cfg(feature = "clipboard")]
++    ClipboardForInstance(ironrdp_cliprdr::CliprdrInstance, ClipboardMessage, oneshot::Sender<()>),
+     SendDvcMessages {
+         channel_id: u32,
+         messages: Vec<SvcMessage>,
+@@ -927,6 +933,22 @@ impl RdpInputSender {
+             .send(RdpInputEvent::ClipboardWithCompletion(message, completion))
+     }
+ 
++    /// Enqueues a clipboard message like [`Self::send_clipboard_with_completion`] for the CLIPRDR
++    /// processor `instance`, such as a deferred answer to a request that processor received.
++    ///
++    /// The session discards the message, before encoding it, if its clipboard channel is no longer
++    /// `instance`, for example after a server redirection; `completion` is then dropped unsignaled.
++    #[cfg(feature = "clipboard")]
++    pub fn send_clipboard_for_instance(
++        &self,
++        instance: ironrdp_cliprdr::CliprdrInstance,
++        message: ClipboardMessage,
++        completion: oneshot::Sender<()>,
++    ) -> Result<(), mpsc::error::SendError<RdpInputEvent>> {
++        self.clipboard_sender
++            .send(RdpInputEvent::ClipboardForInstance(instance, message, completion))
++    }
++
+     /// Enqueues a USB redirection event independently of ordinary bounded input.
+     ///
+     /// Dropping a USB completion would leave the server-side driver waiting for its request forever.
+@@ -5100,6 +5122,16 @@ async fn active_session(
+                                 clipboard_completion = Some(completion);
+                                 ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
+                             }
++                            #[cfg(feature = "clipboard")]
++                            Some(RdpInputEvent::ClipboardForInstance(instance, event, completion)) => {
++                                ActiveSessionIteration::outputs(if is_current_cliprdr(&mut active_stage, instance) {
++                                    clipboard_completion = Some(completion);
++                                    process_clipboard_message(&mut active_stage, event)?
++                                } else {
++                                    debug!("Dropping a clipboard message prepared for a previous channel");
++                                    Vec::new()
++                                })
++                            }
+                             #[cfg(feature = "usb")]
+                             Some(RdpInputEvent::Urbdrc(event)) => urbdrc_iteration(&mut active_stage, event)?,
+                             #[cfg(feature = "pnp")]
+@@ -5266,6 +5298,16 @@ async fn active_session(
+                         clipboard_completion = Some(completion);
+                         ActiveSessionIteration::outputs(process_clipboard_message(&mut active_stage, event)?)
+                     }
++                    #[cfg(feature = "clipboard")]
++                    RdpInputEvent::ClipboardForInstance(instance, event, completion) => {
++                        ActiveSessionIteration::outputs(if is_current_cliprdr(&mut active_stage, instance) {
++                            clipboard_completion = Some(completion);
++                            process_clipboard_message(&mut active_stage, event)?
++                        } else {
++                            debug!("Dropping a clipboard message prepared for a previous channel");
++                            Vec::new()
++                        })
++                    }
+                     RdpInputEvent::SendDvcMessages { channel_id, messages } => {
+                         trace!(channel_id, ?messages, "Send DVC messages");
+                         ActiveSessionIteration::dvc(
+@@ -6458,6 +6500,14 @@ async fn active_session(
+     Ok(RdpControlFlow::TerminatedGracefully(disconnect_reason))
+ }
+ 
++/// Whether the session's clipboard channel is the CLIPRDR processor `instance`.
++#[cfg(feature = "clipboard")]
++fn is_current_cliprdr(active_stage: &mut ActiveStage, instance: ironrdp_cliprdr::CliprdrInstance) -> bool {
++    active_stage
++        .get_svc_processor::<ironrdp_cliprdr::CliprdrClient>()
++        .is_some_and(|cliprdr| cliprdr.instance() == instance)
++}
++
+ #[cfg(feature = "clipboard")]
+ fn process_clipboard_message(
+     active_stage: &mut ActiveStage,
+diff --git a/crates/ironrdp-cliprdr/src/backend.rs b/crates/ironrdp-cliprdr/src/backend.rs
+index d20b49e..cd639d2 100644
+--- a/crates/ironrdp-cliprdr/src/backend.rs
++++ b/crates/ironrdp-cliprdr/src/backend.rs
+@@ -2,6 +2,7 @@
+ 
+ use ironrdp_core::AsAny;
+ 
++use crate::CliprdrInstance;
+ use crate::pdu::{
+     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse,
+     FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
+@@ -135,6 +136,18 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
+     /// [`crate::Cliprdr::submit_format_data`]
+     fn on_format_data_request(&mut self, request: FormatDataRequest);
+ 
++    /// Processes remote's request to send format data, optionally answering it at once.
++    ///
++    /// Called by [crate::Cliprdr] instead of [`Self::on_format_data_request`]. A returned response is
++    /// sent in the output of the PDU that carried the request, so it is written before the channel
++    /// processes another request. Returning `None` leaves the answer to
++    /// [`crate::Cliprdr::submit_format_data`], which the default implementation does by calling
++    /// [`Self::on_format_data_request`].
++    fn respond_to_format_data_request(&mut self, request: FormatDataRequest) -> Option<OwnedFormatDataResponse> {
++        self.on_format_data_request(request);
++        None
++    }
++
+     /// Called by [`crate::Cliprdr`] when server sends data to the client clipboard as a response to
+     /// previously sent format data request.
+     ///
+@@ -151,6 +164,26 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
+     /// client should respond by calling `submit_file_contents` on [crate::Cliprdr]
+     fn on_file_contents_request(&mut self, request: FileContentsRequest);
+ 
++    /// Processes remote's request to send file contents, optionally answering it at once.
++    ///
++    /// Called by [crate::Cliprdr] instead of [`Self::on_file_contents_request`] once the request has
++    /// passed validation. A returned response is sent in the output of the PDU that carried the
++    /// request, so it is written before the channel processes another request. Returning `None`
++    /// leaves the answer to [`crate::Cliprdr::submit_file_contents`], which the default
++    /// implementation does by calling [`Self::on_file_contents_request`].
++    ///
++    /// `instance` identifies the processor that received the request; a deferred answer can carry it
++    /// so it is not sent on a later channel.
++    fn respond_to_file_contents_request(
++        &mut self,
++        request: FileContentsRequest,
++        instance: CliprdrInstance,
++    ) -> Option<FileContentsResponse<'static>> {
++        let _ = instance;
++        self.on_file_contents_request(request);
++        None
++    }
++
+     /// Processes remote's response to previously sent file contents request.
+     ///
+     /// Called by [crate::Cliprdr] when server sends file contents to the client clipboard as a response to
+diff --git a/crates/ironrdp-cliprdr/src/lib.rs b/crates/ironrdp-cliprdr/src/lib.rs
+index edd6472..3adec10 100644
+--- a/crates/ironrdp-cliprdr/src/lib.rs
++++ b/crates/ironrdp-cliprdr/src/lib.rs
+@@ -450,10 +450,25 @@ macro_rules! reject_file_contents_request {
+     }};
+ }
+ 
++/// Identifies one [`Cliprdr`] processor for its whole lifetime.
++///
++/// A connection builds a new processor, so a response prepared for an earlier processor can be told
++/// apart from one for the current channel.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct CliprdrInstance(u64);
++
++impl CliprdrInstance {
++    fn next() -> Self {
++        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
++        Self(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
++    }
++}
++
+ /// CLIPRDR static virtual channel endpoint implementation
+ #[derive(Debug)]
+ pub struct Cliprdr<R: Role> {
+     backend: Box<dyn CliprdrBackend>,
++    instance: CliprdrInstance,
+     capabilities: Capabilities,
+     state: CliprdrState,
+ 
+@@ -641,6 +656,7 @@ impl<R: Role> Cliprdr<R> {
+ 
+         Self {
+             backend,
++            instance: CliprdrInstance::next(),
+             state: CliprdrState::Initialization,
+             capabilities: Capabilities::new(ClipboardProtocolVersion::V2, flags),
+             pending_format_data_requests: VecDeque::new(),
+@@ -681,6 +697,11 @@ impl<R: Role> Cliprdr<R> {
+         FormatList::new_unicode(formats, self.are_long_format_names_enabled())
+     }
+ 
++    /// Returns the identity of this processor, which no other processor shares.
++    pub fn instance(&self) -> CliprdrInstance {
++        self.instance
++    }
++
+     /// Whether the clipboard channel finished its initialization.
+     ///
+     /// Only [`Self::initiate_copy`] and [`Self::request_file_contents`] (which answers with a
+@@ -1897,12 +1918,12 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
+                     }
+                 }
+ 
+-                // Forward to backend for other format requests
+-                self.backend.on_format_data_request(request);
+-
+-                // NOTE: Actual data should be sent later via `submit_format_data` method,
+-                // therefore we do not send anything immediately.
+-                Ok(Vec::new())
++                // Forward to backend for other format requests. A backend that answers now has its
++                // response sent with this PDU's output; otherwise it calls `submit_format_data` later.
++                match self.backend.respond_to_format_data_request(request) {
++                    Some(response) => Ok(vec![into_cliprdr_message(ClipboardPdu::FormatDataResponse(response))]),
++                    None => Ok(Vec::new()),
++                }
+             }
+             ClipboardPdu::FormatDataResponse(response) => {
+                 // Correlate this response with the oldest unanswered FormatDataRequest.
+@@ -2093,9 +2114,12 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
+                     "Processing FileContentsRequest"
+                 );
+ 
+-                // Forward to backend - it will call submit_file_contents() with response
+-                self.backend.on_file_contents_request(request);
+-                Ok(Vec::new())
++                // Forward to backend. A backend that answers now has its response sent with this PDU's
++                // output; otherwise it calls submit_file_contents() with the response later.
++                match self.backend.respond_to_file_contents_request(request, self.instance) {
++                    Some(response) => Ok(vec![into_cliprdr_message(ClipboardPdu::FileContentsResponse(response))]),
++                    None => Ok(Vec::new()),
++                }
+             }
+             ClipboardPdu::FileContentsResponse(response) => {
+                 // [MS-RDPECLIP] 3.1.5.4.8 - Processing a File Contents Response PDU
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/immediate_responses.rs b/crates/ironrdp-testsuite-core/tests/clipboard/immediate_responses.rs
+new file mode 100644
+index 0000000..48499ca
+--- /dev/null
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/immediate_responses.rs
+@@ -0,0 +1,146 @@
++//! Tests for backend answers returned with the output of the PDU that carried the request.
++
++use std::sync::{Arc, Mutex};
++
++use ironrdp_cliprdr::backend::CliprdrBackend;
++use ironrdp_cliprdr::pdu::{
++    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, ClipboardPdu, FileContentsFlags,
++    FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
++    OwnedFormatDataResponse,
++};
++use ironrdp_cliprdr::{CliprdrClient, CliprdrInstance};
++use ironrdp_core::{AsAny, encode_vec};
++use ironrdp_svc::{SvcMessage, SvcProcessor as _};
++use ironrdp_testsuite_core::clipboard::{TestBackend, init_ready_client_with_backend, real_now_ms};
++
++#[derive(Debug, Default)]
++struct Calls {
++    deferred_file_requests: Vec<u32>,
++    deferred_format_requests: usize,
++    instances: Vec<CliprdrInstance>,
++}
++
++/// Answers file contents requests with a failure and text requests with fixed data, at once.
++#[derive(Debug)]
++struct AnsweringBackend(Arc<Mutex<Calls>>);
++
++impl AsAny for AnsweringBackend {
++    fn as_any(&self) -> &dyn core::any::Any {
++        self
++    }
++    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
++        self
++    }
++}
++
++impl CliprdrBackend for AnsweringBackend {
++    fn temporary_directory(&self) -> &str {
++        "/tmp"
++    }
++    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
++        ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
++    }
++    fn on_ready(&mut self) {}
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
++    fn on_format_data_request(&mut self, _: FormatDataRequest) {
++        self.0.lock().unwrap().deferred_format_requests += 1;
++    }
++    fn respond_to_format_data_request(&mut self, _: FormatDataRequest) -> Option<OwnedFormatDataResponse> {
++        Some(FormatDataResponse::new_data(b"a\0\0\0".to_vec()))
++    }
++    fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
++    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
++        self.0.lock().unwrap().deferred_file_requests.push(request.stream_id);
++    }
++    fn respond_to_file_contents_request(
++        &mut self,
++        request: FileContentsRequest,
++        instance: CliprdrInstance,
++    ) -> Option<FileContentsResponse<'static>> {
++        self.0.lock().unwrap().instances.push(instance);
++        Some(FileContentsResponse::new_error(request.stream_id))
++    }
++    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: LockDataId) {}
++    fn on_unlock(&mut self, _: LockDataId) {}
++    fn now_ms(&self) -> u64 {
++        real_now_ms()
++    }
++}
++
++fn offering_client(backend: Box<dyn CliprdrBackend>) -> CliprdrClient {
++    let mut cliprdr = init_ready_client_with_backend(backend);
++    cliprdr
++        .initiate_file_copy(vec![FileDescriptor::new("file.bin").with_file_size(4)])
++        .unwrap();
++    cliprdr
++}
++
++fn range(stream_id: u32) -> Vec<u8> {
++    encode_vec(&ClipboardPdu::FileContentsRequest(FileContentsRequest {
++        stream_id,
++        index: 0,
++        flags: FileContentsFlags::RANGE,
++        position: 0,
++        requested_size: 4,
++        data_id: None,
++    }))
++    .unwrap()
++}
++
++fn decoded(messages: &[SvcMessage]) -> Vec<Vec<u8>> {
++    messages
++        .iter()
++        .map(|message| message.encode_unframed_pdu().unwrap())
++        .collect()
++}
++
++// oracle: mutant dropping the backend's answer, or calling the deferred callback as well.
++#[test]
++fn backend_answers_are_returned_with_the_request_output() {
++    let calls = Arc::new(Mutex::new(Calls::default()));
++    let mut cliprdr = offering_client(Box::new(AnsweringBackend(Arc::clone(&calls))));
++
++    let output = decoded(&cliprdr.process(&range(7)).unwrap());
++    assert_eq!(output.len(), 1);
++    let ClipboardPdu::FileContentsResponse(response) = ironrdp_core::decode::<ClipboardPdu<'_>>(&output[0]).unwrap()
++    else {
++        panic!("expected a file contents response");
++    };
++    assert_eq!((response.stream_id(), response.is_error()), (7, true));
++
++    let text = encode_vec(&ClipboardPdu::FormatDataRequest(FormatDataRequest {
++        format: ClipboardFormatId::CF_UNICODETEXT,
++    }))
++    .unwrap();
++    let output = decoded(&cliprdr.process(&text).unwrap());
++    assert_eq!(output.len(), 1);
++    let ClipboardPdu::FormatDataResponse(response) = ironrdp_core::decode::<ClipboardPdu<'_>>(&output[0]).unwrap()
++    else {
++        panic!("expected a format data response");
++    };
++    assert_eq!(response.data(), b"a\0\0\0");
++
++    let calls = calls.lock().unwrap();
++    assert!(calls.deferred_file_requests.is_empty());
++    assert_eq!(calls.deferred_format_requests, 0);
++    assert_eq!(calls.instances, [cliprdr.instance()]);
++}
++
++// oracle: mutant answering on behalf of a backend that defers, or skipping its callback.
++#[test]
++fn default_backends_still_answer_later() {
++    let mut cliprdr = offering_client(Box::new(TestBackend));
++    assert!(cliprdr.process(&range(7)).unwrap().is_empty());
++}
++
++// oracle: mutant sharing an instance between processors.
++#[test]
++fn each_processor_has_its_own_instance() {
++    let first = CliprdrClient::new(Box::new(TestBackend));
++    let second = CliprdrClient::new(Box::new(TestBackend));
++    assert_eq!(first.instance(), first.instance());
++    assert_ne!(first.instance(), second.instance());
++}
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+index 716c813..3ddd854 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+@@ -7,6 +7,7 @@ mod file_list_format;
+ mod file_transfer_capabilities;
+ mod format;
+ mod format_data_correlation;
++mod immediate_responses;
+ mod lock_lifecycle;
+ mod lock_strategy;
+ mod lock_timeout;
+diff --git a/crates/ironrdp-testsuite-extra/tests/e2e.rs b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+index 6a7a308..cc76336 100644
+--- a/crates/ironrdp-testsuite-extra/tests/e2e.rs
++++ b/crates/ironrdp-testsuite-extra/tests/e2e.rs
+@@ -6828,6 +6828,258 @@ async fn client_clipboard_completion_closes_when_the_session_ends() {
+     .await;
+ }
+ 
++/// Server clipboard that requests the first four bytes of the first file the client offers, and reports
++/// the client's file contents responses.
++#[derive(Debug)]
++struct RequestingClipboard {
++    events: Arc<StdMutex<Option<UnboundedSender<ServerEvent>>>>,
++    responses: UnboundedSender<(u32, Option<Vec<u8>>)>,
++}
++
++impl_as_any!(RequestingClipboard);
++
++impl ironrdp::cliprdr::backend::CliprdrBackend for RequestingClipboard {
++    fn temporary_directory(&self) -> &str {
++        ".cliprdr"
++    }
++    fn client_capabilities(&self) -> ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags {
++        ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
++    }
++    fn on_ready(&mut self) {}
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, formats: &[ironrdp::cliprdr::pdu::ClipboardFormat]) {
++        if formats.is_empty() {
++            return;
++        }
++        let request = ironrdp::cliprdr::pdu::FileContentsRequest {
++            stream_id: 7,
++            index: 0,
++            flags: ironrdp::cliprdr::pdu::FileContentsFlags::RANGE,
++            position: 0,
++            requested_size: 4,
++            data_id: None,
++        };
++        if let Some(events) = self.events.lock().unwrap().as_ref() {
++            let _ = events.send(ServerEvent::Clipboard(
++                ironrdp::cliprdr::backend::ClipboardMessage::SendFileContentsRequest(request),
++            ));
++        }
++    }
++    fn on_format_data_request(&mut self, _: ironrdp::cliprdr::pdu::FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: ironrdp::cliprdr::pdu::FormatDataResponse<'_>) {}
++    fn on_file_contents_request(&mut self, _: ironrdp::cliprdr::pdu::FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, response: ironrdp::cliprdr::pdu::FileContentsResponse<'_>) {
++        let data = (!response.is_error()).then(|| response.data().to_vec());
++        let _ = self.responses.send((response.stream_id(), data));
++    }
++    fn on_lock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++    fn on_unlock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++}
++
++struct RequestingClipboardFactory {
++    events: Arc<StdMutex<Option<UnboundedSender<ServerEvent>>>>,
++    responses: UnboundedSender<(u32, Option<Vec<u8>>)>,
++}
++
++impl ironrdp::cliprdr::backend::CliprdrBackendFactory for RequestingClipboardFactory {
++    fn build_cliprdr_backend(&self) -> Box<dyn ironrdp::cliprdr::backend::CliprdrBackend> {
++        Box::new(RequestingClipboard {
++            events: Arc::clone(&self.events),
++            responses: self.responses.clone(),
++        })
++    }
++}
++
++impl ServerEventSender for RequestingClipboardFactory {
++    fn set_sender(&mut self, sender: UnboundedSender<ServerEvent>) {
++        *self.events.lock().unwrap() = Some(sender);
++    }
++}
++
++impl server::CliprdrServerFactory for RequestingClipboardFactory {}
++
++/// Client clipboard that offers one four-byte file once ready and defers file contents requests, reporting each
++/// with the CLIPRDR processor that received it.
++struct DeferringClipboard {
++    input: ironrdp_client::rdp::RdpInputSender,
++    requests: UnboundedSender<(u32, ironrdp::cliprdr::CliprdrInstance)>,
++}
++
++impl core::fmt::Debug for DeferringClipboard {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("DeferringClipboard").finish_non_exhaustive()
++    }
++}
++
++impl_as_any!(DeferringClipboard);
++
++impl ironrdp::cliprdr::backend::CliprdrBackend for DeferringClipboard {
++    fn temporary_directory(&self) -> &str {
++        ".cliprdr"
++    }
++    fn client_capabilities(&self) -> ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags {
++        ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
++    }
++    fn on_ready(&mut self) {
++        let _ = self
++            .input
++            .send_clipboard(ironrdp::cliprdr::backend::ClipboardMessage::SendInitiateFileCopy(vec![
++                ironrdp::cliprdr::pdu::FileDescriptor::new("file.bin").with_file_size(4),
++            ]));
++    }
++    fn on_request_format_list(&mut self) {
++        let _ = self
++            .input
++            .send_clipboard(ironrdp::cliprdr::backend::ClipboardMessage::SendInitiateCopy(Vec::new()));
++    }
++    fn on_process_negotiated_capabilities(&mut self, _: ironrdp::cliprdr::pdu::ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ironrdp::cliprdr::pdu::ClipboardFormat]) {}
++    fn on_format_data_request(&mut self, _: ironrdp::cliprdr::pdu::FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: ironrdp::cliprdr::pdu::FormatDataResponse<'_>) {}
++    fn on_file_contents_request(&mut self, _: ironrdp::cliprdr::pdu::FileContentsRequest) {
++        unreachable!("CLIPRDR calls respond_to_file_contents_request");
++    }
++    fn respond_to_file_contents_request(
++        &mut self,
++        request: ironrdp::cliprdr::pdu::FileContentsRequest,
++        instance: ironrdp::cliprdr::CliprdrInstance,
++    ) -> Option<ironrdp::cliprdr::pdu::FileContentsResponse<'static>> {
++        let _ = self.requests.send((request.stream_id, instance));
++        None
++    }
++    fn on_file_contents_response(&mut self, _: ironrdp::cliprdr::pdu::FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++    fn on_unlock(&mut self, _: ironrdp::cliprdr::pdu::LockDataId) {}
++}
++
++struct DeferringClipboardFactory {
++    input: ironrdp_client::rdp::RdpInputSender,
++    requests: UnboundedSender<(u32, ironrdp::cliprdr::CliprdrInstance)>,
++}
++
++impl ironrdp::cliprdr::backend::CliprdrBackendFactory for DeferringClipboardFactory {
++    fn build_cliprdr_backend(&self) -> Box<dyn ironrdp::cliprdr::backend::CliprdrBackend> {
++        Box::new(DeferringClipboard {
++            input: self.input.clone(),
++            requests: self.requests.clone(),
++        })
++    }
++}
++
++/// A deferred file contents response reaches the server only for the CLIPRDR processor that received the request;
++/// one prepared for another processor is discarded before it is encoded, and its completion is dropped.
++// oracle: mutant sending a response prepared for a previous clipboard channel, or signaling its completion
++#[tokio::test]
++async fn client_clipboard_sends_deferred_responses_only_for_the_current_channel() {
++    use ironrdp::cliprdr::backend::ClipboardMessage;
++    use ironrdp::cliprdr::pdu::FileContentsResponse;
++    use ironrdp_client::rdp::{RdpClient, RdpOutputEvent};
++
++    let identity = test_tls_identity();
++    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
++    let (_display_tx, display_rx) = mpsc::unbounded_channel();
++    let (responses_tx, mut responses) = mpsc::unbounded_channel();
++    let mut server = RdpServer::builder()
++        .with_addr(([127, 0, 0, 1], 0))
++        .with_hybrid(acceptor, identity.pub_key)
++        .with_input_handler(TestInputHandler)
++        .with_display_handler(TestDisplay {
++            rx: Arc::new(Mutex::new(display_rx)),
++            offers_display_control: true,
++        })
++        .with_cliprdr_factory(Some(Box::new(RequestingClipboardFactory {
++            events: Arc::default(),
++            responses: responses_tx,
++        })))
++        .build();
++    server.set_credentials(Some(server::Credentials {
++        username: HYBRID_USER.into(),
++        password: HYBRID_PASSWORD.into(),
++        domain: None,
++    }));
++    let handle = server.handle().clone();
++    let local = tokio::task::LocalSet::new();
++    Box::pin(local.run_until(async move {
++        let server_task = tokio::task::spawn_local(async move {
++            let _ = server.run().await;
++        });
++        let server_address = handle.local_addr().await.unwrap().unwrap();
++        let config = ironrdp_client::config::ConfigBuilder::new()
++            .with_destination(ironrdp_client::config::Destination::from_parts(
++                "127.0.0.1",
++                server_address.port(),
++            ))
++            .with_username(HYBRID_USER)
++            .with_password(HYBRID_PASSWORD)
++            .with_credssp(true)
++            .with_client_build(1)
++            .with_client_dir("C:\\")
++            .with_platform(MajorPlatformType::WINDOWS)
++            .with_client_name("client")
++            .with_clipboard(ironrdp_client::config::ClipboardType::Enable)
++            .build()
++            .expect("client configuration");
++        let (output_tx, mut output_rx) = ironrdp_client::output_channel::output_channel(64);
++        let client = RdpClient::new(config, output_tx);
++        let input = client.input_sender();
++        let (requests_tx, mut requests) = mpsc::unbounded_channel();
++        let client = client.with_cliprdr_backend_factory(Box::new(DeferringClipboardFactory {
++            input: input.clone(),
++            requests: requests_tx,
++        }));
++        let client_task = tokio::task::spawn_local(client.run());
++        let events = tokio::task::spawn_local(async move {
++            while let Some(event) = output_rx.recv().await {
++                assert!(
++                    !matches!(event, RdpOutputEvent::ConnectionFailure(_)),
++                    "the client failed: {event:?}"
++                );
++            }
++        });
++        let (stream_id, current) = tokio::time::timeout(Duration::from_secs(20), requests.recv())
++            .await
++            .expect("the server requests file contents in time")
++            .expect("the client clipboard reports the request");
++        assert_eq!(stream_id, 7);
++        let previous = ironrdp::cliprdr::CliprdrClient::new(Box::new(NoClipboard)).instance();
++        assert_ne!(previous, current);
++
++        let response = |data: &[u8]| {
++            ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_data_response(7, data.to_vec()))
++        };
++        let (completion, stale) = oneshot::channel();
++        input
++            .send_clipboard_for_instance(previous, response(b"OLD!"), completion)
++            .expect("the session is running");
++        let stale = tokio::time::timeout(Duration::from_secs(5), stale)
++            .await
++            .expect("the session handles the stale response");
++        assert!(stale.is_err(), "a response for a previous channel was handled");
++
++        let (completion, handled) = oneshot::channel();
++        input
++            .send_clipboard_for_instance(current, response(b"CNDF"), completion)
++            .expect("the session is running");
++        tokio::time::timeout(Duration::from_secs(10), handled)
++            .await
++            .expect("the session handles the current response")
++            .expect("the session signals the written response");
++        let received = tokio::time::timeout(Duration::from_secs(10), responses.recv())
++            .await
++            .expect("the server receives the response")
++            .expect("the server clipboard reports the response");
++        assert_eq!(received, (7, Some(b"CNDF".to_vec())));
++        assert!(responses.try_recv().is_err());
++
++        input.request_close();
++        let _ = tokio::time::timeout(Duration::from_secs(5), client_task).await;
++        events.abort();
++        server_task.abort();
++    }))
++    .await;
++}
++
+ /// An `RdpClient` follows a Server Redirection PDU received during its session to the target, here the same
+ /// server since the PDU carries no port.
+ /// The new connection carries the load-balancing information as the X.224 routing token, the session ID in the
