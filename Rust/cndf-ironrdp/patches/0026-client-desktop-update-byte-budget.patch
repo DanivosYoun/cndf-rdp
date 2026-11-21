@@ -1,0 +1,929 @@
+diff --git a/crates/ironrdp-client/src/output_channel.rs b/crates/ironrdp-client/src/output_channel.rs
+index 36f30c1..4838ff3 100644
+--- a/crates/ironrdp-client/src/output_channel.rs
++++ b/crates/ironrdp-client/src/output_channel.rs
+@@ -133,12 +133,48 @@ struct LatestSlots {
+     pointer_position: LatestSlot<LatestPayload>,
+ }
+ 
++/// Pixel bytes of the [`RdpOutputEvent::DesktopUpdate`]s the session loop has packed and the
++/// embedder has not dropped yet.
++///
++/// `MustDeliver` bounds how many events wait, not how large they are: a queue of full-frame desktop
++/// updates would hold its capacity times the framebuffer. Each packed update holds a
++/// [`DesktopUpdatePermit`] for its bytes, so the session loop stops reading from the server once the
++/// budget is spent and resumes as the embedder drops updates.
++#[derive(Default)]
++struct DesktopUpdateBudget {
++    used: Mutex<usize>,
++    released: Notify,
++}
++
++/// Bytes a [`DesktopUpdate`](crate::rdp::DesktopUpdate) holds in its session's desktop update
++/// budget, returned when the update is dropped.
++pub(crate) struct DesktopUpdatePermit {
++    budget: Arc<DesktopUpdateBudget>,
++    bytes: usize,
++}
++
++impl core::fmt::Debug for DesktopUpdatePermit {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("DesktopUpdatePermit")
++            .field("bytes", &self.bytes)
++            .finish()
++    }
++}
++
++impl Drop for DesktopUpdatePermit {
++    fn drop(&mut self) {
++        *self.budget.used.lock().expect("not poisoned") -= self.bytes;
++        self.budget.released.notify_waiters();
++    }
++}
++
+ /// Sending half of the output-event channel. Dispatches each event by
+ /// [`RdpOutputEvent::drop_policy`].
+ #[derive(Clone)]
+ pub struct OutputEventSender {
+     must_deliver: mpsc::Sender<RdpOutputEvent>,
+     latest: Arc<LatestSlots>,
++    desktop_updates: Arc<DesktopUpdateBudget>,
+     /// Events raised from synchronous callbacks, waiting for the session loop to deliver them.
+     deferred: Arc<Mutex<VecDeque<RdpOutputEvent>>>,
+ }
+@@ -163,6 +199,7 @@ pub fn output_channel(capacity: usize) -> (OutputEventSender, OutputEventReceive
+     let sender = OutputEventSender {
+         must_deliver: must_deliver_tx,
+         latest: Arc::clone(&latest),
++        desktop_updates: Arc::default(),
+         deferred: Arc::default(),
+     };
+     let receiver = OutputEventReceiver {
+@@ -207,6 +244,57 @@ impl OutputEventSender {
+         }
+     }
+ 
++    /// Takes `bytes` of the desktop update budget `limit` if they fit now.
++    ///
++    /// An update larger than `limit` takes the whole budget, so it passes once nothing else holds any.
++    pub(crate) fn try_reserve_desktop_update(&self, bytes: usize, limit: usize) -> Option<DesktopUpdatePermit> {
++        let bytes = bytes.min(limit);
++        let mut used = self.desktop_updates.used.lock().expect("not poisoned");
++        if limit.saturating_sub(*used) < bytes {
++            return None;
++        }
++        *used += bytes;
++        Some(DesktopUpdatePermit {
++            budget: Arc::clone(&self.desktop_updates),
++            bytes,
++        })
++    }
++
++    /// Waits until `bytes` of the desktop update budget `limit` fit, then takes them, as
++    /// [`Self::try_reserve_desktop_update`] does.
++    ///
++    /// Not cancellation-aware by itself: callers race it against their close signals.
++    pub(crate) async fn reserve_desktop_update(&self, bytes: usize, limit: usize) -> DesktopUpdatePermit {
++        loop {
++            // Registered before checking, so a release between the check and the wait still wakes us.
++            let released = self.desktop_updates.released.notified();
++            tokio::pin!(released);
++            released.as_mut().enable();
++            if let Some(permit) = self.try_reserve_desktop_update(bytes, limit) {
++                return permit;
++            }
++            released.await;
++        }
++    }
++
++    #[cfg(feature = "__test")]
++    #[doc(hidden)]
++    pub fn __test_desktop_update_bytes_in_flight(&self) -> usize {
++        *self.desktop_updates.used.lock().expect("not poisoned")
++    }
++
++    #[cfg(feature = "__test")]
++    #[doc(hidden)]
++    pub fn __test_try_reserve_desktop_update(&self, bytes: usize, limit: usize) -> Option<impl Sized> {
++        self.try_reserve_desktop_update(bytes, limit)
++    }
++
++    #[cfg(feature = "__test")]
++    #[doc(hidden)]
++    pub async fn __test_reserve_desktop_update(&self, bytes: usize, limit: usize) -> impl Sized {
++        self.reserve_desktop_update(bytes, limit).await
++    }
++
+     /// Queues `event` for [`Self::send_deferred`] without blocking or dropping it.
+     ///
+     /// For callbacks that run synchronously inside the session loop, such as dynamic channel handlers, which cannot
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 4dc9127..d1fff88 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -350,6 +350,8 @@ pub struct DesktopUpdate {
+     width: NonZeroU16,
+     height: NonZeroU16,
+     region: InclusiveRectangle,
++    /// The session's desktop update budget this update holds until it is dropped.
++    permit: Option<crate::output_channel::DesktopUpdatePermit>,
+ }
+ 
+ impl DesktopUpdate {
+@@ -367,6 +369,7 @@ impl DesktopUpdate {
+             width,
+             height,
+             region,
++            permit: None,
+         })
+     }
+ 
+@@ -391,6 +394,8 @@ impl DesktopUpdate {
+     }
+ 
+     /// Decomposes the update into its packed pixels, framebuffer extent, and region.
++    ///
++    /// The update's share of the desktop update budget is returned: the caller owns the pixels now.
+     pub fn into_parts(self) -> (Vec<u32>, NonZeroU16, NonZeroU16, InclusiveRectangle) {
+         (self.buffer, self.width, self.height, self.region)
+     }
+@@ -4745,11 +4750,78 @@ fn process_rdpdr_drive_change(
+     }
+ }
+ 
++/// Smallest desktop update budget, so small desktops still pipeline several full frames.
++const MIN_DESKTOP_UPDATE_BUDGET: usize = 32 * 1024 * 1024;
++
++/// Bytes of packed desktop updates a session lets the embedder hold: two frames of the current
++/// framebuffer, at least [`MIN_DESKTOP_UPDATE_BUDGET`].
++fn desktop_update_budget(width: NonZeroU16, height: NonZeroU16) -> usize {
++    (usize::from(width.get()) * usize::from(height.get()) * 4 * 2).max(MIN_DESKTOP_UPDATE_BUDGET)
++}
++
++/// Pixel bytes a packed `region` takes, or 0 for a region [`pack_desktop_update`] rejects.
++fn desktop_update_bytes(region: &InclusiveRectangle) -> usize {
++    let width = region
++        .right
++        .checked_sub(region.left)
++        .map_or(0, |width| usize::from(width) + 1);
++    let height = region
++        .bottom
++        .checked_sub(region.top)
++        .map_or(0, |height| usize::from(height) + 1);
++    width * height * 4
++}
++
++enum DesktopUpdateRoom {
++    Reserved(crate::output_channel::DesktopUpdatePermit),
++    /// A graceful close is pending and the budget is spent: the update is dropped so the shutdown
++    /// is not held behind a consumer that may never drain.
++    Skip,
++    /// The session was closed while waiting.
++    Closed,
++}
++
++/// Waits for room for `region` in the desktop update budget of a `width` x `height` desktop.
++///
++/// Backpressure stops the session loop from reading, so the wait yields to a close and to a
++/// graceful close request.
++async fn reserve_desktop_update(
++    output_event_sender: &crate::output_channel::OutputEventSender,
++    width: NonZeroU16,
++    height: NonZeroU16,
++    region: &InclusiveRectangle,
++    close_receiver: &mut watch::Receiver<bool>,
++    graceful_close_receiver: &watch::Receiver<bool>,
++) -> DesktopUpdateRoom {
++    let bytes = desktop_update_bytes(region);
++    let limit = desktop_update_budget(width, height);
++    let try_reserve = || {
++        output_event_sender
++            .try_reserve_desktop_update(bytes, limit)
++            .map_or(DesktopUpdateRoom::Skip, DesktopUpdateRoom::Reserved)
++    };
++    if *close_receiver.borrow_and_update() {
++        return DesktopUpdateRoom::Closed;
++    }
++    // A clone, so the session loop still observes the request it is waiting for.
++    let mut graceful_close_receiver = graceful_close_receiver.clone();
++    if *graceful_close_receiver.borrow() {
++        return try_reserve();
++    }
++    tokio::select! {
++        biased;
++        _ = close_receiver.changed() => DesktopUpdateRoom::Closed,
++        _ = graceful_close_receiver.changed() => try_reserve(),
++        permit = output_event_sender.reserve_desktop_update(bytes, limit) => DesktopUpdateRoom::Reserved(permit),
++    }
++}
++
+ fn pack_desktop_update(
+     image: &DecodedImage,
+     width: NonZeroU16,
+     height: NonZeroU16,
+     region: InclusiveRectangle,
++    permit: Option<crate::output_channel::DesktopUpdatePermit>,
+ ) -> SessionResult<DesktopUpdate> {
+     let region_width = region
+         .right
+@@ -4809,8 +4881,10 @@ fn pack_desktop_update(
+         }));
+     }
+ 
+-    DesktopUpdate::new(buffer, width, height, region)
+-        .ok_or_else(|| ironrdp_session::general_err!("packed desktop update is inconsistent"))
++    let mut update = DesktopUpdate::new(buffer, width, height, region)
++        .ok_or_else(|| ironrdp_session::general_err!("packed desktop update is inconsistent"))?;
++    update.permit = permit;
++    Ok(update)
+ }
+ 
+ #[expect(
+@@ -5799,17 +5873,31 @@ async fn active_session(
+                         let extent = (width, height);
+                         if desktop_update_extent != Some(extent) {
+                             desktop_update_extent = Some(extent);
+-                            let update = pack_desktop_update(
+-                                &image,
++                            let region = InclusiveRectangle {
++                                left: 0,
++                                top: 0,
++                                right: width.get() - 1,
++                                bottom: height.get() - 1,
++                            };
++                            let permit = match reserve_desktop_update(
++                                output_event_sender,
+                                 width,
+                                 height,
+-                                InclusiveRectangle {
+-                                    left: 0,
+-                                    top: 0,
+-                                    right: width.get() - 1,
+-                                    bottom: height.get() - 1,
+-                                },
+-                            )?;
++                                &region,
++                                close_receiver,
++                                graceful_close_receiver,
++                            )
++                            .await
++                            {
++                                DesktopUpdateRoom::Reserved(permit) => permit,
++                                DesktopUpdateRoom::Skip => continue,
++                                DesktopUpdateRoom::Closed => {
++                                    return Ok(RdpControlFlow::TerminatedGracefully(
++                                        GracefulDisconnectReason::UserInitiated,
++                                    ));
++                                }
++                            };
++                            let update = pack_desktop_update(&image, width, height, region, Some(permit))?;
+                             if !send_active_output_event(
+                                 output_event_sender,
+                                 RdpOutputEvent::DesktopUpdate(update),
+@@ -5827,7 +5915,25 @@ async fn active_session(
+                                 desktop_damage_regions.push(region);
+                             }
+                             for region in desktop_damage_regions.drain(..) {
+-                                let update = pack_desktop_update(&image, width, height, region)?;
++                                let permit = match reserve_desktop_update(
++                                    output_event_sender,
++                                    width,
++                                    height,
++                                    &region,
++                                    close_receiver,
++                                    graceful_close_receiver,
++                                )
++                                .await
++                                {
++                                    DesktopUpdateRoom::Reserved(permit) => permit,
++                                    DesktopUpdateRoom::Skip => continue,
++                                    DesktopUpdateRoom::Closed => {
++                                        return Ok(RdpControlFlow::TerminatedGracefully(
++                                            GracefulDisconnectReason::UserInitiated,
++                                        ));
++                                    }
++                                };
++                                let update = pack_desktop_update(&image, width, height, region, Some(permit))?;
+                                 if !send_active_output_event(
+                                     output_event_sender,
+                                     RdpOutputEvent::DesktopUpdate(update),
+@@ -5854,6 +5960,7 @@ async fn active_session(
+                             right: width.get() - 1,
+                             bottom: height.get() - 1,
+                         },
++                        None,
+                     )?
+                     .buffer;
+                     if !send_active_output_event(
+diff --git a/crates/ironrdp-testsuite-extra/Cargo.toml b/crates/ironrdp-testsuite-extra/Cargo.toml
+index 702e274..2f6ed58 100644
+--- a/crates/ironrdp-testsuite-extra/Cargo.toml
++++ b/crates/ironrdp-testsuite-extra/Cargo.toml
+@@ -25,6 +25,12 @@ name = "integration_tests_extra"
+ path = "tests/main.rs"
+ harness = true
+ 
++# Its own binary: it installs a counting global allocator.
++[[test]]
++name = "desktop_update_budget"
++path = "tests/desktop_update_budget.rs"
++harness = true
++
+ [dev-dependencies]
+ anyhow = "1.0"
+ async-trait = "0.1"
+diff --git a/crates/ironrdp-testsuite-extra/tests/client/output_channel.rs b/crates/ironrdp-testsuite-extra/tests/client/output_channel.rs
+index a88a8b9..e635d07 100644
+--- a/crates/ironrdp-testsuite-extra/tests/client/output_channel.rs
++++ b/crates/ironrdp-testsuite-extra/tests/client/output_channel.rs
+@@ -313,3 +313,77 @@ async fn must_deliver_is_not_starved_by_sustained_latest_only_traffic() {
+     );
+     flooder.abort();
+ }
++
++#[test]
++fn desktop_update_permits_hold_their_bytes_until_dropped() {
++    let (sender, _receiver) = output_channel(1);
++    let first = sender
++        .__test_try_reserve_desktop_update(6, 10)
++        .expect("room for the first update");
++    assert!(
++        sender.__test_try_reserve_desktop_update(5, 10).is_none(),
++        "6 + 5 bytes exceed the budget"
++    );
++    let second = sender
++        .__test_try_reserve_desktop_update(4, 10)
++        .expect("6 + 4 bytes fit exactly");
++    drop(first);
++    assert!(
++        sender.__test_try_reserve_desktop_update(7, 10).is_none(),
++        "4 bytes are still held"
++    );
++    assert!(sender.__test_try_reserve_desktop_update(6, 10).is_some());
++    drop(second);
++    assert_eq!(sender.__test_desktop_update_bytes_in_flight(), 0);
++}
++
++#[test]
++fn desktop_update_budget_follows_the_limit_of_each_request() {
++    let (sender, _receiver) = output_channel(1);
++    let held = sender.__test_try_reserve_desktop_update(8, 10).expect("room");
++    assert!(sender.__test_try_reserve_desktop_update(8, 10).is_none());
++    // A larger framebuffer raises the budget for the updates packed after it.
++    assert!(sender.__test_try_reserve_desktop_update(8, 16).is_some());
++    drop(held);
++}
++
++#[test]
++fn desktop_update_larger_than_the_budget_takes_all_of_it() {
++    let (sender, _receiver) = output_channel(1);
++    let small = sender.__test_try_reserve_desktop_update(1, 10).expect("room");
++    assert!(
++        sender.__test_try_reserve_desktop_update(25, 10).is_none(),
++        "an oversized update waits for the budget to drain"
++    );
++    drop(small);
++    let large = sender
++        .__test_try_reserve_desktop_update(25, 10)
++        .expect("an oversized update passes alone");
++    assert_eq!(
++        sender.__test_desktop_update_bytes_in_flight(),
++        10,
++        "it holds the whole budget"
++    );
++    drop(large);
++    assert!(
++        sender.__test_try_reserve_desktop_update(10, 10).is_some(),
++        "and returns all of it"
++    );
++}
++
++#[tokio::test]
++async fn desktop_update_reservation_waits_for_a_release() {
++    let (sender, _receiver) = output_channel(1);
++    let held = sender.__test_try_reserve_desktop_update(10, 10).expect("room");
++    let mut waiting = Box::pin(sender.__test_reserve_desktop_update(25, 10));
++    assert!(
++        tokio::time::timeout(Duration::from_millis(50), waiting.as_mut())
++            .await
++            .is_err(),
++        "the budget is spent"
++    );
++    drop(held);
++    tokio::time::timeout(Duration::from_secs(1), waiting)
++        .await
++        .expect("a release wakes the waiting reservation");
++}
+diff --git a/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs b/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
+new file mode 100644
+index 0000000..3eb9926
+--- /dev/null
++++ b/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
+@@ -0,0 +1,507 @@
++//! Bytes of desktop updates an `RdpClient` holds while its embedder stops consuming them.
++//!
++//! The server sends full-frame bitmaps of fresh noise each time and the embedder does not
++//! read the output channel. Held bytes come from a counting global allocator, so this file is its
++//! own test binary and its tests run one at a time.
++
++#![allow(unused_crate_dependencies)]
++#![allow(clippy::unwrap_used, reason = "unwrap is fine in tests")]
++#![allow(clippy::print_stdout, reason = "the measurement is reported")]
++
++use core::alloc::{GlobalAlloc, Layout};
++use core::num::{NonZeroU16, NonZeroUsize};
++use core::sync::atomic::{AtomicUsize, Ordering};
++use core::time::Duration;
++use std::alloc::System;
++use std::path::Path;
++use std::sync::{Arc, Mutex as StdMutex};
++
++use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
++use ironrdp::server::{
++    self, DesktopSize, DisplayContext, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer,
++    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult, TlsIdentityCtx,
++};
++use ironrdp_client::config::{ConfigBuilder, Destination};
++use ironrdp_client::output_channel::{OutputEventReceiver, output_channel};
++use ironrdp_client::rdp::{RdpClient, RdpOutputEvent};
++use tokio::sync::{oneshot, watch};
++
++struct Counting;
++static CURRENT: AtomicUsize = AtomicUsize::new(0);
++
++// SAFETY: forwards every call to `System` and only counts the sizes.
++unsafe impl GlobalAlloc for Counting {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
++        }
++        ptr
++    }
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            CURRENT.fetch_add(layout.size(), Ordering::Relaxed);
++        }
++        ptr
++    }
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: same contract as the caller's.
++        unsafe { System.dealloc(ptr, layout) };
++        CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
++    }
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let new = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new.is_null() {
++            CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
++            CURRENT.fetch_add(new_size, Ordering::Relaxed);
++        }
++        new
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: Counting = Counting;
++
++/// One measurement at a time: the counter is process-wide.
++static SERIAL: StdMutex<()> = StdMutex::new(());
++
++const MIB: usize = 1024 * 1024;
++
++/// `bytes` in MiB with one decimal.
++fn mib(bytes: usize) -> String {
++    format!("{}.{}", bytes / MIB, bytes % MIB * 10 / MIB)
++}
++const USER: &str = "user";
++const PASSWORD: &str = "password";
++
++/// Noise no encoder can shrink, different in every frame, so each is a full-frame update.
++fn frame_data(frame: usize, pixels: usize) -> Vec<u8> {
++    let mut state = 0x2545_f491_4f6c_dd1du64 ^ (u64::try_from(frame).unwrap() + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
++    let mut data = Vec::with_capacity(pixels * 4);
++    for _ in 0..pixels {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        let [b, g, r, ..] = state.to_le_bytes();
++        data.extend_from_slice(&[b, g, r, 0xff]);
++    }
++    data
++}
++
++/// What the display sends, in order, as the server asks for it.
++#[derive(Clone)]
++enum Step {
++    Frame,
++    Resize(u16, u16),
++}
++
++struct Script {
++    steps: Vec<Step>,
++    /// Released step count; the server waits once it has sent them all.
++    released: watch::Receiver<usize>,
++    sent: Arc<AtomicUsize>,
++    size: Arc<StdMutex<(u16, u16)>>,
++}
++
++struct ScriptedUpdates {
++    script: Arc<tokio::sync::Mutex<Script>>,
++}
++
++#[async_trait::async_trait]
++impl RdpServerDisplayUpdates for ScriptedUpdates {
++    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
++        let mut script = self.script.lock().await;
++        let index = script.sent.load(Ordering::SeqCst);
++        if index >= script.steps.len() {
++            return Ok(core::future::pending().await);
++        }
++        let _ = script.released.wait_for(|released| *released > index).await;
++        let step = script.steps[index].clone();
++        let update = match step {
++            Step::Frame => {
++                let (width, height) = *script.size.lock().unwrap();
++                let pixels = usize::from(width) * usize::from(height);
++                let data = frame_data(index, pixels);
++                DisplayUpdate::Bitmap(server::BitmapUpdate {
++                    x: 0,
++                    y: 0,
++                    width: NonZeroU16::new(width).unwrap(),
++                    height: NonZeroU16::new(height).unwrap(),
++                    format: PixelFormat::BgrA32,
++                    data: data.into(),
++                    stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
++                })
++            }
++            Step::Resize(width, height) => {
++                *script.size.lock().unwrap() = (width, height);
++                DisplayUpdate::Resize(DesktopSize { width, height })
++            }
++        };
++        script.sent.store(index + 1, Ordering::SeqCst);
++        Ok(Some(update))
++    }
++}
++
++struct ScriptedDisplay {
++    script: Arc<tokio::sync::Mutex<Script>>,
++    size: Arc<StdMutex<(u16, u16)>>,
++}
++
++#[async_trait::async_trait]
++impl RdpServerDisplay for ScriptedDisplay {
++    async fn size(&mut self) -> DesktopSize {
++        let (width, height) = *self.size.lock().unwrap();
++        DesktopSize { width, height }
++    }
++
++    async fn updates(&mut self, _: DisplayContext) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
++        Ok(Box::new(ScriptedUpdates {
++            script: Arc::clone(&self.script),
++        }))
++    }
++}
++
++struct NoInput;
++impl RdpServerInputHandler for NoInput {
++    fn keyboard(&mut self, _: KeyboardEvent) {}
++    fn mouse(&mut self, _: MouseEvent) {}
++}
++
++struct Session {
++    output: OutputEventReceiver,
++    input: ironrdp_client::rdp::RdpInputSender,
++    client: tokio::task::JoinHandle<()>,
++    server: tokio::task::JoinHandle<()>,
++    release: watch::Sender<usize>,
++    sent: Arc<AtomicUsize>,
++    /// The client's framebuffer as composed from the desktop updates received so far.
++    screen: Vec<u32>,
++    extent: (u16, u16),
++}
++
++/// Starts a server that plays `steps` as they are released and a client with desktop updates on,
++/// and waits until the client is connected.
++async fn start(
++    width: u16,
++    height: u16,
++    steps: Vec<Step>,
++    capacity: usize,
++    probe: Option<oneshot::Sender<ironrdp_client::output_channel::OutputEventSender>>,
++) -> Session {
++    let cert = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
++    let key = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
++    let identity = TlsIdentityCtx::init_from_paths(&cert, &key).unwrap();
++    let acceptor = identity.make_acceptor().unwrap();
++    let size = Arc::new(StdMutex::new((width, height)));
++    let (release, released) = watch::channel(0);
++    let sent = Arc::new(AtomicUsize::new(0));
++    let script = Arc::new(tokio::sync::Mutex::new(Script {
++        steps,
++        released,
++        sent: Arc::clone(&sent),
++        size: Arc::clone(&size),
++    }));
++    let mut server = RdpServer::builder()
++        .with_addr(([127, 0, 0, 1], 0))
++        .with_hybrid(acceptor, identity.pub_key)
++        .with_input_handler(NoInput)
++        .with_display_handler(ScriptedDisplay { script, size })
++        .build();
++    server.set_credentials(Some(server::Credentials {
++        username: USER.into(),
++        password: PASSWORD.into(),
++        domain: None,
++    }));
++    let events = server.event_sender().clone();
++    let server = tokio::task::spawn_local(async move {
++        let _ = server.run().await;
++    });
++    let (tx, rx) = oneshot::channel();
++    events.send(ServerEvent::GetLocalAddr(tx)).unwrap();
++    let addr = rx.await.unwrap().unwrap();
++
++    let config = ConfigBuilder::new()
++        .with_destination(Destination::from_parts("127.0.0.1", addr.port()))
++        .with_username(USER)
++        .with_password(PASSWORD)
++        .with_desktop_width(width)
++        .with_desktop_height(height)
++        .with_client_build(1)
++        .with_client_dir("C:\\")
++        .with_platform(MajorPlatformType::WINDOWS)
++        .with_client_name("client")
++        .with_clipboard(ironrdp_client::config::ClipboardType::Disable)
++        // As the CNDF engine configures it: the server draws the pointer.
++        .with_server_pointer(true)
++        .with_pointer_software_rendering(false)
++        .with_graphics_pipeline(false)
++        // Lossless bitmaps, so the composed screen can be compared with the server's frames.
++        .with_codecs(vec![
++            "remotefx:off".to_owned(),
++            "qoi:off".to_owned(),
++            "qoiz:off".to_owned(),
++        ])
++        .build()
++        .unwrap();
++    let (output_tx, output) = output_channel(capacity);
++    if let Some(probe) = probe {
++        let _ = probe.send(output_tx.clone());
++    }
++    let client = RdpClient::new(config, output_tx).with_desktop_updates();
++    let input = client.input_sender();
++    let client = tokio::task::spawn_local(client.run());
++    let mut session = Session {
++        output,
++        input,
++        client,
++        server,
++        release,
++        sent,
++        screen: Vec::new(),
++        extent: (0, 0),
++    };
++    session
++        .drain_until(Duration::from_secs(20), |event| {
++            matches!(event, RdpOutputEvent::Connected)
++        })
++        .await;
++    session
++}
++
++impl Session {
++    fn compose(&mut self, event: RdpOutputEvent) {
++        if let RdpOutputEvent::DesktopUpdate(update) = event {
++            let extent = (update.width().get(), update.height().get());
++            if extent != self.extent {
++                self.extent = extent;
++                self.screen = vec![0; usize::from(extent.0) * usize::from(extent.1)];
++            }
++            let region = update.region();
++            let row = usize::from(region.right - region.left) + 1;
++            for (i, pixels) in update.buffer().chunks_exact(row).enumerate() {
++                let start = (usize::from(region.top) + i) * usize::from(extent.0) + usize::from(region.left);
++                self.screen[start..start + row].copy_from_slice(pixels);
++            }
++        }
++    }
++
++    /// Consumes events until one matches `stop`; desktop updates are composed on the way.
++    async fn drain_until(&mut self, limit: Duration, stop: impl Fn(&RdpOutputEvent) -> bool) {
++        tokio::time::timeout(limit, async {
++            loop {
++                let event = self.output.recv().await.expect("the client is running");
++                assert!(
++                    !matches!(event, RdpOutputEvent::ConnectionFailure(_)),
++                    "the client failed: {event:?}"
++                );
++                if stop(&event) {
++                    return;
++                }
++                self.compose(event);
++            }
++        })
++        .await
++        .expect("the awaited event arrives");
++    }
++
++    /// Releases `steps` more steps and, without consuming, waits until the client stops taking any.
++    /// Returns the bytes held above `base` once nothing moves for a second.
++    async fn stall(&self, steps: usize, base: usize) -> usize {
++        self.release.send_modify(|released| *released += steps);
++        let mut last = (usize::MAX, usize::MAX);
++        let mut still = 0;
++        loop {
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            let now = (self.sent.load(Ordering::SeqCst), CURRENT.load(Ordering::Relaxed) / MIB);
++            if now == last {
++                still += 1;
++                if still >= 10 {
++                    return CURRENT.load(Ordering::Relaxed).saturating_sub(base);
++                }
++            } else {
++                still = 0;
++                last = now;
++            }
++        }
++    }
++}
++
++/// The `0x00RRGGBB` screen a client shows for `frame`.
++fn screen(frame: usize, pixels: usize) -> Vec<u32> {
++    frame_data(frame, pixels)
++        .chunks_exact(4)
++        .map(|bgra| u32::from_be_bytes([0, bgra[2], bgra[1], bgra[0]]))
++        .collect()
++}
++
++/// Holds the bytes of a stalled consumer after `frames` full 1024x1024 frames.
++async fn held_while_stalled(frames: usize, capacity: usize) -> usize {
++    let session = start(1024, 1024, vec![Step::Frame; frames], capacity, None).await;
++    let base = CURRENT.load(Ordering::Relaxed);
++    let held = session.stall(frames, base).await;
++    println!(
++        "capacity={capacity} frames={frames} sent={} held={} MiB",
++        session.sent.load(Ordering::SeqCst),
++        mib(held)
++    );
++    session.input.request_close();
++    session.server.abort();
++    drop(session.output);
++    let _ = tokio::time::timeout(Duration::from_secs(5), session.client).await;
++    held
++}
++
++fn run_local<F: Future<Output = ()>>(f: impl FnOnce() -> F) {
++    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .unwrap();
++    let local = tokio::task::LocalSet::new();
++    local.block_on(&runtime, f());
++}
++
++/// Before the budget, a stalled consumer held as many full frames as the channel had room for.
++/// The budget for a 1024x1024 desktop is 32 MiB (eight frames) whatever the channel capacity.
++#[test]
++fn stalled_consumer_holds_at_most_the_desktop_update_budget() {
++    run_local(|| async {
++        let frame = 1024 * 1024 * 4;
++        let mut held = Vec::new();
++        for capacity in [16, 64, 128] {
++            held.push((capacity, held_while_stalled(capacity + 40, capacity).await));
++        }
++        for (capacity, held) in held {
++            // The budget, the frame being decoded, and the server's own copies of a frame or two.
++            assert!(
++                held <= 32 * MIB + 4 * frame,
++                "capacity {capacity}: held {held} bytes, more than the 32 MiB budget"
++            );
++        }
++    });
++}
++
++/// Every withheld update arrives in order once the consumer resumes, and the screen ends up as
++/// the server's last frame.
++#[test]
++fn resumed_consumer_receives_every_update_in_order() {
++    run_local(|| async {
++        let frames = 40;
++        let mut session = start(1024, 1024, vec![Step::Frame; frames], 128, None).await;
++        let base = CURRENT.load(Ordering::Relaxed);
++        session.stall(frames, base).await;
++        assert!(
++            session.sent.load(Ordering::SeqCst) < frames,
++            "the stall holds back the server"
++        );
++
++        let pixels = 1024 * 1024;
++        let expected = screen(frames - 1, pixels);
++        // Each frame is told apart by its first row, which every full-frame update starts with.
++        let firsts: Vec<Vec<u32>> = (0..frames).map(|frame| screen(frame, 1024)).collect();
++        let mut seen = Vec::new();
++        tokio::time::timeout(Duration::from_secs(60), async {
++            loop {
++                let event = session.output.recv().await.expect("the client is running");
++                if let RdpOutputEvent::DesktopUpdate(update) = &event {
++                    if update.region().left == 0 && update.region().top == 0 && update.buffer().len() >= 1024 {
++                        if let Some(frame) = firsts.iter().position(|first| first[..] == update.buffer()[..1024]) {
++                            seen.push(frame);
++                        }
++                    }
++                }
++                session.compose(event);
++                if session.sent.load(Ordering::SeqCst) == frames && session.screen == expected {
++                    return;
++                }
++            }
++        })
++        .await
++        .expect("the last frame arrives");
++        assert!(
++            seen.windows(2).all(|pair| pair[0] < pair[1]),
++            "frames out of order: {seen:?}"
++        );
++        assert_eq!(seen.last(), Some(&(frames - 1)));
++        session.input.request_close();
++        session.server.abort();
++        drop(session.output);
++        let _ = tokio::time::timeout(Duration::from_secs(5), session.client).await;
++    });
++}
++
++/// A close while the session loop waits for budget ends the session within a second, and so
++/// does a graceful close, which still reaches the server (it disconnects on a shutdown request),
++/// with the consumer stalled throughout.
++#[test]
++fn close_while_waiting_for_budget_terminates_the_session() {
++    for graceful in [false, true] {
++        run_local(|| async move {
++            let mut session = start(1024, 1024, vec![Step::Frame; 60], 128, None).await;
++            let base = CURRENT.load(Ordering::Relaxed);
++            session.stall(60, base).await;
++            if graceful {
++                session.input.request_graceful_close();
++            } else {
++                session.input.request_close();
++            }
++            tokio::time::timeout(Duration::from_secs(1), &mut session.client)
++                .await
++                .unwrap_or_else(|_| panic!("graceful={graceful}: the session waits for budget past a close"))
++                .unwrap();
++            session
++                .drain_until(Duration::from_secs(1), |event| {
++                    matches!(event, RdpOutputEvent::Terminated(_))
++                })
++                .await;
++            session.server.abort();
++        });
++    }
++}
++
++/// The budget follows the framebuffer: after a resize to 4096x2048 (32 MiB frames) the client
++/// lets up to 64 MiB of updates wait, not the 32 MiB of the 1024x1024 desktop it connected with.
++#[test]
++fn budget_follows_a_desktop_resize() {
++    run_local(|| async {
++        let mut steps = vec![Step::Frame, Step::Resize(4096, 2048)];
++        steps.extend(vec![Step::Frame; 12]);
++        let total = steps.len();
++        let (probe_tx, probe_rx) = oneshot::channel();
++        let mut session = start(1024, 1024, steps, 128, Some(probe_tx)).await;
++        let probe = probe_rx.await.unwrap();
++        // Let the first frame, the resize and a frame at the new size through while consuming.
++        session.release.send_modify(|released| *released = 3);
++        tokio::time::timeout(Duration::from_secs(20), async {
++            while session.extent != (4096, 2048) {
++                let event = session.output.recv().await.expect("the client is running");
++                session.compose(event);
++            }
++        })
++        .await
++        .expect("the client resizes");
++        let base = CURRENT.load(Ordering::Relaxed);
++        let held = session.stall(total - 3, base).await;
++        let waiting = probe.__test_desktop_update_bytes_in_flight();
++        println!("after resize: waiting={} MiB held={} MiB", mib(waiting), mib(held));
++        // Tiles are at most 8 MiB, so a 64 MiB budget stalls above 56 MiB and a 32 MiB one below 32.
++        assert!(
++            waiting > 40 * MIB,
++            "{waiting} bytes wait: the budget did not grow with the framebuffer"
++        );
++        assert!(waiting <= 64 * MIB, "{waiting} bytes wait, more than the 64 MiB budget");
++        let frame = 4096 * 2048 * 4;
++        assert!(
++            held <= 64 * MIB + 3 * frame,
++            "held {held} bytes, more than the 64 MiB budget"
++        );
++        session.input.request_close();
++        session.server.abort();
++        drop(session.output);
++        let _ = tokio::time::timeout(Duration::from_secs(5), session.client).await;
++    });
++}
