@@ -19,7 +19,7 @@ final class RDPEngineRoutingTests: XCTestCase {
         }
         XCTAssertEqual(RDPConnectionOptions(host: "h").engine, .freeRDP)
         XCTAssertTrue(RDPEngineKind.freeRDP.supportsClipboard)
-        XCTAssertFalse(RDPEngineKind.ironRDP.supportsClipboard)
+        XCTAssertTrue(RDPEngineKind.ironRDP.supportsClipboard)
     }
 
     // stub

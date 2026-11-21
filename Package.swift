@@ -83,7 +83,12 @@ let package = Package(
                 ]),
                 .linkedFramework("Security"),
                 .linkedFramework("CoreFoundation"),
-                .linkedFramework("SystemConfiguration")
+                .linkedFramework("SystemConfiguration"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("Foundation"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
+                .linkedLibrary("iconv")
             ]
         ),
         .testTarget(

@@ -1,3 +1,5 @@
+import AppKit
+import FileTransferStaging
 import Foundation
 import IronRDPBridge
 import XCTest
@@ -26,10 +28,18 @@ final class IronRDPSessionTests: XCTestCase {
         }
     }
 
-    func testEngineCapabilitiesAreReportedOff() throws {
+    func testEngineCapabilitiesMatchABIv1() throws {
         let session = try IronRDPSession()
         XCTAssertEqual(session.engine, .ironRDP)
-        XCTAssertFalse(session.supportsClipboard)
+        XCTAssertEqual(cndf_iron_abi_version(), 1)
+        XCTAssertEqual(cndf_iron_capabilities(), 0xF)
+        XCTAssertTrue(session.supportsClipboard)
+        for engine in [RDPEngineKind.freeRDP, .ironRDP] {
+            XCTAssertTrue(engine.supportsDriveRedirection)
+            XCTAssertTrue(engine.supportsAudioPlayback(.disabled))
+            XCTAssertTrue(engine.supportsAudioPlayback(.playLocally))
+            XCTAssertTrue(engine.supportsAudioPlayback(.playOnRemote))
+        }
         XCTAssertFalse(session.supportsOutputSuppression)
         XCTAssertNoThrow(try session.pollLocalClipboard())
         XCTAssertThrowsError(try session.sendLocalText("x"))
@@ -45,6 +55,25 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(session.connectionGeneration, generation)
         XCTAssertFalse(session.isConnected)
         XCTAssertThrowsError(try session.sendKey(keyCode: 0x1E, pressed: true, extended: false))
+    }
+
+    func testInvalidDrivePathIsRejectedBeforeConnecting() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data().write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let session = try IronRDPSession()
+        let recorder = Recorder()
+        session.delegate = recorder
+        let options = RDPConnectionOptions(
+            host: "localhost", enableClipboard: false,
+            redirectedFolderPath: file.path, redirectedFolderName: "Home",
+            audioPlaybackMode: .playOnRemote
+        )
+        XCTAssertThrowsError(try session.connect(options, initialPointSize: CGSize(width: 800, height: 600), scale: 1)) {
+            XCTAssertEqual($0 as? RDPSessionError, .bridgeRejectedOperation(Int32(CNDF_IRON_INVALID_ARGUMENT.rawValue)))
+        }
+        XCTAssertEqual(session.connectionGeneration, 0)
+        XCTAssertEqual(recorder.logs.dropFirst().first, "RDP channels clipboard=off folder=on audio=remote")
     }
 
     func testCallbacksBeforeAnyConnectionAreDropped() throws {
@@ -307,7 +336,7 @@ final class IronRDPSessionTests: XCTestCase {
     }
 
     // stub
-    func testForcedResizeIsSentEvenWhenTheSizeIsUnchanged() throws {
+    func testForcedUpdateRedeliversFrameWhenTheSizeIsUnchanged() throws {
         try skipUnlessStub()
         let session = try IronRDPSession()
         let recorder = Recorder(trust: true)
@@ -315,11 +344,148 @@ final class IronRDPSessionTests: XCTestCase {
         try session.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
         XCTAssertTrue(waitUntil { session.isConnected && recorder.frameCount == 1 })
 
-        // The stub answers a redelivery with one frame and a resize with another.
+        // A same-size update redelivers the cached frame without asking for a resize.
         try session.updateDesktopSize(pointWidth: 640, pointHeight: 480, scale: 1, force: true)
-        XCTAssertTrue(waitUntil { recorder.frameCount == 3 })
+        XCTAssertTrue(waitUntil { recorder.frameCount == 2 })
         XCTAssertEqual(recorder.lastFrameSize, CGSize(width: 640, height: 480))
         try session.disconnect()
+    }
+
+    func testClipboardStubRoundTripsTextAndFilesOnNamedPasteboard() throws {
+        try skipUnlessStub()
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let staging = FileTransferStaging(rootURL: root.appendingPathComponent("staging"))
+        let session = try IronRDPSession(resizeCoordinator: DisplayResizeCoordinator(), certificateTrustTimeout: 5, staging: staging)
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        defer { try? session.disconnect() }
+        try session.connect(RDPConnectionOptions(host: "localhost", pasteboardName: board.name.rawValue),
+                            initialPointSize: CGSize(width: 800, height: 600), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected })
+
+        board.clearContents()
+        XCTAssertTrue(board.setString("한글 🖥️", forType: .string))
+        try session.pollLocalClipboard()
+        XCTAssertTrue(waitUntil { recorder.clipboardTexts == ["한글 🖥️"] })
+        XCTAssertEqual(board.string(forType: .string), "한글 🖥️")
+        try session.pollLocalClipboard()
+        XCTAssertEqual(session.statistics.remoteClipboardTextsReceived, 1)
+
+        let nfd = "한글.txt".decomposedStringWithCanonicalMapping
+        let file = root.appendingPathComponent(nfd)
+        let data = Data(repeating: 0xA5, count: 1024 * 1024 + 3)
+        try data.write(to: file)
+        try session.sendLocalFiles([file])
+        XCTAssertTrue(waitUntil { !recorder.clipboardFiles.isEmpty })
+        let entry = try XCTUnwrap(recorder.clipboardFiles.first)
+        XCTAssertEqual(Array(entry.fileName.utf8), Array("한글.txt".utf8))
+        XCTAssertTrue(waitUntil {
+            (board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?.count == 1
+        })
+        let urls = try XCTUnwrap(board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(urls.first)), data)
+        XCTAssertEqual(session.statistics.localFilesOffered, 1)
+        XCTAssertEqual(session.statistics.remoteFileBytesReceived, UInt64(data.count))
+    }
+
+    func testClipboardCallbacksAreDroppedAcrossDisconnectAndReconnect() throws {
+        try skipUnlessStub()
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let session = try IronRDPSession()
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        defer { try? session.disconnect() }
+        try session.connect(RDPConnectionOptions(host: "localhost", pasteboardName: board.name.rawValue),
+                            initialPointSize: CGSize(width: 800, height: 600), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected })
+        let connection = session.connectionGeneration
+
+        let text = Array("stale".utf8)
+        text.withUnsafeBufferPointer {
+            session.callbacks.remote_text?(99, $0.baseAddress, $0.count, session.callbacks.context)
+            session.callbacks.remote_text?(1, $0.baseAddress, $0.count, session.callbacks.context)
+        }
+        try session.reconnect()
+        XCTAssertTrue(waitUntil { session.isConnected })
+        try session.sendLocalText("current")
+        XCTAssertTrue(waitUntil { recorder.clipboardTexts.contains("current") })
+        XCTAssertEqual(recorder.clipboardTexts, ["current"])
+        XCTAssertEqual(board.string(forType: .string), "current")
+
+        try session.disconnect()
+        XCTAssertThrowsError(try session.requestRemoteFileRange(connection: connection, stream: 2, index: 0, offset: 1024 * 1024, length: 1)) {
+            XCTAssertEqual($0 as? RDPSessionError, .bridgeRejectedOperation(Int32(CNDF_IRON_NOT_CONNECTED.rawValue)))
+        }
+        text.withUnsafeBufferPointer {
+            session.callbacks.remote_text?(1, $0.baseAddress, $0.count, session.callbacks.context)
+        }
+        let mainQueueDrained = expectation(description: "main queue drained")
+        DispatchQueue.main.async { mainQueueDrained.fulfill() }
+        wait(for: [mainQueueDrained], timeout: 2)
+        XCTAssertEqual(recorder.clipboardTexts, ["current"])
+        XCTAssertEqual(board.string(forType: .string), "current")
+    }
+
+    func testClipboardStubReportsRejectedRangeWithoutChangingPasteboard() throws {
+        try skipUnlessStub()
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        board.setString("unchanged", forType: .string)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = try IronRDPSession(
+            resizeCoordinator: DisplayResizeCoordinator(),
+            certificateTrustTimeout: 5,
+            staging: FileTransferStaging(rootURL: root)
+        )
+        let recorder = Recorder(trust: true)
+        session.delegate = recorder
+        defer { try? session.disconnect() }
+        try session.connect(RDPConnectionOptions(host: "localhost", pasteboardName: board.name.rawValue),
+                            initialPointSize: CGSize(width: 800, height: 600), scale: 1)
+        XCTAssertTrue(waitUntil { session.isConnected })
+
+        // The stub has no file at index zero. Its range reply must drive the failure path.
+        Array("unavailable.txt".utf8).withUnsafeBufferPointer { name in
+            var file = CNDFIronRemoteFile(name_utf8: name.baseAddress, name_length: name.count, size: 1)
+            session.callbacks.remote_file_list?(1, &file, 1, session.callbacks.context)
+        }
+        XCTAssertTrue(waitUntil(timeout: 3) {
+            recorder.logs.contains { $0.hasPrefix("Remote file materialization failed:") }
+        })
+        XCTAssertEqual(board.string(forType: .string), "unchanged")
+    }
+
+    func testFileDownloadRequestsOneMiBAndFailsImmediatelyOnNegativeResponse() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstChunk: UInt32 = 1024 * 1024
+        var offsets: [UInt64] = []
+        var lengths: [UInt32] = []
+        var manager: RDPRemoteFileDownloadManager!
+        manager = RDPRemoteFileDownloadManager(staging: FileTransferStaging(rootURL: root)) { stream, _, offset, length in
+            offsets.append(offset)
+            lengths.append(length)
+            if offset == 0 {
+                manager.receive(streamId: stream, data: Data(count: Int(length)))
+            } else {
+                manager.fail(streamId: stream)
+            }
+        }
+        defer { manager = nil }
+        manager.fail(streamId: 1) // unsolicited responses cannot poison future requests
+        let start = Date()
+        XCTAssertThrowsError(try manager.materialize([
+            RDPFileListEntry(fileName: "partial.txt", byteCount: UInt64(firstChunk) + 1, localURL: nil)
+        ]))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+        XCTAssertEqual(offsets, [0, UInt64(firstChunk)])
+        XCTAssertEqual(lengths, [firstChunk, 1])
     }
 
     private func options(logFileURL: URL? = nil) -> RDPConnectionOptions {
@@ -408,6 +574,8 @@ private final class Recorder: RDPSessionDelegate {
     private let lock = NSLock()
     private var trust: Bool?
     private var storedLogs: [String] = []
+    private var storedClipboardTexts: [String] = []
+    private var storedClipboardFiles: [RDPRemoteFile] = []
     private var storedTrustRequests: [String] = []
     private var storedErrors: [RDPSessionError] = []
     private var storedFrames: [CGSize] = []
@@ -428,6 +596,19 @@ private final class Recorder: RDPSessionDelegate {
     var eventCount: Int { locked { storedEvents } }
     /// `failure` and `disconnect:<reason>` in delivery order, plus `log` with `logsInLifecycle`.
     var lifecycle: [String] { locked { storedLifecycle } }
+
+    var clipboardTexts: [String] { locked { storedClipboardTexts } }
+    var clipboardFiles: [RDPRemoteFile] { locked { storedClipboardFiles } }
+
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String) {
+        XCTAssertTrue(Thread.isMainThread)
+        locked { storedClipboardTexts.append(text) }
+    }
+
+    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {
+        XCTAssertTrue(Thread.isMainThread)
+        locked { storedClipboardFiles.append(contentsOf: files) }
+    }
 
     func answerTrust(_ trusted: Bool) {
         locked { trust = trusted }
@@ -471,8 +652,6 @@ private final class Recorder: RDPSessionDelegate {
         locked { storedLifecycle.append("disconnect:\(name)"); storedEvents += 1 }
     }
 
-    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteText text: String) {}
-    func rdpSession(_ session: RDPEngineSession, didReceiveRemoteFiles files: [RDPRemoteFile]) {}
 
     func rdpSession(_ session: RDPEngineSession, didReceiveFrame frame: RDPFrame) {
         locked { storedFrames.append(CGSize(width: frame.width, height: frame.height)); storedEvents += 1 }

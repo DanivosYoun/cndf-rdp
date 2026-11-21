@@ -1,25 +1,38 @@
-import ClipboardBridge
 import FileTransferStaging
 import Foundation
 import FreeRDPBridge
 
 final class RDPRemoteFileDownloadManager {
-    private let session: OpaquePointer
+    private let requestRange: (UInt32, UInt32, UInt64, UInt32) throws -> Void
     private let staging: FileTransferStaging
     private let condition = NSCondition()
     private var nextStreamId: UInt32 = 1
-    private var responses: [UInt32: Data] = [:]
+    private enum Response {
+        case waiting
+        case received(Data)
+        case failed
+    }
+    private var responses: [UInt32: Response] = [:]
 
-    init(session: OpaquePointer, staging: FileTransferStaging) {
-        self.session = session
+    init(staging: FileTransferStaging, requestRange: @escaping (UInt32, UInt32, UInt64, UInt32) throws -> Void) {
         self.staging = staging
+        self.requestRange = requestRange
     }
 
     func receive(streamId: UInt32, data: Data) {
+        complete(streamId: streamId, with: .received(data))
+    }
+
+    func fail(streamId: UInt32) {
+        complete(streamId: streamId, with: .failed)
+    }
+
+    private func complete(streamId: UInt32, with response: Response) {
         condition.lock()
-        responses[streamId] = data
+        defer { condition.unlock() }
+        guard case .waiting? = responses[streamId] else { return }
+        responses[streamId] = response
         condition.broadcast()
-        condition.unlock()
     }
 
     func materialize(_ files: [RDPFileListEntry], chunkSize: UInt32 = 1024 * 1024) throws -> [URL] {
@@ -56,20 +69,27 @@ final class RDPRemoteFileDownloadManager {
 
     private func requestChunk(listIndex: UInt32, offset: UInt64, length: UInt32) throws -> Data {
         let streamId = allocateStreamId()
-        let status = rdp_bridge_request_remote_file_range(session, streamId, listIndex, offset, length)
-        guard status == RDPBridgeStatusOK else {
-            throw RDPSessionError.bridgeRejectedOperation(Int32(status.rawValue))
+        defer {
+            condition.lock()
+            responses.removeValue(forKey: streamId)
+            condition.unlock()
         }
 
+        try requestRange(streamId, listIndex, offset, length)
         return try waitForResponse(streamId: streamId, timeout: 15)
     }
 
     private func allocateStreamId() -> UInt32 {
         condition.lock()
         defer { condition.unlock() }
-        let streamId = nextStreamId
-        nextStreamId = nextStreamId == UInt32.max ? 1 : nextStreamId + 1
-        return streamId
+        repeat {
+            let streamId = nextStreamId
+            nextStreamId = nextStreamId == UInt32.max ? 1 : nextStreamId + 1
+            if responses[streamId] == nil {
+                responses[streamId] = .waiting
+                return streamId
+            }
+        } while true
     }
 
     private func waitForResponse(streamId: UInt32, timeout: TimeInterval) throws -> Data {
@@ -77,12 +97,11 @@ final class RDPRemoteFileDownloadManager {
         condition.lock()
         defer { condition.unlock() }
 
-        while responses[streamId] == nil {
-            if !condition.wait(until: deadline) {
-                throw RDPSessionError.bridgeRejectedOperation(Int32(RDPBridgeStatusBackendUnavailable.rawValue))
-            }
+        while case .waiting? = responses[streamId] {
+            if !condition.wait(until: deadline) { break }
         }
 
-        return responses.removeValue(forKey: streamId) ?? Data()
+        if case .received(let data)? = responses[streamId] { return data }
+        throw RDPSessionError.bridgeRejectedOperation(Int32(RDPBridgeStatusBackendUnavailable.rawValue))
     }
 }
