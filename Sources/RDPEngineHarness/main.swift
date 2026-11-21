@@ -139,6 +139,10 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
 
     func rdpConnectionView(_ view: RDPConnectionView, didLog message: String) {
         guard noteCallback() else { return }
+        // F3: the follow decisions, to compare with the Windows probe log.
+        if message.hasPrefix("RDP input-source follow:") {
+            FileHandle.standardError.write(Data("\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime)) \(message)\n".utf8))
+        }
         lock.withLock {
             displayControlReady = updateDisplayControlReady(displayControlReady, forLogMessage: message)
         }

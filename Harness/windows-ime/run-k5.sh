@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # K5 Windows IME end-to-end test (Korean input design V4), driven from the Linux Docker host.
 #
-#   K5_BATCH=<roster batch> K5_PASSWORD_FILE=<file> Harness/windows-ime/run-k5.sh setup|run <name> <engine> <profile> <op> <script>|fetch <name>|logoff|teardown
+#   K5_BATCH=<roster batch> K5_PASSWORD_FILE=<file> Harness/windows-ime/run-k5.sh setup|run <name> <engine> <profile> <op> <script> [<op> <script>...]|fetch <name>|logoff|teardown
 #
 # The Windows server only accepts the Linux egress, so WinRM (python:3.12-alpine + pywinrm, NTLM
 # with message encryption) runs here and the Mac reaches 3389 through one reverse tunnel
@@ -9,7 +9,9 @@
 # setup: upload probe.ps1, register the AtLogOn interactive task K5ImeProbe, record the
 # Administrator language list; teardown: remove the task and C:\k5, restore the language list,
 # log off, stop the tunnel and the WinRM container. The Mac side is rdp-engine-harness built
-# from this tree in $K5_MAC_DIR.
+# from this tree in $K5_MAC_DIR. The F3 follow tokens (KeyScript follow/src) use RDPClientView's
+# internal test hook, so build it with `swift build -c release --product rdp-engine-harness
+# -Xswiftc -enable-testing`.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -39,7 +41,7 @@ if r.status_code != 0:
     sys.stderr.write(r.std_err.decode('utf-8', 'replace')[:4000])
 sys.exit(r.status_code)
 PY
-  docker run -d --label "roster.batch=${K5_BATCH}" --name "${CONTAINER}" -v "${WORK}:/k5" python:3.12-alpine sleep 14400 >/dev/null
+  docker run -d --label "roster.batch=${K5_BATCH}" -m 512m --name "${CONTAINER}" -v "${WORK}:/k5" python:3.12-alpine sleep 14400 >/dev/null
   docker exec "${CONTAINER}" pip install -q pywinrm >/dev/null 2>&1
 }
 
@@ -118,18 +120,22 @@ Get-WinUserLanguageList | ForEach-Object { "$($_.LanguageTag) | $($_.InputMethod
 PS
 }
 
-# run <name> <engine> <profile> <op> <script>: one RDP logon on the Mac, then fetch and log off.
+# run <name> <engine> <profile> <op> <script> [<op> <script>...]: one RDP logon on the Mac, the
+# key steps in order, then fetch and log off.
 run() {
-  local name="$1" engine="$2" profile="$3" op="$4" script="$5"
+  local name="$1" engine="$2" profile="$3" op="$4"
+  shift 3
   printf 'Set-Content -NoNewline -Path C:\\k5\\runid.txt -Value "%s"\n' "${name}" | ps
-  python3 - "${WORK}/results/${name}.scenario.json" "${name}" "${profile}" "${op}" "${script}" <<'PY'
+  python3 - "${WORK}/results/${name}.scenario.json" "${name}" "${profile}" "$@" <<'PY'
 import json, sys
-path, name, profile, op, script = sys.argv[1:]
+path, name, profile = sys.argv[1:4]
+pairs = sys.argv[4:]
+keys = [{"op": pairs[i], "text": pairs[i + 1], "seconds": 3} for i in range(0, len(pairs), 2)]
 json.dump({"name": name, "runs": [{
     "id": name, "host": "127.0.0.1", "port": 33389, "username": "Administrator", "passwordEnv": "K5_PASS",
     "keyboardProfile": profile,
     "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 40}, {"op": "waitFirstFrame", "timeout": 40},
-              {"op": "idle", "seconds": 40}, {"op": op, "text": script, "seconds": 3}, {"op": "shutdown"}],
+              {"op": "idle", "seconds": 40}] + keys + [{"op": "shutdown"}],
     "expect": {"connected": True, "firstFrame": True}}]}, open(path, "w"))
 PY
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/results/${name}.scenario.json" "${MAC}:${MAC_DIR}/scenarios/"
@@ -142,8 +148,9 @@ PY
   set -e
   rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${MAC_DIR}/results/${name}.json" "${WORK}/results/" 2>/dev/null || true
   rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${MAC_DIR}/work/${name}-1.session.log" "${WORK}/results/" 2>/dev/null || true
-  fetch "${name}"
+  # Log off first: the probe holds its key log open until its session ends.
   logoff >/dev/null
+  fetch "${name}"
   log "run ${name}: $(tail -1 "${WORK}/results/${name}.stdout.log" 2>/dev/null)"
 }
 
