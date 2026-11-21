@@ -63,7 +63,8 @@ final class RDPRemoteFileDownloadManager {
     /// Creates the list's items under the staging root and fills its files. Folder entries become
     /// directories and request no contents; `listIndex` stays each entry's position in `files`
     /// (INV-F2). Returns the top-level items. `shouldContinue` is checked before each range
-    /// request. On any error every item this call created is removed (INV-L3).
+    /// request, after its stream is registered (INV-G5). On any error every item this call
+    /// created is removed (INV-L3).
     func materialize(
         _ files: [RDPFileListEntry],
         chunkSize: UInt32 = 1024 * 1024,
@@ -82,13 +83,13 @@ final class RDPRemoteFileDownloadManager {
 
                 var offset: UInt64 = 0
                 while offset < file.byteCount {
-                    guard shouldContinue() else { throw CancellationError() }
                     let remaining = file.byteCount - offset
                     let requestLength = UInt32(min(UInt64(chunkSize), remaining))
                     let chunk = try requestChunk(
                         listIndex: UInt32(index),
                         offset: offset,
-                        length: requestLength
+                        length: requestLength,
+                        shouldContinue: shouldContinue
                     )
                     // A reply must be 1…requestLength bytes; anything else fails the whole list (INV-C1).
                     if chunk.isEmpty { throw ChunkError.truncated }
@@ -105,7 +106,12 @@ final class RDPRemoteFileDownloadManager {
         return tree.topLevelURLs
     }
 
-    private func requestChunk(listIndex: UInt32, offset: UInt64, length: UInt32) throws -> Data {
+    private func requestChunk(
+        listIndex: UInt32,
+        offset: UInt64,
+        length: UInt32,
+        shouldContinue: () -> Bool
+    ) throws -> Data {
         let streamId = allocateStreamId()
         defer {
             condition.lock()
@@ -113,6 +119,9 @@ final class RDPRemoteFileDownloadManager {
             condition.unlock()
         }
 
+        // Register, then check, then request (design D-G4): a cancel that comes with a newer list
+        // after this check fails the registered stream, so no reply to it reaches the file.
+        guard shouldContinue() else { throw CancellationError() }
         try requestRange(streamId, listIndex, offset, length)
         return try waitForResponse(streamId: streamId, timeout: 15)
     }
