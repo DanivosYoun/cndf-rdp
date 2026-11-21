@@ -204,10 +204,15 @@ enum Command {
     Redeliver,
 }
 
+/// Logs what a run has aggregated but not logged yet.
+type FlushLogs = Arc<dyn Fn() + Send + Sync>;
+
 struct Run {
     connection: Arc<Connection>,
     commands: SyncSender<Command>,
     threads: Vec<JoinHandle<()>>,
+    /// Called by destroy before it closes the callback gate.
+    flush_logs: FlushLogs,
 }
 
 #[derive(Default)]
@@ -326,7 +331,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=26\0"
+            " ironrdp=15b4a03ff552 patches=27\0"
         );
         version.as_ptr().cast()
     })
@@ -507,7 +512,9 @@ pub unsafe extern "C" fn cndf_iron_connect(
         });
         let (commands, incoming) = mpsc::sync_channel(128);
         let (start, ready) = mpsc::channel();
-        let Ok(threads) = start_workers(Arc::clone(&connection), options, incoming, ready) else {
+        let Ok((threads, flush_logs)) =
+            start_workers(Arc::clone(&connection), options, incoming, ready)
+        else {
             return CNDF_IRON_INTERNAL;
         };
         state.generation = generation;
@@ -515,6 +522,7 @@ pub unsafe extern "C" fn cndf_iron_connect(
             connection,
             commands,
             threads,
+            flush_logs,
         });
         out_generation.write(generation);
         let _ = start.send(());
@@ -686,6 +694,15 @@ pub unsafe extern "C" fn cndf_iron_session_destroy(
             return;
         };
         let deadline = Instant::now() + Duration::from_millis(join_timeout_ms.into());
+        // The gate drops every later callback, so log the run's pending repeat counts first.
+        // The state lock is released before calling back into the host.
+        let flush_logs = lock(&session_ref.state)
+            .run
+            .as_ref()
+            .map(|run| Arc::clone(&run.flush_logs));
+        if let Some(flush_logs) = flush_logs {
+            flush_logs();
+        }
         session_ref.callbacks.closed.store(true, Ordering::Release);
         cndf_iron_disconnect(session);
         // Swift resolves any outstanding certificate decision before calling destroy.
@@ -811,6 +828,7 @@ mod tests {
             connection,
             commands,
             threads: vec![thread],
+            flush_logs: Arc::new(|| {}),
         });
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(probe.failures.load(Ordering::Relaxed), 1);

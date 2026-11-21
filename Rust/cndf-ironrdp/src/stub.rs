@@ -13,7 +13,7 @@ pub(super) fn start_workers(
     options: Options,
     commands: Receiver<Command>,
     ready: Receiver<()>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
+) -> std::io::Result<(Vec<JoinHandle<()>>, FlushLogs)> {
     let (output, updates) = mpsc::sync_channel(128);
     let delivery = Arc::clone(&connection);
     let deliver = thread::Builder::new()
@@ -43,10 +43,14 @@ pub(super) fn start_workers(
             })
         });
     match session {
-        Ok(session) => Ok([Some(session), Some(deliver), clip]
-            .into_iter()
-            .flatten()
-            .collect()),
+        // The stub logs no aggregated events, so it has nothing to flush.
+        Ok(session) => Ok((
+            [Some(session), Some(deliver), clip]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Arc::new(|| {}),
+        )),
         Err(error) => {
             lock(&connection.clipboard).take();
             if let Some(clip) = clip {

@@ -35,6 +35,26 @@ pub(super) const LEGACY_TLS_UNAVAILABLE: Failure = Failure(
     "TLS protocol negotiation failed and legacy TLS is not available in this build",
 );
 
+/// A server message over a client channel's size limit ended an active session.
+pub(super) const CHANNEL_MESSAGE_LIMIT: Failure = Failure(
+    CNDF_IRON_FAILURE_ENGINE,
+    0x4952000E,
+    CNDF_IRON_STAGE_ACTIVE,
+    "서버가 보낸 채널 메시지가 크기 상한을 넘어 세션을 끝냈습니다",
+);
+
+/// The channel size limit that failed `error`, if one did.
+pub(super) fn channel_limit_cause<'a>(
+    mut error: &'a (dyn Error + 'static),
+) -> Option<&'a ironrdp_svc::MessageSizeLimitExceeded> {
+    loop {
+        if let Some(cause) = error.downcast_ref::<ironrdp_svc::MessageSizeLimitExceeded>() {
+            return Some(cause);
+        }
+        error = error.source()?;
+    }
+}
+
 pub(super) fn framebuffer_failure(error: DesktopFramebufferError, stage: CNDFIronStage) -> Failure {
     let (code, message) = match error {
         DesktopFramebufferError::Dimensions => (

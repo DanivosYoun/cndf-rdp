@@ -20,13 +20,18 @@ pub(super) fn start_workers(
     options: Options,
     commands: Receiver<Command>,
     ready: Receiver<()>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
+) -> std::io::Result<(Vec<JoinHandle<()>>, FlushLogs)> {
     let (output, updates) = async_channel::channel(128);
     let delivery = Arc::clone(&connection);
     let minimum = options.log_level;
+    let repeats = Arc::<Mutex<Repeats>>::default();
+    let flush_logs = log_flush(&connection, minimum, &repeats);
+    let delivery_repeats = Arc::clone(&repeats);
     let deliver_thread = thread::Builder::new()
         .name(format!("cndf-iron-{}-deliver", connection.generation))
-        .spawn(move || delivery.worker(|| deliver(&delivery, updates, minimum)))?;
+        .spawn(move || {
+            delivery.worker(|| deliver(&delivery, updates, minimum, &delivery_repeats))
+        })?;
     let (clip_jobs, clip) = if options.channels.clipboard {
         let (jobs, worker) = clipboard::ClipWork::spawn(Arc::clone(&connection))?;
         (Some(jobs), Some(worker))
@@ -38,7 +43,14 @@ pub(super) fn start_workers(
         .spawn(move || {
             if catch_worker(|| {
                 if ready.recv().is_ok() {
-                    run(&connection, options, commands, &output, clip_jobs.as_ref());
+                    run(
+                        &connection,
+                        options,
+                        commands,
+                        &output,
+                        clip_jobs.as_ref(),
+                        &repeats,
+                    );
                 }
             })
             .is_err()
@@ -50,10 +62,13 @@ pub(super) fn start_workers(
             }
         });
     match session_thread {
-        Ok(session_thread) => Ok([Some(session_thread), Some(deliver_thread), clip]
-            .into_iter()
-            .flatten()
-            .collect()),
+        Ok(session_thread) => Ok((
+            [Some(session_thread), Some(deliver_thread), clip]
+                .into_iter()
+                .flatten()
+                .collect(),
+            flush_logs,
+        )),
         Err(error) => {
             if let Some(clip) = clip {
                 let _ = clip.join();
@@ -210,6 +225,18 @@ impl Repeats {
     }
 }
 
+/// Logs a session's pending repeat counts when called. Called before each report that ends the
+/// session's callbacks, because the host drops the session's log lines after it.
+fn log_flush(
+    connection: &Arc<Connection>,
+    minimum: CNDFIronLogLevel,
+    repeats: &Arc<Mutex<Repeats>>,
+) -> FlushLogs {
+    let connection = Arc::clone(connection);
+    let repeats = Arc::clone(repeats);
+    Arc::new(move || Logs::flush(&connection, minimum, &repeats))
+}
+
 impl Logs {
     /// Logs the repeats the session has not logged yet.
     fn flush(connection: &Connection, minimum: CNDFIronLogLevel, repeats: &Mutex<Repeats>) {
@@ -279,6 +306,7 @@ fn run(
     commands: Receiver<Command>,
     output: &async_channel::Sender<Output>,
     clip_jobs: Option<&clipboard::ClipJobs>,
+    repeats: &Arc<Mutex<Repeats>>,
 ) {
     let rejected = Arc::new(AtomicBool::new(false));
     let trust_outcome = Arc::clone(&rejected);
@@ -385,12 +413,11 @@ fn run(
             LevelFilter::OFF
         }
     };
-    let repeats = Arc::<Mutex<Repeats>>::default();
     let subscriber = tracing_subscriber::registry().with(
         Logs {
             connection: Arc::clone(connection),
             minimum,
-            repeats: Arc::clone(&repeats),
+            repeats: Arc::clone(repeats),
         }
         .with_filter(filter),
     );
@@ -451,7 +478,7 @@ fn run(
             debug_assert!(retry.is_none());
         });
     });
-    Logs::flush(connection, minimum, &repeats);
+    Logs::flush(connection, minimum, repeats);
     connection.connected.store(false, Ordering::Release);
     *lock(&connection.input) = None;
     // DNS uses Tokio's blocking pool. Cancel the session without waiting for an
@@ -621,6 +648,7 @@ fn deliver(
     connection: &Connection,
     mut updates: async_channel::Receiver<Output>,
     minimum: CNDFIronLogLevel,
+    repeats: &Mutex<Repeats>,
 ) {
     let mut frame = Frame::default();
     let mut batch = Instant::now();
@@ -636,6 +664,7 @@ fn deliver(
                     Ok(bytes) => bytes,
                     Err(error) => {
                         connection.stop.store(true, Ordering::Release);
+                        Logs::flush(connection, minimum, repeats);
                         report_active_framebuffer_failure(connection, error);
                         return;
                     }
@@ -647,11 +676,13 @@ fn deliver(
             other => match other {
                 Output::Failure(failure) => {
                     frame.publish(connection, false);
+                    Logs::flush(connection, minimum, repeats);
                     report_failure(connection, failure);
                 }
                 Output::Rdp(event) => {
                     if matches!(event, RdpOutputEvent::Terminated(_)) {
                         frame.publish(connection, false);
+                        Logs::flush(connection, minimum, repeats);
                     }
                     deliver_event(connection, event, minimum);
                 }
@@ -687,7 +718,13 @@ fn report_active_framebuffer_failure(
     connection: &Connection,
     error: ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError,
 ) {
-    let failure = errors::framebuffer_failure(error, CNDFIronStage::CNDF_IRON_STAGE_ACTIVE);
+    report_active_failure(
+        connection,
+        errors::framebuffer_failure(error, CNDFIronStage::CNDF_IRON_STAGE_ACTIVE),
+    );
+}
+
+fn report_active_failure(connection: &Connection, failure: Failure) {
     let code = failure.1;
     report_failure(connection, failure);
     report_disconnect(
@@ -729,6 +766,20 @@ fn deliver_event(connection: &Connection, event: RdpOutputEvent, minimum: CNDFIr
                 );
                 if let Some(error) = errors::framebuffer_cause(error) {
                     report_active_framebuffer_failure(connection, error);
+                    return;
+                }
+                if let Some(cause) = errors::channel_limit_cause(error) {
+                    // The channel name is the client's own and the limit a constant.
+                    log(
+                        connection,
+                        minimum,
+                        CNDFIronLogLevel::CNDF_IRON_LOG_ERROR,
+                        &format!(
+                            "IronRDP channel message limit exceeded: channel={} limit={}",
+                            cause.channel, cause.limit
+                        ),
+                    );
+                    report_active_failure(connection, errors::CHANNEL_MESSAGE_LIMIT);
                     return;
                 }
             }
@@ -1028,5 +1079,255 @@ mod tests {
         );
         assert_eq!(lines(repeats.record(extra, WARN, later)), []);
         assert_eq!(repeats.drain().last(), Some((WARN, Line::Repeated("other", 1))));
+    }
+
+    /// What the host saw, dropping a generation's log lines after its failure or disconnect,
+    /// as the Swift session does.
+    #[derive(Default)]
+    struct Host {
+        logs: Vec<String>,
+        failures: Vec<(CNDFIronFailureKind, u32, CNDFIronStage, String)>,
+        disconnects: Vec<(CNDFIronDisconnectKind, u32)>,
+        ended: bool,
+    }
+
+    extern "C" fn host_log(
+        _: u64,
+        _: CNDFIronLogLevel,
+        bytes: *const u8,
+        len: usize,
+        context: *mut c_void,
+    ) {
+        let host = unsafe { &mut *context.cast::<Host>() };
+        if !host.ended {
+            let message = unsafe { std::slice::from_raw_parts(bytes, len) };
+            host.logs.push(String::from_utf8_lossy(message).into_owned());
+        }
+    }
+
+    extern "C" fn host_failure(
+        _: u64,
+        kind: CNDFIronFailureKind,
+        code: u32,
+        stage: CNDFIronStage,
+        bytes: *const u8,
+        len: usize,
+        context: *mut c_void,
+    ) {
+        let host = unsafe { &mut *context.cast::<Host>() };
+        let message = unsafe { std::slice::from_raw_parts(bytes, len) };
+        host.failures
+            .push((kind, code, stage, String::from_utf8_lossy(message).into_owned()));
+        host.ended = true;
+    }
+
+    extern "C" fn host_disconnect(
+        _: u64,
+        kind: CNDFIronDisconnectKind,
+        code: u32,
+        context: *mut c_void,
+    ) {
+        let host = unsafe { &mut *context.cast::<Host>() };
+        host.disconnects.push((kind, code));
+        host.ended = true;
+    }
+
+    fn host_table(host: &mut Host) -> CNDFIronCallbacks {
+        CNDFIronCallbacks {
+            log: Some(host_log),
+            certificate_trust: None,
+            connected: None,
+            failure: Some(host_failure),
+            disconnect: Some(host_disconnect),
+            frame: None,
+            pointer: None,
+            remote_text: None,
+            remote_file_list: None,
+            remote_file_contents: None,
+            context: (host as *mut Host).cast(),
+        }
+    }
+
+    fn host_connection(callbacks: Arc<Callbacks>) -> Arc<Connection> {
+        Arc::new(Connection {
+            generation: 1,
+            connected: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            input: Mutex::default(),
+            clipboard: Mutex::default(),
+            log_level: CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+            callbacks,
+            statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
+        })
+    }
+
+    fn host_callbacks(host: &mut Host) -> Arc<Callbacks> {
+        Arc::new(Callbacks {
+            table: host_table(host),
+            gate: Mutex::default(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    #[derive(Debug)]
+    struct LimitedChannel;
+
+    ironrdp_core::impl_as_any!(LimitedChannel);
+
+    impl ironrdp_svc::SvcProcessor for LimitedChannel {
+        fn channel_name(&self) -> ironrdp_pdu::gcc::ChannelName {
+            ironrdp_pdu::gcc::ChannelName::from_static(b"rdpsnd\0\0")
+        }
+
+        fn max_message_size(&self) -> Option<usize> {
+            Some(8)
+        }
+
+        fn process(&mut self, _: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    // Finding oversized-channel-unclassified-disconnect: the session ended with only a decode
+    // error and disconnect(ERROR, 0), so the host showed no failure.
+    #[test]
+    fn channel_limit_termination_reports_a_classified_failure() {
+        let mut host = Host::default();
+        let connection = host_connection(host_callbacks(&mut host));
+        // A real channel error: one 4660-byte FIRST fragment on a channel limited to 8 bytes.
+        let mut channel = ironrdp_svc::StaticVirtualChannel::new(LimitedChannel);
+        let mut chunk = 4660u32.to_le_bytes().to_vec();
+        chunk.extend_from_slice(&1u32.to_le_bytes());
+        chunk.extend_from_slice(&[0; 16]);
+        let error = channel.process(&chunk).unwrap_err();
+
+        deliver_event(
+            &connection,
+            RdpOutputEvent::Terminated(Err(SessionError::pdu(error))),
+            CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+        );
+
+        assert_eq!(
+            host.failures,
+            [(
+                CNDFIronFailureKind::CNDF_IRON_FAILURE_ENGINE,
+                0x4952000E,
+                CNDFIronStage::CNDF_IRON_STAGE_ACTIVE,
+                errors::CHANNEL_MESSAGE_LIMIT.3.to_owned(),
+            )]
+        );
+        assert_eq!(
+            host.disconnects,
+            [(CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_ERROR, 0x4952000E)]
+        );
+        assert!(
+            host.logs
+                .iter()
+                .any(|line| line == "IronRDP channel message limit exceeded: channel=rdpsnd limit=8"),
+            "{:?}",
+            host.logs
+        );
+        // The declared length is server data and stays out of every line.
+        assert!(host.logs.iter().all(|line| !line.contains("4660")));
+        assert!(!errors::CHANNEL_MESSAGE_LIMIT.3.contains('\u{2014}'));
+    }
+
+    // An error without a channel limit cause keeps the unclassified disconnect.
+    #[test]
+    fn other_terminations_report_no_channel_limit_failure() {
+        let mut host = Host::default();
+        let connection = host_connection(host_callbacks(&mut host));
+        let error = ironrdp_pdu::PduError::new(
+            "graphics update",
+            ironrdp_pdu::PduErrorKind::Other {
+                description: "unknown surface",
+            },
+        );
+        deliver_event(
+            &connection,
+            RdpOutputEvent::Terminated(Err(SessionError::pdu(error))),
+            CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+        );
+        assert!(host.failures.is_empty());
+        assert_eq!(
+            host.disconnects,
+            [(CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_ERROR, 0)]
+        );
+    }
+
+    /// Records the same event three times in one window, so one summary of two is pending.
+    fn pending_repeats() -> Arc<Mutex<Repeats>> {
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            let _ = lock(&repeats).record("fast_path", CNDFIronLogLevel::CNDF_IRON_LOG_WARN, now);
+        }
+        repeats
+    }
+
+    // Finding log-repeat-flush-dropped-on-teardown, server and error end: the host ends the
+    // generation at the disconnect, so a summary logged after it was lost.
+    #[test]
+    fn server_end_logs_pending_repeats_before_the_disconnect() {
+        let mut host = Host::default();
+        let connection = host_connection(host_callbacks(&mut host));
+        let repeats = pending_repeats();
+        let (output, updates) = async_channel::channel(4);
+        output
+            .try_send(Output::Rdp(RdpOutputEvent::Terminated(Ok(
+                ironrdp_session::GracefulDisconnectReason::ServerInitiated,
+            ))))
+            .unwrap();
+        drop(output);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+
+        assert_eq!(host.logs, ["fast_path repeated count=2"]);
+        assert_eq!(
+            host.disconnects,
+            [(CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER, 0)]
+        );
+        // The session thread's own flush at the end finds nothing left to log.
+        Logs::flush(&connection, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+        assert_eq!(host.logs.len(), 1);
+    }
+
+    #[test]
+    fn failure_end_logs_pending_repeats_before_the_failure() {
+        let mut host = Host::default();
+        let connection = host_connection(host_callbacks(&mut host));
+        let repeats = pending_repeats();
+        let (output, updates) = async_channel::channel(4);
+        output.try_send(Output::Failure(errors::PANIC)).unwrap();
+        drop(output);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+
+        assert_eq!(host.logs, ["fast_path repeated count=2"]);
+        assert_eq!(host.failures.len(), 1);
+    }
+
+    // Finding log-repeat-flush-dropped-on-teardown, local end: destroy closed the callback gate
+    // before the session thread flushed, so the summary was dropped.
+    #[test]
+    fn destroy_logs_pending_repeats_before_closing_the_gate() {
+        let mut host = Host::default();
+        let table = host_table(&mut host);
+        let session = unsafe { cndf_iron_session_create(&table) };
+        let owner = unsafe { &*session };
+        let connection = host_connection(Arc::clone(&owner.callbacks));
+        let repeats = pending_repeats();
+        let (commands, _) = mpsc::sync_channel(1);
+        lock(&owner.state).run = Some(Run {
+            flush_logs: log_flush(&connection, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats),
+            connection: Arc::clone(&connection),
+            commands,
+            threads: Vec::new(),
+        });
+
+        unsafe { cndf_iron_session_destroy(session, 1000) };
+
+        assert_eq!(host.logs, ["fast_path repeated count=2"]);
+        // After destroy the gate is closed and nothing more reaches the host.
+        Logs::flush(&connection, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &pending_repeats());
+        assert_eq!(host.logs.len(), 1);
     }
 }

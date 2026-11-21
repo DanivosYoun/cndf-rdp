@@ -1,0 +1,413 @@
+diff --git a/crates/ironrdp-dvc/src/client.rs b/crates/ironrdp-dvc/src/client.rs
+index 48efee4..f359747 100644
+--- a/crates/ironrdp-dvc/src/client.rs
++++ b/crates/ironrdp-dvc/src/client.rs
+@@ -130,7 +130,10 @@ impl DynamicVirtualChannel {
+ 
+     fn process(&mut self, pdu: DrdynvcDataPdu) -> PduResult<Vec<DvcMessage>> {
+         let channel_id = pdu.channel_id();
+-        let complete_data = self.complete_data.process_data(pdu).map_err(|e| decode_err!(e))?;
++        let complete_data = self
++            .complete_data
++            .process_data(self.channel_processor.channel_name(), pdu)
++            .map_err(|e| decode_err!(e))?;
+         if let Some(complete_data) = complete_data {
+             self.channel_processor.process(channel_id, &complete_data)
+         } else {
+diff --git a/crates/ironrdp-dvc/src/complete_data.rs b/crates/ironrdp-dvc/src/complete_data.rs
+index 9b16ca1..3fd87cb 100644
+--- a/crates/ironrdp-dvc/src/complete_data.rs
++++ b/crates/ironrdp-dvc/src/complete_data.rs
+@@ -2,7 +2,8 @@ use alloc::vec::Vec;
+ use core::cmp;
+ 
+ use ironrdp_bulk::rdp8::Rdp8Decompressor;
+-use ironrdp_core::{DecodeResult, cast_length, invalid_field_err, other_err};
++use ironrdp_core::{DecodeError, DecodeResult, cast_length, invalid_field_err, other_err};
++use ironrdp_svc::MessageSizeLimitExceeded;
+ use tracing::error;
+ 
+ use crate::pdu::DrdynvcDataPdu;
+@@ -31,24 +32,32 @@ impl CompleteData {
+         }
+     }
+ 
+-    pub(crate) fn process_data(&mut self, pdu: DrdynvcDataPdu) -> DecodeResult<Option<Vec<u8>>> {
++    /// `channel` names the channel in the error returned for a message over the size limit.
++    pub(crate) fn process_data(&mut self, channel: &str, pdu: DrdynvcDataPdu) -> DecodeResult<Option<Vec<u8>>> {
+         match pdu {
+             DrdynvcDataPdu::DataFirst(data_first) => {
+                 let total_size = data_first.length();
+-                self.process_data_first(total_size, data_first.into_data())
++                self.process_data_first(channel, total_size, data_first.into_data())
+             }
+-            DrdynvcDataPdu::Data(data) => self.process_data_block(data.into_data()),
++            DrdynvcDataPdu::Data(data) => self.process_data_block(channel, data.into_data()),
+             DrdynvcDataPdu::DataFirstCompressed(data_first) => {
+                 let data = self.decompress(data_first.data())?;
+-                self.process_data_first(data_first.length(), data)
++                self.process_data_first(channel, data_first.length(), data)
+             }
+             DrdynvcDataPdu::DataCompressed(data) => {
+                 let data = self.decompress(data.data())?;
+-                self.process_data_block(data)
++                self.process_data_block(channel, data)
+             }
+         }
+     }
+ 
++    fn limit_exceeded(&self, channel: &str) -> MessageSizeLimitExceeded {
++        MessageSizeLimitExceeded {
++            channel: channel.into(),
++            limit: self.max_message_size.unwrap_or_default(),
++        }
++    }
++
+     fn decompress(&mut self, compressed: &[u8]) -> DecodeResult<Vec<u8>> {
+         if self.decompression_failed {
+             return Err(invalid_field_err!(
+@@ -67,7 +76,7 @@ impl CompleteData {
+         Ok(data)
+     }
+ 
+-    fn process_data_first(&mut self, total_size: u32, data: Vec<u8>) -> DecodeResult<Option<Vec<u8>>> {
++    fn process_data_first(&mut self, channel: &str, total_size: u32, data: Vec<u8>) -> DecodeResult<Option<Vec<u8>>> {
+         let total_data_size: DecodeResult<_> = cast_length!("DataFirstPdu::length", total_size);
+         let total_data_size = total_data_size?;
+         if self.total_size.is_some() {
+@@ -79,10 +88,8 @@ impl CompleteData {
+             .max_message_size
+             .is_some_and(|max_message_size| total_data_size > max_message_size)
+         {
+-            return Err(invalid_field_err!(
+-                "DataFirstPdu::length",
+-                "DVC message exceeds configured maximum size"
+-            ));
++            let error: DecodeError = invalid_field_err!("DataFirstPdu::length", "DVC message exceeds configured maximum size");
++            return Err(error.with_source(self.limit_exceeded(channel)));
+         }
+ 
+         if data.len() > total_data_size {
+@@ -101,17 +108,15 @@ impl CompleteData {
+         Ok(None)
+     }
+ 
+-    fn process_data_block(&mut self, mut data: Vec<u8>) -> DecodeResult<Option<Vec<u8>>> {
++    fn process_data_block(&mut self, channel: &str, mut data: Vec<u8>) -> DecodeResult<Option<Vec<u8>>> {
+         let Some(total_size) = self.total_size else {
+             // message is not fragmented
+             if self
+                 .max_message_size
+                 .is_some_and(|max_message_size| data.len() > max_message_size)
+             {
+-                return Err(invalid_field_err!(
+-                    "DataPdu::data",
+-                    "DVC message exceeds configured maximum size"
+-                ));
++                let error: DecodeError = invalid_field_err!("DataPdu::data", "DVC message exceeds configured maximum size");
++                return Err(error.with_source(self.limit_exceeded(channel)));
+             }
+             return Ok(Some(data));
+         };
+diff --git a/crates/ironrdp-dvc/src/server.rs b/crates/ironrdp-dvc/src/server.rs
+index 294a956..bb3de0b 100644
+--- a/crates/ironrdp-dvc/src/server.rs
++++ b/crates/ironrdp-dvc/src/server.rs
+@@ -492,7 +492,11 @@ impl DrdynvcServer {
+             }
+         }
+         let mut resp = Vec::new();
+-        if let Some(complete) = c.complete_data.process_data(data).map_err(|e| decode_err!(e))? {
++        if let Some(complete) = c
++            .complete_data
++            .process_data(c.processor.channel_name(), data)
++            .map_err(|e| decode_err!(e))?
++        {
+             if max_message_size.is_some_and(|max_message_size| max_message_size < complete.len()) {
+                 return Ok(self.close_for_message_limit(channel_id, complete.len()));
+             }
+diff --git a/crates/ironrdp-dvc/tests/limit_cause.rs b/crates/ironrdp-dvc/tests/limit_cause.rs
+new file mode 100644
+index 0000000..788e874
+--- /dev/null
++++ b/crates/ironrdp-dvc/tests/limit_cause.rs
+@@ -0,0 +1,89 @@
++//! A dynamic channel message over its size limit fails with a cause that names the channel and the limit.
++
++use core::error::Error;
++
++use ironrdp_bulk as _;
++use ironrdp_core::encode_vec;
++use ironrdp_dvc::pdu::{CreateRequestPdu, DataFirstPdu, DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
++use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DvcMessage, DvcProcessor};
++use ironrdp_pdu::PduResult;
++use ironrdp_svc::{MessageSizeLimitExceeded, SvcProcessor as _};
++use tracing as _;
++
++const NAME: &str = "test::limited";
++const LIMIT: usize = 64;
++
++struct Limited;
++
++ironrdp_core::impl_as_any!(Limited);
++
++impl DvcProcessor for Limited {
++    fn channel_name(&self) -> &str {
++        NAME
++    }
++
++    fn max_message_size(&self) -> Option<usize> {
++        Some(LIMIT)
++    }
++
++    fn start(&mut self, _: u32) -> PduResult<Vec<DvcMessage>> {
++        Ok(Vec::new())
++    }
++
++    fn process(&mut self, _: u32, _: &[u8]) -> PduResult<Vec<DvcMessage>> {
++        Ok(Vec::new())
++    }
++}
++
++impl DvcClientProcessor for Limited {}
++
++fn opened() -> DrdynvcClient {
++    let mut client = DrdynvcClient::new().with_dynamic_channel_factory(NAME, || Limited);
++    let create = encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(1, NAME.to_owned()))).unwrap();
++    client.process(&create).unwrap();
++    client
++}
++
++fn send(client: &mut DrdynvcClient, pdu: DrdynvcDataPdu) -> PduResult<()> {
++    let bytes = encode_vec(&DrdynvcServerPdu::Data(pdu)).unwrap();
++    client.process(&bytes).map(drop)
++}
++
++fn limit_cause(mut error: &(dyn Error + 'static)) -> Option<MessageSizeLimitExceeded> {
++    loop {
++        if let Some(cause) = error.downcast_ref::<MessageSizeLimitExceeded>() {
++            return Some(cause.clone());
++        }
++        error = error.source()?;
++    }
++}
++
++fn expected() -> Option<MessageSizeLimitExceeded> {
++    Some(MessageSizeLimitExceeded {
++        channel: NAME.to_owned(),
++        limit: LIMIT,
++    })
++}
++
++// oracle: mutant dropping the cause at either limit check.
++#[test]
++fn each_limit_check_names_the_channel_and_the_limit() {
++    let mut client = opened();
++    let over = DataFirstPdu::new(1, u32::try_from(LIMIT + 1).unwrap(), vec![0; 8]);
++    let error = send(&mut client, DrdynvcDataPdu::DataFirst(over)).unwrap_err();
++    assert_eq!(limit_cause(&error), expected());
++
++    let mut client = opened();
++    let error = send(&mut client, DrdynvcDataPdu::Data(DataPdu::new(1, vec![0; LIMIT + 1]))).unwrap_err();
++    assert_eq!(limit_cause(&error), expected());
++}
++
++// oracle: mutant attaching the cause to errors that are not about the size limit.
++#[test]
++fn other_reassembly_errors_carry_no_limit_cause() {
++    let mut client = opened();
++    let first = DataFirstPdu::new(1, 16, vec![0; 8]);
++    send(&mut client, DrdynvcDataPdu::DataFirst(first)).unwrap();
++    let error = send(&mut client, DrdynvcDataPdu::Data(DataPdu::new(1, vec![0; 9]))).unwrap_err();
++    assert_eq!(limit_cause(&error), None);
++}
+diff --git a/crates/ironrdp-svc/src/lib.rs b/crates/ironrdp-svc/src/lib.rs
+index ec222ab..964e8f2 100644
+--- a/crates/ironrdp-svc/src/lib.rs
++++ b/crates/ironrdp-svc/src/lib.rs
+@@ -46,6 +46,26 @@ pub const DEFAULT_CLIENT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+ /// The leading bytes of a discarded oversized message handed to [`SvcProcessor::process_oversized`].
+ pub const OVERSIZED_MESSAGE_PREFIX_LENGTH: usize = 64;
+ 
++/// The cause attached to the error a client channel returns when a message exceeds its size limit.
++///
++/// Carries only the client's own channel name and the configured limit, never server data, so a
++/// session can report which channel limit ended it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MessageSizeLimitExceeded {
++    /// The channel whose limit was exceeded.
++    pub channel: String,
++    /// The limit in bytes.
++    pub limit: usize,
++}
++
++impl fmt::Display for MessageSizeLimitExceeded {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "{} channel message exceeds the {}-byte limit", self.channel, self.limit)
++    }
++}
++
++impl core::error::Error for MessageSizeLimitExceeded {}
++
+ /// What a static channel does with a message over its [`SvcProcessor::max_message_size`].
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum OversizedMessagePolicy {
+@@ -195,9 +215,10 @@ impl StaticVirtualChannel {
+     /// to the server. If no PDUs are to be sent, an empty vector is returned.
+     pub fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+         let context = self.channel_processor.message_context();
++        let channel = self.channel_processor.channel_name();
+         match self
+             .chunk_processor
+-            .dechunkify(context, payload)
++            .dechunkify(&channel, context, payload)
+             .map_err(|e| decode_err!(e))?
+         {
+             Some(Dechunked::Complete(context, payload)) => {
+@@ -481,7 +502,12 @@ impl ChunkProcessor {
+     /// Returns `None` until complete, or when discarding an invalidated context.
+     ///
+     /// [3.1.5.2.2.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a542bf19-1c86-4c80-ab3e-61449653abf6
+-    fn dechunkify(&mut self, context: Option<u64>, payload: &[u8]) -> DecodeResult<Option<Dechunked>> {
++    fn dechunkify(
++        &mut self,
++        channel: &ChannelName,
++        context: Option<u64>,
++        payload: &[u8],
++    ) -> DecodeResult<Option<Dechunked>> {
+         let mut cursor = ReadCursor::new(payload);
+         let header: ironrdp_pdu::rdp::vc::ChannelPduHeader = decode_cursor(&mut cursor)?;
+         let chunk = cursor.remaining();
+@@ -495,11 +521,12 @@ impl ChunkProcessor {
+         let discards = declared_over_limit && self.discard_oversized && (first || self.oversized);
+         if self.max_message_size.is_some_and(|limit| limit < chunk.len()) || (declared_over_limit && !discards) {
+             self.clear_sequence();
+-            return Err(ironrdp_core::invalid_field_err!(
++            let error: ironrdp_core::DecodeError = ironrdp_core::invalid_field_err!(
+                 "length",
+                 "static channel message exceeds configured maximum size",
+                 in: cursor
+-            ));
++            );
++            return Err(error.with_source(self.limit_exceeded(channel)));
+         }
+ 
+         if !first && !last && self.expected_length.is_none() {
+@@ -549,11 +576,12 @@ impl ChunkProcessor {
+         };
+         if !self.oversized && self.max_message_size.is_some_and(|limit| limit < received_length) {
+             self.clear_sequence();
+-            return Err(ironrdp_core::invalid_field_err!(
++            let error: ironrdp_core::DecodeError = ironrdp_core::invalid_field_err!(
+                 "length",
+                 "static channel message exceeds configured maximum size",
+                 in: cursor
+-            ));
++            );
++            return Err(error.with_source(self.limit_exceeded(channel)));
+         }
+         if expected_length < received_length {
+             self.clear_sequence();
+@@ -614,6 +642,13 @@ impl ChunkProcessor {
+         }))
+     }
+ 
++    fn limit_exceeded(&self, channel: &ChannelName) -> MessageSizeLimitExceeded {
++        MessageSizeLimitExceeded {
++            channel: channel.as_str().unwrap_or_default().to_owned(),
++            limit: self.max_message_size.unwrap_or_default(),
++        }
++    }
++
+     fn discard_partial_message(&mut self) {
+         // UNTESTED: Release capacity when discarding a sequence so it cannot pin reassembly memory.
+         // Check retained allocation, not just buffer length, when changing this reset.
+diff --git a/crates/ironrdp-svc/tests/limit_cause.rs b/crates/ironrdp-svc/tests/limit_cause.rs
+new file mode 100644
+index 0000000..70c4f9b
+--- /dev/null
++++ b/crates/ironrdp-svc/tests/limit_cause.rs
+@@ -0,0 +1,83 @@
++//! A static channel message over its size limit fails with a cause that names the channel and the limit.
++
++use core::error::Error;
++
++use bitflags as _;
++use ironrdp_pdu::PduResult;
++use ironrdp_pdu::gcc::ChannelName;
++use ironrdp_svc::{MessageSizeLimitExceeded, StaticVirtualChannel, SvcMessage, SvcProcessor};
++
++const FIRST: u32 = 1;
++const LAST: u32 = 2;
++const LIMIT: usize = 8;
++
++#[derive(Debug)]
++struct Limited;
++
++ironrdp_core::impl_as_any!(Limited);
++
++impl SvcProcessor for Limited {
++    fn channel_name(&self) -> ChannelName {
++        ChannelName::from_static(b"testcap\0")
++    }
++
++    fn max_message_size(&self) -> Option<usize> {
++        Some(LIMIT)
++    }
++
++    fn process(&mut self, _: &[u8]) -> PduResult<Vec<SvcMessage>> {
++        Ok(Vec::new())
++    }
++}
++
++fn frame(length: usize, flags: u32, data: &[u8]) -> Vec<u8> {
++    let mut bytes = u32::try_from(length).unwrap().to_le_bytes().to_vec();
++    bytes.extend_from_slice(&flags.to_le_bytes());
++    bytes.extend_from_slice(data);
++    bytes
++}
++
++fn limit_cause(mut error: &(dyn Error + 'static)) -> Option<MessageSizeLimitExceeded> {
++    loop {
++        if let Some(cause) = error.downcast_ref::<MessageSizeLimitExceeded>() {
++            return Some(cause.clone());
++        }
++        error = error.source()?;
++    }
++}
++
++fn expected() -> Option<MessageSizeLimitExceeded> {
++    Some(MessageSizeLimitExceeded {
++        channel: "testcap".to_owned(),
++        limit: LIMIT,
++    })
++}
++
++// oracle: mutant dropping the cause at any of the limit checks.
++#[test]
++fn each_limit_check_names_the_channel_and_the_limit() {
++    // One unfragmented chunk over the limit.
++    let mut channel = StaticVirtualChannel::new(Limited);
++    let error = channel.process(&frame(LIMIT + 1, FIRST | LAST, &[0; LIMIT + 1])).unwrap_err();
++    assert_eq!(limit_cause(&error), expected());
++
++    // A first fragment that declares more than the limit.
++    let mut channel = StaticVirtualChannel::new(Limited);
++    let error = channel.process(&frame(LIMIT + 1, FIRST, &[0; 4])).unwrap_err();
++    assert_eq!(limit_cause(&error), expected());
++
++    // Fragments whose bytes pass the limit before the declared length catches them.
++    let mut channel = StaticVirtualChannel::new(Limited);
++    assert!(channel.process(&frame(LIMIT, FIRST, &[0; 4])).unwrap().is_empty());
++    let error = channel.process(&frame(LIMIT, 0, &[0; 6])).unwrap_err();
++    assert_eq!(limit_cause(&error), expected());
++}
++
++// oracle: mutant attaching the cause to errors that are not about the size limit.
++#[test]
++fn other_reassembly_errors_carry_no_limit_cause() {
++    let mut channel = StaticVirtualChannel::new(Limited);
++    assert!(channel.process(&frame(LIMIT, FIRST, &[0; 4])).unwrap().is_empty());
++    let error = channel.process(&frame(LIMIT - 1, LAST, &[0; 3])).unwrap_err();
++    assert_eq!(limit_cause(&error), None);
++}
