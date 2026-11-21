@@ -5,6 +5,8 @@ import XCTest
 /// fixture 와 함께 cc 로 컴파일해 돌린다(`ClipboardMonitorReadyTests` 와 같은 방식).
 /// C-1 디렉터리 서술자, C-2~C-5 요청·응답 계수(INV-P1), C-6 FileContents FAIL 전달(INV-P2),
 /// H 2 GiB 이상 서술자 직렬화, L 로컬 파일 요청 실패 응답.
+/// 설계 download-lifecycle D-G3: C-G1~C-G5 원격 복사 세대·RANGE 관문·기다리는 스트림 표(INV-G1~G4).
+/// 잠금 흉내는 FreeRDP 호출·Swift 콜백이 잠금 밖에서 불리는지도 단언한다.
 final class ClipboardResponsePairingTests: XCTestCase {
     func testC1DirectoryMarkerBecomesDirectoryDescriptor() throws { try run("c1") }
     func testC2ResponseToRequestBeforeNewestFormatListIsDropped() throws { try run("c2") }
@@ -12,7 +14,14 @@ final class ClipboardResponsePairingTests: XCTestCase {
     func testC3FailedReplyIsCountedSoTheNextTextIsDelivered() throws { try run("c3") }
     func testC4ClassificationIgnoresLastRequestedFormatId() throws { try run("c4") }
     func testC5UnsolicitedReplyIsDroppedAndMonitorReadyResetsCounts() throws { try run("c5") }
-    func testC6FileContentsFailIsForwardedAsNullPayload() throws { try run("c6") }
+    func testC6WaitingStreamFailIsForwardedAsNullPayload() throws { try run("c6") }
+    func testCG1FormatListFailsWaitingRangeAndDropsItsLateReply() throws { try run("cg1") }
+    func testCG2ConsecutiveFormatListsStillAcceptRangesForTheDeliveredList() throws { try run("cg2") }
+    func testCG3MonitorReadyRefusesRangesForTheDeliveredList() throws { try run("cg3") }
+    func testCG4FailedDescriptorAfterNewFormatListRefusesOldRanges() throws { try run("cg4") }
+    func testCG5RangeBeforeTheNewDescriptorArrivesIsRefused() throws { try run("cg5") }
+    func testCGRangeInsideFileListCallbackIsAccepted() throws { try run("cgcb") }
+    func testCGWaitingTableIsBoundedAndSendFailureLeavesNoEntry() throws { try run("cgtable") }
     func testHugeFileDescriptorIsSerializedWhenServerAdvertisesHugeSupport() throws { try run("huge") }
     func testDescriptorSerializationFailureAnswersFail() throws { try run("hugefail") }
     func testLocalFileRequestFailuresAnswerFail() throws { try run("local") }
@@ -22,8 +31,8 @@ final class ClipboardResponsePairingTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("Sources/FreeRDPBridge/FreeRDPBridge.c"), encoding: .utf8)
 
-        func function(_ name: String) throws -> String {
-            let start = try XCTUnwrap(source.range(of: "static UINT \(name)("))
+        func function(_ name: String, prefix: String = "static UINT") throws -> String {
+            let start = try XCTUnwrap(source.range(of: "\(prefix) \(name)("))
             let end = try XCTUnwrap(source.range(of: "\n}", range: start.upperBound..<source.endIndex))
             return String(source[start.lowerBound..<end.upperBound])
         }
@@ -36,6 +45,9 @@ final class ClipboardResponsePairingTests: XCTestCase {
         #include <stdlib.h>
         #include <string.h>
         #include <sys/types.h>
+        #define RDP_FREERDP_REAL 1
+        #define RDP_BRIDGE_CLIP_RANGES 8
+        #define CB_FILECONTENTS_REQUEST 8
         #define CHANNEL_RC_OK 0
         #define CHANNEL_RC_NO_MEMORY 14
         #define ERROR_FILE_TOO_LARGE 223
@@ -93,7 +105,19 @@ final class ClipboardResponsePairingTests: XCTestCase {
             UINT (*ClientFormatDataRequest)(CliprdrClientContext *, const CLIPRDR_FORMAT_DATA_REQUEST *);
             UINT (*ClientFormatDataResponse)(CliprdrClientContext *, const CLIPRDR_FORMAT_DATA_RESPONSE *);
             UINT (*ClientFileContentsResponse)(CliprdrClientContext *, const CLIPRDR_FILE_CONTENTS_RESPONSE *);
+            UINT (*ClientFileContentsRequest)(CliprdrClientContext *, const CLIPRDR_FILE_CONTENTS_REQUEST *);
         };
+        typedef enum {
+            RDPBridgeStatusOK = 0,
+            RDPBridgeStatusInvalidArgument = 1,
+            RDPBridgeStatusNotConnected = 2,
+            RDPBridgeStatusBackendUnavailable = 3,
+            RDPBridgeStatusInternalError = 4
+        } RDPBridgeStatus;
+        // WinPR CRITICAL_SECTION 대역: 재진입·짝 어긋남을 잡는다.
+        typedef struct { int depth; } CRITICAL_SECTION;
+        static void EnterCriticalSection(CRITICAL_SECTION *lock) { assert(lock->depth == 0); lock->depth++; }
+        static void LeaveCriticalSection(CRITICAL_SECTION *lock) { assert(lock->depth == 1); lock->depth--; }
         typedef struct { const char *path; const char *fileName; uint64_t size; } RDPBridgeLocalFile;
         typedef struct {
             void (*remoteText)(const uint8_t *, size_t, void *);
@@ -103,6 +127,7 @@ final class ClipboardResponsePairingTests: XCTestCase {
         } RDPBridgeCallbacks;
         typedef struct {
             RDPBridgeCallbacks callbacks;
+            bool connected;
             CliprdrClientContext *cliprdr;
             char *local_text;
             size_t local_text_length;
@@ -112,6 +137,11 @@ final class ClipboardResponsePairingTests: XCTestCase {
             uint32_t clip_requests_stale;
             UINT32 clip_request_format;
             UINT32 server_clip_flags;
+            uint64_t clip_copy;
+            uint64_t clip_ranges_copy;
+            uint32_t clip_ranges[RDP_BRIDGE_CLIP_RANGES];
+            size_t clip_range_count;
+            CRITICAL_SECTION clip_range_lock;
         } RDPBridgeSession;
         #define bridge_log(...) ((void)0)
         #define bridge_logf(...) ((void)0)
@@ -144,6 +174,8 @@ final class ClipboardResponsePairingTests: XCTestCase {
             return CHANNEL_RC_OK;
         }
 
+        \#(try function("bridge_take_waiting_range", prefix: "static bool"))
+        \#(try function("bridge_replace_remote_clipboard", prefix: "static void"))
         \#(try function("bridge_send_client_format_list"))
         \#(try function("bridge_send_file_group_descriptor"))
         \#(try function("bridge_cliprdr_server_format_data_response"))
@@ -153,23 +185,34 @@ final class ClipboardResponsePairingTests: XCTestCase {
         \#(try function("bridge_send_file_contents_failure"))
         \#(try function("bridge_cliprdr_server_file_contents_request"))
         \#(try function("bridge_cliprdr_server_file_contents_response"))
+        \#(try function("rdp_bridge_request_remote_file_range", prefix: "RDPBridgeStatus"))
 
-        static int texts, lists, contents_calls, requests, data_responses, contents_responses;
+        static RDPBridgeSession session;
+        // FreeRDP 호출·Swift 콜백은 clip_range_lock 밖에서만 불려야 한다(설계 D-G3 잠금 범위).
+        #define UNLOCKED() assert(session.clip_range_lock.depth == 0)
+        static int texts, lists, contents_calls, requests, data_responses, contents_responses, range_requests;
+        static UINT range_request_result;
+        static RDPBridgeStatus callback_range_status = (RDPBridgeStatus)-1;
+        static bool range_from_list_callback;
         static char last_text[64];
         static UINT32 last_stream, last_contents_flags, last_data_flags;
         static const uint8_t *last_payload;
         static size_t last_length;
-        static void on_text(const uint8_t *p, size_t n, void *c) { texts++; snprintf(last_text, sizeof last_text, "%.*s", (int)n, (const char *)p); }
-        static void on_list(const uint8_t *p, size_t n, void *c) { lists++; }
-        static void on_contents(uint32_t s, const uint8_t *p, size_t n, void *c) { contents_calls++; last_stream = s; last_payload = p; last_length = n; }
-        static UINT ok_caps(CliprdrClientContext *c, const CLIPRDR_CAPABILITIES *x) { return 0; }
-        static UINT ok_list(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST *x) { return 0; }
-        static UINT ok_list_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST_RESPONSE *x) { return 0; }
-        static UINT on_request(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_REQUEST *x) { requests++; return 0; }
-        static UINT on_data_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_RESPONSE *x) { data_responses++; last_data_flags = x->common.msgFlags; return 0; }
-        static UINT on_contents_response(CliprdrClientContext *c, const CLIPRDR_FILE_CONTENTS_RESPONSE *x) { contents_responses++; last_contents_flags = x->common.msgFlags; last_stream = x->streamId; return 0; }
+        static void on_text(const uint8_t *p, size_t n, void *c) { UNLOCKED(); texts++; snprintf(last_text, sizeof last_text, "%.*s", (int)n, (const char *)p); }
+        static void on_list(const uint8_t *p, size_t n, void *c) {
+            UNLOCKED();
+            lists++;
+            if (range_from_list_callback) callback_range_status = rdp_bridge_request_remote_file_range(&session, 900, 0, 0, 16);
+        }
+        static void on_contents(uint32_t s, const uint8_t *p, size_t n, void *c) { UNLOCKED(); contents_calls++; last_stream = s; last_payload = p; last_length = n; }
+        static UINT ok_caps(CliprdrClientContext *c, const CLIPRDR_CAPABILITIES *x) { UNLOCKED(); return 0; }
+        static UINT ok_list(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST *x) { UNLOCKED(); return 0; }
+        static UINT ok_list_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST_RESPONSE *x) { UNLOCKED(); return 0; }
+        static UINT on_request(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_REQUEST *x) { UNLOCKED(); requests++; return 0; }
+        static UINT on_data_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_RESPONSE *x) { UNLOCKED(); data_responses++; last_data_flags = x->common.msgFlags; return 0; }
+        static UINT on_contents_response(CliprdrClientContext *c, const CLIPRDR_FILE_CONTENTS_RESPONSE *x) { UNLOCKED(); contents_responses++; last_contents_flags = x->common.msgFlags; last_stream = x->streamId; return 0; }
+        static UINT on_range_request(CliprdrClientContext *c, const CLIPRDR_FILE_CONTENTS_REQUEST *x) { UNLOCKED(); range_requests++; assert(x->dwFlags == FILECONTENTS_RANGE); return range_request_result; }
 
-        static RDPBridgeSession session;
         static CliprdrClientContext context;
         static void reset(void) {
             memset(&session, 0, sizeof session);
@@ -181,11 +224,14 @@ final class ClipboardResponsePairingTests: XCTestCase {
             context.ClientFormatDataRequest = on_request;
             context.ClientFormatDataResponse = on_data_response;
             context.ClientFileContentsResponse = on_contents_response;
+            context.ClientFileContentsRequest = on_range_request;
+            session.connected = true;
             session.cliprdr = &context;
             session.callbacks.remoteText = on_text;
             session.callbacks.remoteFileList = on_list;
             session.callbacks.remoteFileContents = on_contents;
-            texts = lists = contents_calls = requests = data_responses = contents_responses = 0;
+            texts = lists = contents_calls = requests = data_responses = contents_responses = range_requests = 0;
+            range_request_result = CHANNEL_RC_OK;
             last_text[0] = 0;
         }
         static void fl_files(void) {
@@ -239,6 +285,23 @@ final class ClipboardResponsePairingTests: XCTestCase {
             const int before = contents_responses;
             assert(bridge_cliprdr_server_file_contents_request(&context, &request) == 0);
             return contents_responses - before;
+        }
+
+        static RDPBridgeStatus range(UINT32 stream) {
+            const RDPBridgeStatus status = rdp_bridge_request_remote_file_range(&session, stream, 0, 0, 16);
+            UNLOCKED();
+            return status;
+        }
+        static void contents_reply(UINT32 stream, UINT flags) {
+            static const BYTE abc[3] = { 'a', 'b', 'c' };
+            CLIPRDR_FILE_CONTENTS_RESPONSE r = { { CB_FILECONTENTS_RESPONSE, flags, 3 }, stream, flags == CB_RESPONSE_OK ? 3 : 0, flags == CB_RESPONSE_OK ? abc : NULL };
+            assert(bridge_cliprdr_server_file_contents_response(&context, &r) == 0);
+        }
+        // 파일 FL 과 그 서술자 응답: 목록이 앱에 넘어가 지금 세대가 RANGE 대상이 된다.
+        static void deliver_files(void) {
+            const int before = lists;
+            fl_files(); reply_descriptor();
+            assert(lists == before + 1);
         }
 
         int main(int argc, char **argv) {
@@ -299,6 +362,9 @@ final class ClipboardResponsePairingTests: XCTestCase {
                 return 0;
             }
             if (!strcmp(s, "c6")) {
+                // INV-P2(D-G3 개정): 기다리는 스트림의 응답만 전달한다.
+                deliver_files();
+                assert(range(5) == RDPBridgeStatusOK && range(6) == RDPBridgeStatusOK && range(7) == RDPBridgeStatusOK);
                 CLIPRDR_FILE_CONTENTS_RESPONSE fail = { { CB_FILECONTENTS_RESPONSE, CB_RESPONSE_FAIL, 4 }, 5, 0, NULL };
                 assert(bridge_cliprdr_server_file_contents_response(&context, &fail) == 0);
                 assert(contents_calls == 1 && last_stream == 5 && last_payload == NULL && last_length == 0);
@@ -309,6 +375,85 @@ final class ClipboardResponsePairingTests: XCTestCase {
                 CLIPRDR_FILE_CONTENTS_RESPONSE ok = { { CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, 7 }, 7, 3, abc };
                 assert(bridge_cliprdr_server_file_contents_response(&context, &ok) == 0);
                 assert(contents_calls == 3 && last_payload == abc && last_length == 3);
+                assert(session.clip_range_count == 0);
+                return 0;
+            }
+            if (!strcmp(s, "cg1")) {
+                // C-G1: 넘긴 목록의 s1 이 기다리는 중에 텍스트 FL → s1 즉시 FAIL, 늦은 s1 응답은 버린다.
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK && range_requests == 1);
+                fl_text();
+                assert(contents_calls == 1 && last_stream == 1 && last_payload == NULL && last_length == 0);
+                contents_reply(1, CB_RESPONSE_OK);
+                assert(contents_calls == 1);
+                assert(range(2) == RDPBridgeStatusNotConnected && range_requests == 1);
+                return 0;
+            }
+            if (!strcmp(s, "cg2")) {
+                // C-G2: FL → FL → 오래된 r1 버림 → r2 목록 → RANGE 수락(정상 경로).
+                fl_files(); fl_files();
+                reply_descriptor();
+                assert(lists == 0);
+                reply_descriptor();
+                assert(lists == 1);
+                assert(range(1) == RDPBridgeStatusOK && range_requests == 1);
+                contents_reply(1, CB_RESPONSE_OK);
+                assert(contents_calls == 1 && last_stream == 1 && last_length == 3);
+                return 0;
+            }
+            if (!strcmp(s, "cg3")) {
+                // C-G3: 목록을 넘긴 뒤 MonitorReady → RANGE 거부.
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                monitor_ready();
+                assert(contents_calls == 1 && last_stream == 1 && last_payload == NULL);
+                assert(range(2) == RDPBridgeStatusNotConnected && range_requests == 1);
+                return 0;
+            }
+            if (!strcmp(s, "cg4")) {
+                // C-G4(4B 의 FreeRDP 판): 새 파일 FL 의 서술자가 FAIL 이면 옛 목록의 RANGE 는 거부.
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                fl_files();
+                assert(contents_calls == 1 && last_stream == 1 && last_payload == NULL);
+                reply_fail();
+                assert(lists == 1);
+                assert(range(2) == RDPBridgeStatusNotConnected && range_requests == 1);
+                return 0;
+            }
+            if (!strcmp(s, "cg5")) {
+                // C-G5: 새 파일 FL 뒤 서술자 응답이 오기 전의 RANGE 는 거부, 응답이 오면 수락.
+                assert(range(1) == RDPBridgeStatusNotConnected);
+                deliver_files();
+                fl_files();
+                assert(range(2) == RDPBridgeStatusNotConnected && range_requests == 0);
+                reply_descriptor();
+                assert(lists == 2 && range(3) == RDPBridgeStatusOK && range_requests == 1);
+                return 0;
+            }
+            if (!strcmp(s, "cgcb")) {
+                // INV-G4: 목록 콜백 안에서 곧바로 보낸 RANGE 는 수락된다.
+                range_from_list_callback = true;
+                deliver_files();
+                assert(callback_range_status == RDPBridgeStatusOK && range_requests == 1);
+                return 0;
+            }
+            if (!strcmp(s, "cgtable")) {
+                // 표가 가득 차면 fail-closed, 보내기 실패는 표에 남지 않는다.
+                deliver_files();
+                range_request_result = 5;
+                assert(range(50) == RDPBridgeStatusInternalError && session.clip_range_count == 0);
+                contents_reply(50, CB_RESPONSE_OK);
+                assert(contents_calls == 0);
+                range_request_result = CHANNEL_RC_OK;
+                for (UINT32 i = 0; i < RDP_BRIDGE_CLIP_RANGES; i++) assert(range(100 + i) == RDPBridgeStatusOK);
+                const int sent = range_requests;
+                assert(range(200) == RDPBridgeStatusInternalError && range_requests == sent);
+                contents_reply(103, CB_RESPONSE_OK);
+                assert(contents_calls == 1 && last_stream == 103);
+                assert(range(201) == RDPBridgeStatusOK);
+                fl_text();
+                assert(contents_calls == 1 + RDP_BRIDGE_CLIP_RANGES && session.clip_range_count == 0);
                 return 0;
             }
             if (!strcmp(s, "huge")) {

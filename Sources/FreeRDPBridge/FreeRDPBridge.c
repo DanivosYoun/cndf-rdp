@@ -41,6 +41,8 @@
 #define RDP_BRIDGE_FORMAT_FILECONTENTS 0xC002
 // RDPGFX codec ids are < RDPGFX_CODECID_MAX (0x10); the last slot counts anything else.
 #define RDP_BRIDGE_CODEC_SLOTS 17
+// 보낸 뒤 응답을 기다리는 RANGE 스트림의 최대 수(설계 D-G3). 가득 차면 새 요청을 거부한다.
+#define RDP_BRIDGE_CLIP_RANGES 8
 
 struct RDPBridgeSession {
     RDPBridgeCallbacks callbacks;
@@ -74,6 +76,17 @@ struct RDPBridgeSession {
     UINT32 clip_request_format;
     // 서버 CLIPRDR general capability flags. 서술자 직렬화의 huge 파일 판정에 쓴다.
     UINT32 server_clip_flags;
+    // 원격 복사 세대(설계 D-G3, INV-G1~G3). 채널 스레드(FL·MonitorReady·응답)와 RANGE 를
+    // 보내는 호출자 스레드가 함께 쓰므로 clip_range_lock 아래에서만 읽고 쓴다.
+    // clip_copy: 서버 FL·MonitorReady 마다 오른다. clip_ranges_copy: 마지막으로 앱에 넘긴
+    // 파일 목록의 세대(0 = 넘긴 것 없음). clip_ranges: 보낸 뒤 응답을 기다리는 스트림.
+    // 잠금을 쥔 채 FreeRDP 호출이나 Swift 콜백을 부르지 않는다.
+    uint64_t clip_copy;
+    uint64_t clip_ranges_copy;
+    uint32_t clip_ranges[RDP_BRIDGE_CLIP_RANGES];
+    size_t clip_range_count;
+    CRITICAL_SECTION clip_range_lock;
+    bool clip_range_lock_initialized;
     // TLS 1.2 자동 폴백 재시도: 첫 연결이 TLS connect 단계에서 실패하면(예: Entra
     // 하드닝 Azure VM의 TLS 1.3/SCHANNEL 비호환) 보관해 둔 옵션으로 인스턴스를 다시
     // 만들어 TLS 1.2를 강제한 뒤 한 번만 재시도한다. retry_options의 문자열은 소유
@@ -165,6 +178,8 @@ RDPBridgeSession *rdp_bridge_session_create(const RDPBridgeCallbacks *callbacks)
 #if defined(RDP_FREERDP_REAL)
     InitializeCriticalSection(&session->instance_lock);
     session->instance_lock_initialized = true;
+    InitializeCriticalSection(&session->clip_range_lock);
+    session->clip_range_lock_initialized = true;
 #endif
 
     return session;
@@ -180,6 +195,10 @@ void rdp_bridge_session_destroy(RDPBridgeSession *session) {
     if (session->instance_lock_initialized) {
         DeleteCriticalSection(&session->instance_lock);
         session->instance_lock_initialized = false;
+    }
+    if (session->clip_range_lock_initialized) {
+        DeleteCriticalSection(&session->clip_range_lock);
+        session->clip_range_lock_initialized = false;
     }
 #else
     (void)rdp_bridge_disconnect(session);
@@ -398,6 +417,36 @@ static UINT bridge_cliprdr_server_format_data_request(
     return status;
 }
 
+// 기다리는 스트림 표에서 stream 하나를 뺀다. 호출자가 clip_range_lock 을 쥐고 있어야 한다.
+static bool bridge_take_waiting_range(RDPBridgeSession *session, uint32_t stream) {
+    for (size_t index = 0; index < session->clip_range_count; index++) {
+        if (session->clip_ranges[index] == stream) {
+            session->clip_ranges[index] = session->clip_ranges[--session->clip_range_count];
+            return true;
+        }
+    }
+    return false;
+}
+
+// 원격 복사 세대를 올린다(설계 D-G3, INV-G1·G3). 기다리던 RANGE 는 모두 FAIL(NULL, 0)로
+// 끝내고, 그 뒤 도착하는 응답은 표에 없으므로 버려진다. 콜백은 잠금을 푼 뒤에 부른다.
+static void bridge_replace_remote_clipboard(RDPBridgeSession *session) {
+    uint32_t streams[RDP_BRIDGE_CLIP_RANGES];
+    EnterCriticalSection(&session->clip_range_lock);
+    session->clip_copy++;
+    const size_t count = session->clip_range_count;
+    memcpy(streams, session->clip_ranges, count * sizeof(streams[0]));
+    session->clip_range_count = 0;
+    LeaveCriticalSection(&session->clip_range_lock);
+
+    if (session->callbacks.remoteFileContents == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < count; index++) {
+        session->callbacks.remoteFileContents(streams[index], NULL, 0, session->callbacks.context);
+    }
+}
+
 static UINT bridge_cliprdr_server_format_data_response(
     CliprdrClientContext *cliprdr,
     const CLIPRDR_FORMAT_DATA_RESPONSE *response) {
@@ -427,6 +476,11 @@ static UINT bridge_cliprdr_server_format_data_response(
         if (session->clip_request_format == RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW &&
             session->callbacks.remoteFileList != NULL) {
             bridge_logf(session, "Clipboard received remote file descriptor list: bytes=%u.", response->common.dataLen);
+            // 넘기기 직전에 이 세대를 RANGE 대상으로 정한다(INV-G4). D-2 덕분에 여기 오는 응답은
+            // 늘 최신 FL 의 요청에 대한 것이다. 콜백 안에서 곧바로 보낸 RANGE 도 수락된다.
+            EnterCriticalSection(&session->clip_range_lock);
+            session->clip_ranges_copy = session->clip_copy;
+            LeaveCriticalSection(&session->clip_range_lock);
             session->callbacks.remoteFileList(
                 response->requestedFormatData,
                 response->common.dataLen,
@@ -497,6 +551,8 @@ static UINT bridge_cliprdr_monitor_ready(
     session->clip_requests_pending = 0;
     session->clip_requests_stale = 0;
     session->clip_request_format = 0;
+    // 채널 경계: 이전 채널에서 넘긴 목록의 RANGE 는 더 이상 보내지 않는다(INV-G1).
+    bridge_replace_remote_clipboard(session);
     CLIPRDR_GENERAL_CAPABILITY_SET general = { 0 };
     CLIPRDR_CAPABILITIES capabilities = { 0 };
     general.capabilitySetType = CB_CAPSTYPE_GENERAL;
@@ -525,6 +581,8 @@ static UINT bridge_cliprdr_server_format_list(
     if ((cliprdr == NULL) || (format_list == NULL)) {
         return CHANNEL_RC_OK;
     }
+    // 새 복사: 진행 중인 RANGE 를 끝내고, 지금까지 넘긴 목록의 RANGE 를 막는다(INV-G2·G3).
+    bridge_replace_remote_clipboard((RDPBridgeSession *)cliprdr->custom);
 
     CLIPRDR_FORMAT_LIST_RESPONSE list_response = { 0 };
     list_response.common.msgType = CB_FORMAT_LIST_RESPONSE;
@@ -660,10 +718,17 @@ static UINT bridge_cliprdr_server_file_contents_response(
         return CHANNEL_RC_OK;
     }
 
-    // 규약(설계 D-3, INV-P2): 모든 응답을 Swift 로 보낸다. payload NULL = FAIL,
+    // 규약(설계 D-3, INV-P2 개정 D-G3): 기다리는 요청의 응답만 Swift 로 보낸다. payload NULL = FAIL,
     // OK 는 0바이트여도 NULL 이 아닌 포인터를 준다.
     static const BYTE empty_contents[1] = { 0 };
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    EnterCriticalSection(&session->clip_range_lock);
+    const bool waiting = bridge_take_waiting_range(session, response->streamId);
+    LeaveCriticalSection(&session->clip_range_lock);
+    if (!waiting) {
+        bridge_logf(session, "Clipboard dropped remote file contents for a stream not waiting: stream=%u.", response->streamId);
+        return CHANNEL_RC_OK;
+    }
     if (session->callbacks.remoteFileContents == NULL) {
         return CHANNEL_RC_OK;
     }
@@ -2117,7 +2182,25 @@ RDPBridgeStatus rdp_bridge_request_remote_file_range(
     request.nPositionHigh = (UINT32)(offset >> 32);
     request.cbRequested = length;
 
+    // 관문(설계 D-G3, INV-G2): 마지막으로 넘긴 파일 목록이 지금 세대일 때만 와이어에 보낸다.
+    EnterCriticalSection(&session->clip_range_lock);
+    if ((session->clip_ranges_copy == 0) || (session->clip_ranges_copy != session->clip_copy)) {
+        LeaveCriticalSection(&session->clip_range_lock);
+        bridge_log(session, "Clipboard refused file range for a replaced clipboard.");
+        return RDPBridgeStatusNotConnected;
+    }
+    if (session->clip_range_count >= RDP_BRIDGE_CLIP_RANGES) {
+        LeaveCriticalSection(&session->clip_range_lock);
+        bridge_log(session, "Clipboard refused file range: too many ranges waiting.");
+        return RDPBridgeStatusInternalError;
+    }
+    session->clip_ranges[session->clip_range_count++] = stream_id;
+    LeaveCriticalSection(&session->clip_range_lock);
+
     if (session->cliprdr->ClientFileContentsRequest(session->cliprdr, &request) != CHANNEL_RC_OK) {
+        EnterCriticalSection(&session->clip_range_lock);
+        (void)bridge_take_waiting_range(session, stream_id);
+        LeaveCriticalSection(&session->clip_range_lock);
         return RDPBridgeStatusInternalError;
     }
     return RDPBridgeStatusOK;
