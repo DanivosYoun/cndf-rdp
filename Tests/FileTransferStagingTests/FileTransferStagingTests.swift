@@ -170,6 +170,27 @@ final class FileTransferStagingTests: XCTestCase {
         }
     }
 
+    /// T-S3: backslashes in any Mac path component become `_`, so only the folder marker ends in `\`.
+    func testWireNameSanitizesBackslashesInEveryMacComponent() throws {
+        let temp = try makeTemp()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let dir = temp.appendingPathComponent("x\\", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("1".utf8).write(to: dir.appendingPathComponent("f.txt"))
+        let mid = temp.appendingPathComponent("a\\b.txt")
+        try Data("2".utf8).write(to: mid)
+        let leading = temp.appendingPathComponent("\\c")
+        try Data("3".utf8).write(to: leading)
+
+        let files = try FileTransferStaging(rootURL: temp.appendingPathComponent("staging"))
+            .stageLocalFilesForRemotePaste([dir, mid, leading])
+
+        XCTAssertEqual(Set(files.map(\.wireName)), ["x_\\", "x_\\f.txt", "a_b.txt", "_c"])
+        for file in files {
+            XCTAssertEqual(file.wireName.hasSuffix("\\"), file.isDirectory, file.wireName)
+        }
+    }
+
     func testNormalizesRemoteDropDestinationToNFC() throws {
         let temp = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

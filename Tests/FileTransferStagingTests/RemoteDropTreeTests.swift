@@ -258,4 +258,54 @@ final class RemoteDropTreeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: stagingRoot.path))
     }
+
+    // MARK: T-S1 / T-S2 — no held descriptors between calls and immediate registration
+
+    private func openFileDescriptorCount() throws -> Int {
+        try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+    }
+
+    func testManyTopLevelDirectoriesDoNotHoldDescriptorsBetweenCalls() throws {
+        let tree = try staging.beginRemoteDrop()
+        let before = try openFileDescriptorCount()
+        for index in 0..<300 {
+            try tree.createDirectory(path: "d\(index)")
+        }
+        let after = try openFileDescriptorCount()
+        XCTAssertLessThanOrEqual(after - before, 3, "open fds grew from \(before) to \(after)")
+        XCTAssertEqual(tree.topLevelURLs.count, 300)
+    }
+
+    func testTopLevelDirectoryIsRegisteredEvenWhenOpenFailsWithEMFILE() throws {
+        let tree = try staging.beginRemoteDrop()
+        var original = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &original), 0)
+
+        let lowestFree = dup(0)
+        XCTAssertGreaterThanOrEqual(lowestFree, 0)
+        close(lowestFree)
+
+        var caughtError: Error?
+        do {
+            var tight = rlimit(rlim_cur: rlim_t(lowestFree), rlim_max: original.rlim_max)
+            XCTAssertEqual(setrlimit(RLIMIT_NOFILE, &tight), 0)
+            defer { _ = setrlimit(RLIMIT_NOFILE, &original) }
+
+            do {
+                try tree.createDirectory(path: "d-emfile")
+                XCTFail("expected EMFILE when opening newly created top-level directory")
+            } catch {
+                caughtError = error
+            }
+        }
+
+        guard case let .unableToCreateRemoteDropFile(url, errno: code)? = caughtError as? FileTransferStagingError else {
+            return XCTFail("unexpected error: \(String(describing: caughtError))")
+        }
+        XCTAssertEqual(code, EMFILE)
+        XCTAssertEqual(tree.topLevelURLs, [url])
+
+        try staging.removeRemoteDropItems(tree.topLevelURLs)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: stagingRoot.path), [])
+    }
 }
