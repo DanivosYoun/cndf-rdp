@@ -56,7 +56,7 @@ public final class FileTransferStaging {
                 return try stageLocalDirectoryForRemotePaste(sourceURL)
             }
 
-            return [try stageLocalFileForRemotePaste(sourceURL, fileName: sourceURL.lastPathComponent)]
+            return [try stageLocalFileForRemotePaste(sourceURL, fileName: Self.sanitizeLocalTransferComponent(sourceURL.lastPathComponent))]
         }
     }
 
@@ -145,7 +145,7 @@ public final class FileTransferStaging {
             return []
         }
 
-        let rootName = FileNameNormalization.normalizeForTransfer(directoryURL.lastPathComponent)
+        let rootName = Self.sanitizeLocalTransferComponent(directoryURL.lastPathComponent)
         // Every folder, the root included, is an entry so empty folders reach the server (design D-1).
         var files: [StagedFile] = [directoryEntry(directoryURL, fileName: rootName)]
         for case let fileURL as URL in enumerator {
@@ -178,14 +178,13 @@ public final class FileTransferStaging {
         return StagedFile(
             sourceURL: sourceURL,
             stagedURL: sourceURL,
-            fileName: Self.withoutDirectoryMarker(normalizedTransferPath(fileName)),
+            fileName: normalizedTransferPath(fileName),
             byteCount: UInt64(size)
         )
     }
 
-    /// A legal macOS file name may end in `\\`, which the bridges read as a folder (INV-D2); replace it.
-    private static func withoutDirectoryMarker(_ name: String) -> String {
-        name.hasSuffix("\\") ? String(name.dropLast()) + "_" : name
+    private static func sanitizeLocalTransferComponent(_ component: String) -> String {
+        FileNameNormalization.normalizeForTransfer(component).replacingOccurrences(of: "\\", with: "_")
     }
 
     private func relativeTransferPath(fileURL: URL, rootURL: URL, rootName: String) -> String {
@@ -193,7 +192,7 @@ public final class FileTransferStaging {
         let filePath = fileURL.standardizedFileURL.path
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
         let relative = filePath.hasPrefix(prefix) ? String(filePath.dropFirst(prefix.count)) : fileURL.lastPathComponent
-        return ([rootName] + relative.split(separator: "/").map(String.init)).joined(separator: "\\")
+        return ([rootName] + relative.split(separator: "/").map { Self.sanitizeLocalTransferComponent(String($0)) }).joined(separator: "\\")
     }
 
     private func normalizedTransferPath(_ path: String) -> String {
@@ -240,9 +239,8 @@ public final class FileTransferStaging {
         return components.isEmpty ? ["untitled"] : components
     }
 
-    /// Creates a new top-level directory directly under the root (`mkdir 0700`, " N" on EEXIST)
-    /// and opens it without following links.
-    fileprivate func createRemoteDropTopDirectory(_ name: String, rootPath: String) throws -> (descriptor: Int32, url: URL) {
+    /// Creates a new top-level directory directly under the root (`mkdir 0700`, " N" on EEXIST).
+    fileprivate func createRemoteDropTopDirectory(_ name: String, rootPath: String) throws -> (path: String, url: URL) {
         for index in 0...Int.max {
             let candidateName = Self.fitFileSystemNameLimit(base: name, suffix: index == 0 ? "" : " \(index)", ext: "")
             let candidatePath = rootPath + "/" + candidateName
@@ -252,13 +250,7 @@ public final class FileTransferStaging {
                 throw FileTransferStagingError.unsafeRemoteFileName(name)
             }
             if candidatePath.withCString({ mkdir($0, 0o700) }) == 0 {
-                let descriptor = candidatePath.withCString {
-                    open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                }
-                guard descriptor >= 0 else {
-                    throw FileTransferStagingError.unableToCreateRemoteDropFile(candidate, errno: errno)
-                }
-                return (descriptor, candidate)
+                return (candidatePath, candidate)
             }
             let error = errno
             guard error == EEXIST else {
@@ -299,7 +291,7 @@ public final class FileTransferStaging {
 public final class RemoteDropTree {
     private let staging: FileTransferStaging
     private let rootPath: String
-    private var directories: [String: (descriptor: Int32, url: URL)] = [:]
+    private var directories: [String: (path: String, url: URL)] = [:]
     /// The list's top-level items (directories and files), in first-seen order.
     public private(set) var topLevelURLs: [URL] = []
 
@@ -308,15 +300,9 @@ public final class RemoteDropTree {
         self.rootPath = rootPath
     }
 
-    deinit {
-        for directory in directories.values {
-            close(directory.descriptor)
-        }
-    }
-
     public func createDirectory(path: String) throws {
         let opened = try openDirectory(FileTransferStaging.remoteDropComponents(path)[...])
-        if opened.owned { close(opened.descriptor) }
+        close(opened.descriptor)
     }
 
     public func createFile(path: String) throws -> RemoteDropFile {
@@ -327,14 +313,14 @@ public final class RemoteDropTree {
             return file
         }
         let parent = try openDirectory(components.dropLast())
-        defer { if parent.owned { close(parent.descriptor) } }
+        defer { close(parent.descriptor) }
         return try FileTransferStaging.createRemoteDropFile(named: components[components.count - 1], in: parent.descriptor, directoryURL: parent.url)
     }
 
-    /// The directory for `components`, created as needed. `owned` descriptors are the caller's to close.
-    private func openDirectory(_ components: ArraySlice<String>) throws -> (descriptor: Int32, url: URL, owned: Bool) {
+    /// Opens the directory for `components`, creating missing levels. Caller closes the returned descriptor.
+    private func openDirectory(_ components: ArraySlice<String>) throws -> (descriptor: Int32, url: URL) {
         let top = components[components.startIndex]
-        let topDirectory: (descriptor: Int32, url: URL)
+        let topDirectory: (path: String, url: URL)
         if let existing = directories[top] {
             topDirectory = existing
         } else {
@@ -343,22 +329,29 @@ public final class RemoteDropTree {
             topLevelURLs.append(topDirectory.url)
         }
 
-        var current = (descriptor: topDirectory.descriptor, url: topDirectory.url, owned: false)
+        let topDescriptor = topDirectory.path.withCString {
+            open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard topDescriptor >= 0 else {
+            throw FileTransferStagingError.unableToCreateRemoteDropFile(topDirectory.url, errno: errno)
+        }
+
+        var current = (descriptor: topDescriptor, url: topDirectory.url)
         for name in components.dropFirst() {
             let url = URL(fileURLWithPath: current.url.standardizedFileURL.path + "/" + name, isDirectory: true)
             let made = name.withCString { mkdirat(current.descriptor, $0, 0o700) }
             if made != 0, errno != EEXIST {
                 let error = errno
-                if current.owned { close(current.descriptor) }
+                close(current.descriptor)
                 throw FileTransferStagingError.unableToCreateRemoteDropFile(url, errno: error)
             }
             let next = name.withCString { openat(current.descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
             let error = errno
-            if current.owned { close(current.descriptor) }
+            close(current.descriptor)
             guard next >= 0 else {
                 throw FileTransferStagingError.unableToCreateRemoteDropFile(url, errno: error)
             }
-            current = (next, url, true)
+            current = (next, url)
         }
         return current
     }
