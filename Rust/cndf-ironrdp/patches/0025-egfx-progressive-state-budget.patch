@@ -1,0 +1,973 @@
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index 746b3dd..c66faee 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -1227,6 +1227,12 @@ impl GraphicsPipelineClient {
+             return Ok(());
+         };
+         let (surface_width, surface_height) = (surface.width, surface.height);
++        // Progressive state persists per surface, so a surface the compositor refused a canvas
++        // (too large or over budget) would keep growing it while drawing nothing.
++        if !self.compositor.has_canvas(pdu.surface_id) {
++            debug!(surface_id = pdu.surface_id, "WireToSurface2 for a surface without a canvas dropped");
++            return Ok(());
++        }
+ 
+         let tiles = match self.progressive_decoder.decode_bitmap(
+             pdu.surface_id,
+@@ -3621,6 +3627,50 @@ mod tests {
+         assert_eq!(client.dropped_updates, 1);
+     }
+ 
++    #[test]
++    fn progressive_state_past_its_budget_drops_the_payload_and_deleting_the_surface_returns_it() {
++        let mut client = progressive_client();
++        // Room for the grid and one tile with its reference, but not a second tile.
++        let one_tile = {
++            let mut probe = ProgressiveDecoder::new();
++            probe
++                .decode_bitmap(1, 0, 128, 64, &progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0))
++                .unwrap();
++            probe.state_bytes()
++        };
++        client.progressive_decoder = ProgressiveDecoder::with_state_budget(one_tile);
++        client
++            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++                surface_id: 1,
++                width: 128,
++                height: 64,
++                pixel_format: PixelFormat::XRgb,
++            }))
++            .unwrap();
++
++        wire_progressive(&mut client, progressive_tile_stream(0, 0, rect(0, 0, 64, 64), 0)).unwrap();
++        assert_eq!(client.dropped_updates, 0);
++        let second = progressive_tile_stream(1, 0, rect(64, 0, 64, 64), 0);
++        assert!(wire_progressive(&mut client, second.clone()).is_ok(), "the session survives");
++        assert_eq!(client.dropped_updates, 1, "the payload past the budget is dropped");
++        assert!(client.progressive_decoder.state_bytes() <= one_tile);
++
++        client
++            .handle_pdu(GfxPdu::DeleteSurface(crate::pdu::DeleteSurfacePdu { surface_id: 1 }))
++            .unwrap();
++        assert_eq!(client.progressive_decoder.state_bytes(), 0);
++        client
++            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++                surface_id: 1,
++                width: 128,
++                height: 64,
++                pixel_format: PixelFormat::XRgb,
++            }))
++            .unwrap();
++        wire_progressive(&mut client, second).unwrap();
++        assert_eq!(client.dropped_updates, 1, "the returned budget admits the tile again");
++    }
++
+     // ========================================================================
+     // AVC420 region rectangles (regionRects) -- issue #2042
+     //
+diff --git a/crates/ironrdp-egfx/src/compositor.rs b/crates/ironrdp-egfx/src/compositor.rs
+index 00a0216..0e3b68a 100644
+--- a/crates/ironrdp-egfx/src/compositor.rs
++++ b/crates/ironrdp-egfx/src/compositor.rs
+@@ -342,6 +342,11 @@ impl Compositor {
+         self.allocated_bytes = self.allocated_bytes.saturating_sub(len);
+     }
+ 
++    /// Whether the compositor holds a canvas for surface `id`; it has none for a surface it refused.
++    pub(crate) fn has_canvas(&self, id: u16) -> bool {
++        self.surfaces.contains_key(&id)
++    }
++
+     /// Reserve `len` bytes for a buffer kept beside surface `id`, such as a codec's reference picture.
+     ///
+     /// Refused when the compositor holds no canvas for the surface (it was too large or over budget)
+diff --git a/crates/ironrdp-egfx/tests/progressive_canvas.rs b/crates/ironrdp-egfx/tests/progressive_canvas.rs
+new file mode 100644
+index 0000000..6bd650d
+--- /dev/null
++++ b/crates/ironrdp-egfx/tests/progressive_canvas.rs
+@@ -0,0 +1,131 @@
++//! Progressive state is kept only for surfaces the compositor holds a canvas for.
++//!
++//! A counting allocator measures what the client holds, so this runs in its own test binary.
++
++#![expect(unused_crate_dependencies, reason = "an integration test uses a few of the crate's dependencies")]
++#![expect(
++    clippy::unwrap_used,
++    clippy::print_stderr,
++    reason = "test helpers fail loudly and report the bytes they measured"
++)]
++
++use core::alloc::{GlobalAlloc, Layout};
++use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
++use std::alloc::System;
++
++use ironrdp_dvc::DvcProcessor as _;
++use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
++use ironrdp_egfx::pdu::{
++    Codec2Type, CreateSurfacePdu, GfxPdu, PixelFormat, ResetGraphicsPdu, WireToSurface2Pdu,
++};
++use ironrdp_graphics::zgfx;
++use ironrdp_pdu::codecs::rfx::progressive::{
++    ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveSyncPdu, encode_progressive_stream,
++};
++
++struct Counting;
++
++static HELD: AtomicUsize = AtomicUsize::new(0);
++
++// SAFETY: forwards every call to `System` and only counts the sizes it allocated.
++unsafe impl GlobalAlloc for Counting {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            HELD.fetch_add(layout.size(), Relaxed);
++        }
++        ptr
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            HELD.fetch_add(layout.size(), Relaxed);
++        }
++        ptr
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: same contract as the caller's.
++        unsafe { System.dealloc(ptr, layout) };
++        HELD.fetch_sub(layout.size(), Relaxed);
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let new = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new.is_null() {
++            HELD.fetch_sub(layout.size(), Relaxed);
++            HELD.fetch_add(new_size, Relaxed);
++        }
++        new
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: Counting = Counting;
++
++struct Handler;
++
++impl GraphicsPipelineHandler for Handler {}
++
++fn send(client: &mut GraphicsPipelineClient, pdu: &GfxPdu) {
++    let bytes = ironrdp_core::encode_vec(pdu).unwrap();
++    client.process(0, &zgfx::wrap_uncompressed(&bytes)).unwrap();
++}
++
++#[test]
++fn surfaces_without_a_canvas_keep_no_progressive_state() {
++    let mut client = GraphicsPipelineClient::new(Box::new(Handler), None);
++    send(
++        &mut client,
++        &GfxPdu::ResetGraphics(ResetGraphicsPdu {
++            width: 1024,
++            height: 768,
++            monitors: vec![],
++        }),
++    );
++    let empty_frame = encode_progressive_stream(&[
++        ProgressiveBlock::Sync(ProgressiveSyncPdu),
++        ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
++            frame_index: 0,
++            region_count: 0,
++        }),
++        ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
++    ])
++    .unwrap();
++
++    let base = HELD.load(Relaxed);
++    // Design scenario P6 through the client: the compositor refuses every 32768x32768 canvas,
++    // and without the canvas check each surface's progressive grid takes 2 MiB, 128 MiB here.
++    for surface_id in 0..64 {
++        send(
++            &mut client,
++            &GfxPdu::CreateSurface(CreateSurfacePdu {
++                surface_id,
++                width: 32768,
++                height: 32768,
++                pixel_format: PixelFormat::XRgb,
++            }),
++        );
++        send(
++            &mut client,
++            &GfxPdu::WireToSurface2(WireToSurface2Pdu {
++                surface_id,
++                codec_id: Codec2Type::RemoteFxProgressive,
++                codec_context_id: 0,
++                pixel_format: PixelFormat::XRgb,
++                bitmap_data: empty_frame.clone(),
++            }),
++        );
++    }
++    let surfaces_held = HELD.load(Relaxed) - base;
++    eprintln!("P6 via client, surfaces=64 without a canvas: held={surfaces_held}");
++    assert!(
++        surfaces_held <= 1024 * 1024,
++        "client holds {surfaces_held} bytes for surfaces without a canvas"
++    );
++    assert_eq!(client.dropped_updates(), 0, "a surface without a canvas is not an undecodable update");
++}
+diff --git a/crates/ironrdp-graphics/src/progressive.rs b/crates/ironrdp-graphics/src/progressive.rs
+index deeb983..066a537 100644
+--- a/crates/ironrdp-graphics/src/progressive.rs
++++ b/crates/ironrdp-graphics/src/progressive.rs
+@@ -1128,6 +1128,12 @@ impl SurfaceTiles {
+         }
+     }
+ 
++    /// Bytes this grid holds: its slot vector plus every allocated tile.
++    fn state_bytes(&self) -> usize {
++        let populated = self.tiles.iter().filter(|tile| tile.is_some()).count();
++        self.tiles.len() * GRID_SLOT_BYTES + populated * TILE_STATE_BYTES
++    }
++
+     fn tile_index(&self, x_idx: u16, y_idx: u16) -> Option<usize> {
+         if x_idx >= self.tiles_wide || y_idx >= self.tiles_high {
+             return None;
+@@ -1171,6 +1177,53 @@ pub const MAX_SURFACE_DIM: u16 = 32768;
+ /// large `numRects` solely because many rectangles collapse to a simple region.
+ const MAX_REGION_CLIPPING_WORK: usize = 1 << 20;
+ 
++/// Default cap on the progressive state a [`ProgressiveDecoder`] keeps across payloads:
++/// tile grids, tiles and sub-band references together.
++///
++/// One tile holds about 61 KiB here (its [`TileState`] plus its sub-band reference), so a
++/// 3840x2160 surface fully refined holds about 120 MiB and two of them stay well inside the cap.
++/// The surface dimension cap alone does not bound this state: every surface the server creates
++/// gets its own grid and tiles.
++pub const DEFAULT_STATE_BUDGET: usize = 512 * 1024 * 1024;
++
++const GRID_SLOT_BYTES: usize = size_of::<Option<Box<TileState>>>();
++const TILE_STATE_BYTES: usize = size_of::<TileState>();
++/// A boxed sub-band reference plus a generous share of its map node (key and box pointer).
++const REFERENCE_BYTES: usize = size_of::<DecDwtQ>() + 64;
++
++fn grid_bytes(surface_width: u16, surface_height: u16) -> usize {
++    usize::from(surface_width.div_ceil(TILE_DIM)) * usize::from(surface_height.div_ceil(TILE_DIM)) * GRID_SLOT_BYTES
++}
++
++/// Running total of the progressive state bytes a decoder holds, against its budget.
++struct StateBytes {
++    held: usize,
++    budget: usize,
++}
++
++impl StateBytes {
++    /// Fail unless `bytes` more fit in the budget; checked before the allocation it covers.
++    fn ensure(&self, bytes: usize) -> Result<(), ProgressiveDecodeError> {
++        match self.held.checked_add(bytes) {
++            Some(total) if total <= self.budget => Ok(()),
++            _ => Err(ProgressiveDecodeError::StateBudget {
++                requested: bytes,
++                held: self.held,
++                budget: self.budget,
++            }),
++        }
++    }
++
++    /// Record an allocation that [`Self::ensure`] admitted.
++    fn charge(&mut self, bytes: usize) {
++        self.held += bytes;
++    }
++
++    fn release(&mut self, bytes: usize) {
++        self.held = self.held.saturating_sub(bytes);
++    }
++}
++
+ /// Error type for progressive decoding operations.
+ #[derive(Debug)]
+ pub enum ProgressiveDecodeError {
+@@ -1190,6 +1243,8 @@ pub enum ProgressiveDecodeError {
+     MissingTileReference { x_idx: u16, y_idx: u16 },
+     /// Surface dimensions exceed [`MAX_SURFACE_DIM`] per axis.
+     SurfaceTooLarge { width: u16, height: u16 },
++    /// Keeping the payload's new state would take the decoder past its state budget.
++    StateBudget { requested: usize, held: usize, budget: usize },
+ }
+ 
+ impl core::fmt::Display for ProgressiveDecodeError {
+@@ -1215,6 +1270,16 @@ impl core::fmt::Display for ProgressiveDecodeError {
+                      (MS-RDPEGFX 2.2.2.14 normative ceiling: 32766)"
+                 )
+             }
++            Self::StateBudget {
++                requested,
++                held,
++                budget,
++            } => {
++                write!(
++                    f,
++                    "progressive state of {requested} more bytes exceeds the budget ({held} of {budget} held)"
++                )
++            }
+         }
+     }
+ }
+@@ -1284,22 +1349,40 @@ fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), Pro
+ /// ```
+ pub struct ProgressiveDecoder {
+     surfaces: BTreeMap<u16, SurfaceTiles>,
+-    references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
++    // Boxed so each reference is one allocation of its own size, which is what the budget charges.
++    references: BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
+     frame_tiles: BTreeMap<u16, BTreeSet<(u16, u16)>>,
+     frame_active: bool,
++    state: StateBytes,
+ }
+ 
+ impl ProgressiveDecoder {
+-    /// Create a new progressive decoder with no surface state.
++    /// Create a new progressive decoder with no surface state and [`DEFAULT_STATE_BUDGET`].
+     pub fn new() -> Self {
++        Self::with_state_budget(DEFAULT_STATE_BUDGET)
++    }
++
++    /// Create a decoder that keeps at most `budget` bytes of progressive state.
++    ///
++    /// A payload whose new grid, tile or reference would exceed it fails with
++    /// [`ProgressiveDecodeError::StateBudget`] before that allocation, like any other decode error:
++    /// tiles it decoded before the failing one stay. Deleting a surface returns its grid, tiles and
++    /// references; [`Self::reset`] returns grids and tiles and keeps the references it retains.
++    pub fn with_state_budget(budget: usize) -> Self {
+         Self {
+             surfaces: BTreeMap::new(),
+             references: BTreeMap::new(),
+             frame_tiles: BTreeMap::new(),
+             frame_active: false,
++            state: StateBytes { held: 0, budget },
+         }
+     }
+ 
++    /// Bytes of progressive state this decoder currently holds against its budget.
++    pub fn state_bytes(&self) -> usize {
++        self.state.held
++    }
++
+     /// Start an RDPGFX frame, resetting the set of tiles available to REGION blocks.
+     pub fn begin_frame(&mut self) {
+         self.frame_tiles.clear();
+@@ -1342,12 +1425,23 @@ impl ProgressiveDecoder {
+             self.frame_tiles.clear();
+         }
+ 
+-        let (surfaces, references, all_frame_tiles) = (&mut self.surfaces, &mut self.references, &mut self.frame_tiles);
++        let (surfaces, references, all_frame_tiles, state) = (
++            &mut self.surfaces,
++            &mut self.references,
++            &mut self.frame_tiles,
++            &mut self.state,
++        );
+ 
+         // Every codec context on a surface decodes into the surface's tile grid.
+         let surface = match surfaces.entry(surface_id) {
+             Entry::Occupied(e) => e.into_mut(),
+-            Entry::Vacant(e) => e.insert(SurfaceTiles::new(surface_width, surface_height, false)?),
++            Entry::Vacant(e) => {
++                let grid = grid_bytes(surface_width, surface_height);
++                state.ensure(grid)?;
++                let tiles = SurfaceTiles::new(surface_width, surface_height, false)?;
++                state.charge(grid);
++                e.insert(tiles)
++            }
+         };
+ 
+         // If surface dimensions changed, reallocate the tile grid.
+@@ -1355,7 +1449,22 @@ impl ProgressiveDecoder {
+         let expected_high = surface_height.div_ceil(TILE_DIM);
+         let surface_resized = surface.tiles_wide != expected_wide || surface.tiles_high != expected_high;
+         if surface_resized {
+-            *surface = SurfaceTiles::new(surface_width, surface_height, false)?;
++            let previous = surface.state_bytes();
++            let grid = grid_bytes(surface_width, surface_height);
++            state.release(previous);
++            if let Err(error) = state.ensure(grid) {
++                state.charge(previous);
++                return Err(error);
++            }
++            let tiles = match SurfaceTiles::new(surface_width, surface_height, false) {
++                Ok(tiles) => tiles,
++                Err(error) => {
++                    state.charge(previous);
++                    return Err(error);
++                }
++            };
++            *surface = tiles;
++            state.charge(grid);
+         }
+ 
+         let frame_tiles = all_frame_tiles.entry(surface_id).or_default();
+@@ -1395,6 +1504,7 @@ impl ProgressiveDecoder {
+                     surface_id,
+                     surface,
+                     references,
++                    state,
+                     tile_block,
+                     &region.quant_vals,
+                     &region.quant_prog_vals,
+@@ -1501,14 +1611,22 @@ impl ProgressiveDecoder {
+     /// Call this when discarding a surface so a subsequent surface with the
+     /// same ID cannot inherit stale Progressive tile state.
+     pub fn delete_surface(&mut self, surface_id: u16) {
+-        self.surfaces.remove(&surface_id);
++        if let Some(surface) = self.surfaces.remove(&surface_id) {
++            self.state.release(surface.state_bytes());
++        }
++        let references = self.references.len();
+         self.references
+             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
++        self.state
++            .release((references - self.references.len()) * REFERENCE_BYTES);
+         self.frame_tiles.remove(&surface_id);
+     }
+ 
+     /// Reset tile state while retaining surface sub-band references.
+     pub fn reset(&mut self) {
++        for surface in self.surfaces.values() {
++            self.state.release(surface.state_bytes());
++        }
+         self.surfaces.clear();
+         self.frame_tiles.clear();
+         self.frame_active = false;
+@@ -1548,10 +1666,15 @@ fn progressive_quant_for(
+     clippy::similar_names,
+     reason = "q_y/q_cb/q_cr are standard component quant index names"
+ )]
++#[expect(
++    clippy::too_many_arguments,
++    reason = "the decoder's state is split into disjoint borrows for each tile block"
++)]
+ fn decode_tile_block(
+     surface_id: u16,
+     surface: &mut SurfaceTiles,
+-    references: &mut BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
++    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
++    state: &mut StateBytes,
+     tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
+     quant_vals: &[ComponentCodecQuant],
+     prog_quant_vals: &[ProgressiveCodecQuant],
+@@ -1571,16 +1694,21 @@ fn decode_tile_block(
+             let reference_key = (surface_id, x_idx, y_idx);
+             let reference = if is_difference {
+                 Some(
+-                    references
++                    &**references
+                         .get(&reference_key)
+                         .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
+                 )
+             } else {
+                 None
+             };
++            let new_tile = surface.get(x_idx, y_idx).is_none();
++            state.ensure(new_state_bytes(new_tile, !references.contains_key(&reference_key)))?;
+             let tile_state = surface
+                 .get_or_create(x_idx, y_idx)
+                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
++            if new_tile {
++                state.charge(TILE_STATE_BYTES);
++            }
+ 
+             let q_y = usize::from(tile.quant_idx_y);
+             let q_cb = usize::from(tile.quant_idx_cb);
+@@ -1607,7 +1735,7 @@ fn decode_tile_block(
+                     use_reduce_extrapolate,
+                 },
+             )?;
+-            references.insert(reference_key, tile_state.coefficients);
++            retain_reference(references, state, reference_key, &tile_state.coefficients);
+ 
+             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
+             tile_state.reconstruct_to_rgba(&mut pixels);
+@@ -1631,16 +1759,21 @@ fn decode_tile_block(
+             let reference_key = (surface_id, x_idx, y_idx);
+             let reference = if is_difference {
+                 Some(
+-                    references
++                    &**references
+                         .get(&reference_key)
+                         .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
+                 )
+             } else {
+                 None
+             };
++            let new_tile = surface.get(x_idx, y_idx).is_none();
++            state.ensure(new_state_bytes(new_tile, !references.contains_key(&reference_key)))?;
+             let tile_state = surface
+                 .get_or_create(x_idx, y_idx)
+                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
++            if new_tile {
++                state.charge(TILE_STATE_BYTES);
++            }
+ 
+             let q_y = usize::from(tile.quant_idx_y);
+             let q_cb = usize::from(tile.quant_idx_cb);
+@@ -1666,7 +1799,7 @@ fn decode_tile_block(
+                     use_reduce_extrapolate,
+                 },
+             )?;
+-            references.insert(reference_key, tile_state.coefficients);
++            retain_reference(references, state, reference_key, &tile_state.coefficients);
+ 
+             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
+             tile_state.reconstruct_to_rgba(&mut pixels);
+@@ -1683,11 +1816,17 @@ fn decode_tile_block(
+             let x_idx = tile.x_idx;
+             let y_idx = tile.y_idx;
+ 
+-            let tile_state = surface
+-                .get_or_create(x_idx, y_idx)
++            let index = surface
++                .tile_index(x_idx, y_idx)
+                 .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
++            let reference_key = (surface_id, x_idx, y_idx);
++            state.ensure(new_state_bytes(false, !references.contains_key(&reference_key)))?;
+ 
+-            // If this tile hasn't had a first pass, skip the upgrade
++            // If this tile hasn't had a first pass, skip the upgrade. A tile that was never
++            // created has not had one either, so there is nothing to allocate for it.
++            let Some(tile_state) = surface.tiles[index].as_deref_mut() else {
++                return Ok(Vec::new());
++            };
+             if tile_state.pass == 0 {
+                 return Ok(Vec::new());
+             }
+@@ -1700,7 +1839,7 @@ fn decode_tile_block(
+                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                 tile.quality,
+             )?;
+-            references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
++            retain_reference(references, state, reference_key, &tile_state.coefficients);
+ 
+             let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
+             tile_state.reconstruct_to_rgba(&mut pixels);
+@@ -1715,6 +1854,29 @@ fn decode_tile_block(
+     }
+ }
+ 
++/// State bytes a tile block may add: a tile it creates and a reference it adds.
++fn new_state_bytes(new_tile: bool, new_reference: bool) -> usize {
++    usize::from(new_tile) * TILE_STATE_BYTES + usize::from(new_reference) * REFERENCE_BYTES
++}
++
++/// Store a tile's coefficients as its sub-band reference, charging a new entry to `state`.
++///
++/// The caller has checked with [`StateBytes::ensure`] that a new entry fits.
++fn retain_reference(
++    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
++    state: &mut StateBytes,
++    key: SubBandDiffingTileKey,
++    coefficients: &DecDwtQ,
++) {
++    match references.entry(key) {
++        Entry::Occupied(mut entry) => **entry.get_mut() = *coefficients,
++        Entry::Vacant(entry) => {
++            state.charge(REFERENCE_BYTES);
++            entry.insert(Box::new(*coefficients));
++        }
++    }
++}
++
+ impl Default for ProgressiveDecoder {
+     fn default() -> Self {
+         Self::new()
+@@ -2168,14 +2330,14 @@ mod tests {
+         assert!(result.is_ok());
+         assert_eq!(decoder.surfaces.len(), 1);
+         assert_eq!(decoder.references.len(), 1);
+-        let reference = *decoder
++        let reference = **decoder
+             .references
+             .get(&(1, 0, 0))
+             .expect("original tile reference should be retained");
+ 
+         decoder.reset();
+         assert!(decoder.surfaces.is_empty());
+-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
++        assert_eq!(decoder.references.get(&(1, 0, 0)).map(|r| &**r), Some(&reference));
+ 
+         assert!(
+             decoder
+@@ -3610,7 +3772,7 @@ mod tests {
+                 &first_tile_stream(0, &original_data, base_quant, progressive_quant, true),
+             )
+             .expect("original first-pass tile should decode");
+-        let initial_reference = *decoder
++        let initial_reference = **decoder
+             .references
+             .get(&(1, 0, 0))
+             .expect("original tile should retain a reference");
+@@ -3630,7 +3792,7 @@ mod tests {
+                 ),
+             )
+             .expect("upgrade tile should decode");
+-        let upgraded_reference = *decoder
++        let upgraded_reference = **decoder
+             .references
+             .get(&(1, 0, 0))
+             .expect("upgrade should update the retained reference");
+@@ -3721,7 +3883,7 @@ mod tests {
+                     &first_tile_stream(0, &first_data, base_quant, progressive_quant, true),
+                 )
+                 .expect("first-pass tile should decode");
+-            let first_reference = *decoder
++            let first_reference = **decoder
+                 .references
+                 .get(&(1, 0, 0))
+                 .expect("first-pass tile should retain a reference");
+@@ -3781,7 +3943,7 @@ mod tests {
+         decoder
+             .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, original_components, true))
+             .expect("original tile should decode");
+-        let reference = *decoder
++        let reference = **decoder
+             .references
+             .get(&(1, 0, 0))
+             .expect("original tile reference should be retained");
+@@ -3818,7 +3980,7 @@ mod tests {
+             }
+         }
+ 
+-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&updated));
++        assert_eq!(decoder.references.get(&(1, 0, 0)).map(|r| &**r), Some(&updated));
+ 
+         decoder.delete_surface(1);
+         assert!(!decoder.references.contains_key(&(1, 0, 0)));
+@@ -3843,7 +4005,7 @@ mod tests {
+         decoder
+             .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, original_components, true))
+             .expect("original tile should decode");
+-        let reference = *decoder
++        let reference = **decoder
+             .references
+             .get(&(1, 0, 0))
+             .expect("original tile reference should be retained");
+@@ -3851,7 +4013,7 @@ mod tests {
+         decoder
+             .decode_bitmap(1, 7, 128, 64, &minimal_progressive_stream(true))
+             .expect("resized surface should decode");
+-        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
++        assert_eq!(decoder.references.get(&(1, 0, 0)).map(|r| &**r), Some(&reference));
+ 
+         decoder
+             .decode_bitmap(
+diff --git a/crates/ironrdp-graphics/tests/progressive_state_budget.rs b/crates/ironrdp-graphics/tests/progressive_state_budget.rs
+new file mode 100644
+index 0000000..2d2749a
+--- /dev/null
++++ b/crates/ironrdp-graphics/tests/progressive_state_budget.rs
+@@ -0,0 +1,303 @@
++//! Bytes a [`ProgressiveDecoder`] keeps across payloads stay inside its state budget.
++//!
++//! A counting allocator measures what the decoder actually holds, so these run in their own test
++//! binary and take a lock to keep the measurements of one test out of another's.
++
++#![expect(unused_crate_dependencies, reason = "an integration test uses a few of the crate's dependencies")]
++#![expect(
++    clippy::unwrap_used,
++    clippy::panic,
++    clippy::print_stderr,
++    reason = "test helpers fail loudly and report the bytes they measured"
++)]
++
++use core::alloc::{GlobalAlloc, Layout};
++use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
++use std::alloc::System;
++use std::sync::Mutex;
++
++use ironrdp_graphics::progressive::{
++    COEFFICIENTS_PER_COMPONENT, DEFAULT_STATE_BUDGET, ProgressiveDecodeError, ProgressiveDecoder, encode_first_pass,
++};
++use ironrdp_pdu::codecs::rfx::RfxRectangle;
++use ironrdp_pdu::codecs::rfx::progressive::{
++    ComponentCodecQuant, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
++    ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, TileUpgrade, encode_progressive_stream,
++};
++
++struct Counting;
++
++static HELD: AtomicUsize = AtomicUsize::new(0);
++
++// SAFETY: forwards every call to `System` and only counts the sizes it allocated.
++unsafe impl GlobalAlloc for Counting {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let ptr = unsafe { System.alloc(layout) };
++        if !ptr.is_null() {
++            HELD.fetch_add(layout.size(), Relaxed);
++        }
++        ptr
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let ptr = unsafe { System.alloc_zeroed(layout) };
++        if !ptr.is_null() {
++            HELD.fetch_add(layout.size(), Relaxed);
++        }
++        ptr
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        // SAFETY: same contract as the caller's.
++        unsafe { System.dealloc(ptr, layout) };
++        HELD.fetch_sub(layout.size(), Relaxed);
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        // SAFETY: same contract as the caller's.
++        let new = unsafe { System.realloc(ptr, layout, new_size) };
++        if !new.is_null() {
++            HELD.fetch_sub(layout.size(), Relaxed);
++            HELD.fetch_add(new_size, Relaxed);
++        }
++        new
++    }
++}
++
++#[global_allocator]
++static ALLOCATOR: Counting = Counting;
++
++static SERIAL: Mutex<()> = Mutex::new(());
++
++const MIB: usize = 1024 * 1024;
++const TEST_BUDGET: usize = 8 * MIB;
++/// Room for allocator bookkeeping the decoder does not own, such as the frame tile set.
++const SLACK: usize = MIB;
++
++fn held() -> usize {
++    HELD.load(Relaxed)
++}
++
++fn zero_component() -> Vec<u8> {
++    let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
++    let mut data = [0u8; 8192];
++    let len = encode_first_pass(
++        &mut coefficients,
++        &mut data,
++        &ComponentCodecQuant::LOSSLESS,
++        &ComponentCodecQuant::LOSSLESS,
++        false,
++    )
++    .unwrap();
++    data[..len].to_vec()
++}
++
++fn simple(component: &[u8], x_idx: u16, y_idx: u16) -> ProgressiveTile<'_> {
++    ProgressiveTile::Simple(TileSimple {
++        quant_idx_y: 0,
++        quant_idx_cb: 0,
++        quant_idx_cr: 0,
++        x_idx,
++        y_idx,
++        flags: 0,
++        y_data: component,
++        cb_data: component,
++        cr_data: component,
++        tail_data: &[],
++    })
++}
++
++fn upgrade(x_idx: u16, y_idx: u16) -> ProgressiveTile<'static> {
++    ProgressiveTile::Upgrade(TileUpgrade {
++        quant_idx_y: 0,
++        quant_idx_cb: 0,
++        quant_idx_cr: 0,
++        x_idx,
++        y_idx,
++        quality: 0xFF,
++        y_srl_data: &[],
++        y_raw_data: &[],
++        cb_srl_data: &[],
++        cb_raw_data: &[],
++        cr_srl_data: &[],
++        cr_raw_data: &[],
++    })
++}
++
++fn stream(frame_index: u32, rect: RfxRectangle, tiles: Vec<ProgressiveTile<'_>>) -> Vec<u8> {
++    encode_progressive_stream(&[
++        ProgressiveBlock::Sync(ProgressiveSyncPdu),
++        ProgressiveBlock::Context(ProgressiveContextPdu {
++            context_id: 0,
++            tile_size: 64,
++            flags: 0,
++        }),
++        ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
++            frame_index,
++            region_count: 1,
++        }),
++        ProgressiveBlock::Region(ProgressiveRegion {
++            tile_size: 64,
++            rects: vec![rect],
++            quant_vals: vec![ComponentCodecQuant::LOSSLESS],
++            quant_prog_vals: Vec::new(),
++            flags: 0,
++            tiles,
++        }),
++        ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
++    ])
++    .unwrap()
++}
++
++/// Design scenario P4: TILE_SIMPLE blocks across a 32768x32768 surface, each outside the REGION
++/// so nothing is drawn while every tile is kept. Returns the payloads the decoder accepted.
++fn tile_flood(decoder: &mut ProgressiveDecoder, component: &[u8], tiles: u32) -> usize {
++    const PER_CALL: u32 = 16;
++    let outside = RfxRectangle {
++        x: 0,
++        y: 0,
++        width: 64,
++        height: 64,
++    };
++    let mut accepted = 0;
++    for call in 0..tiles / PER_CALL {
++        let blocks = (0..PER_CALL)
++            .map(|i| {
++                // Skip tile (0, 0), the only one inside the REGION.
++                let n = call * PER_CALL + i + 1;
++                simple(component, u16::try_from(n % 512).unwrap(), u16::try_from(n / 512).unwrap())
++            })
++            .collect();
++        match decoder.decode_bitmap(1, 0, 32768, 32768, &stream(call, outside.clone(), blocks)) {
++            Ok(_) => accepted += 1,
++            Err(ProgressiveDecodeError::StateBudget { .. }) => {}
++            Err(error) => panic!("unexpected decode error: {error}"),
++        }
++    }
++    accepted
++}
++
++#[test]
++fn a_tile_flood_holds_no_more_than_the_state_budget() {
++    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let component = zero_component();
++    let base = held();
++    let mut decoder = ProgressiveDecoder::with_state_budget(TEST_BUDGET);
++
++    // 4096 tiles keep about 250 MiB without a budget.
++    let accepted = tile_flood(&mut decoder, &component, 4096);
++    let flood_held = held() - base;
++    eprintln!(
++        "P4 tiles=4096 held={flood_held} state={} accepted={accepted}",
++        decoder.state_bytes()
++    );
++    assert!(
++        flood_held <= TEST_BUDGET + SLACK,
++        "decoder holds {flood_held} bytes against a {TEST_BUDGET} byte budget"
++    );
++    assert!(decoder.state_bytes() <= TEST_BUDGET);
++    // The budget charges what the decoder really holds, grid, tiles and references alike.
++    assert!(
++        flood_held <= decoder.state_bytes() + SLACK,
++        "decoder holds {flood_held} bytes but accounts for {}",
++        decoder.state_bytes()
++    );
++    assert!(accepted > 0, "payloads inside the budget must still decode");
++    assert!(accepted < 16, "payloads past the budget must be refused");
++
++    // Deleting the surface returns its bytes, so the same flood is accepted again.
++    decoder.delete_surface(1);
++    assert_eq!(decoder.state_bytes(), 0);
++    assert!(held() - base <= SLACK);
++    assert_eq!(tile_flood(&mut decoder, &component, 4096), accepted);
++
++    // A reset returns the tiles and grid; the sub-band references it keeps stay charged.
++    decoder.reset();
++    assert!(held() - base <= decoder.state_bytes() + SLACK);
++    drop(decoder);
++}
++
++#[test]
++fn surface_grids_are_charged_against_the_state_budget() {
++    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    // Design scenario P6: an empty frame on each of many 32768x32768 surfaces allocates a
++    // 2 MiB grid each, 128 MiB here without a budget.
++    let empty = encode_progressive_stream(&[
++        ProgressiveBlock::Sync(ProgressiveSyncPdu),
++        ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
++            frame_index: 0,
++            region_count: 0,
++        }),
++        ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
++    ])
++    .unwrap();
++    let base = held();
++    let mut decoder = ProgressiveDecoder::with_state_budget(TEST_BUDGET);
++    let mut refused = 0;
++    for surface_id in 0..64 {
++        match decoder.decode_bitmap(surface_id, 0, 32768, 32768, &empty) {
++            Ok(_) => {}
++            Err(ProgressiveDecodeError::StateBudget { .. }) => refused += 1,
++            Err(error) => panic!("unexpected decode error: {error}"),
++        }
++    }
++    let grids_held = held() - base;
++    eprintln!("P6 surfaces=64 held={grids_held} state={} refused={refused}", decoder.state_bytes());
++    assert!(
++        grids_held <= TEST_BUDGET + SLACK,
++        "decoder holds {grids_held} bytes of grids against a {TEST_BUDGET} byte budget"
++    );
++    assert!(refused >= 60, "surfaces past the budget must be refused, refused {refused}");
++
++    // Resizing a surface returns its old grid before charging the new one.
++    decoder.delete_surface(0);
++    decoder.decode_bitmap(1, 0, 64, 64, &empty).unwrap();
++    decoder.decode_bitmap(1, 0, 32768, 32768, &empty).unwrap();
++    assert!(held() - base <= decoder.state_bytes() + SLACK);
++    drop(decoder);
++}
++
++#[test]
++fn two_4k_progressive_desktops_fit_the_default_budget() {
++    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
++    let component = zero_component();
++    let (width, height) = (3840u16, 2160u16);
++    let (tiles_wide, tiles_high) = (width.div_ceil(64), height.div_ceil(64));
++    let whole = RfxRectangle {
++        x: 0,
++        y: 0,
++        width,
++        height,
++    };
++    let base = held();
++    let mut decoder = ProgressiveDecoder::new();
++
++    // A first pass over every tile of both surfaces, then an upgrade pass over every tile.
++    for pass in 0..2u32 {
++        for surface_id in [1u16, 2] {
++            for y_idx in 0..tiles_high {
++                let tiles = (0..tiles_wide)
++                    .map(|x_idx| {
++                        if pass == 0 {
++                            simple(&component, x_idx, y_idx)
++                        } else {
++                            upgrade(x_idx, y_idx)
++                        }
++                    })
++                    .collect();
++                let drawn = decoder
++                    .decode_bitmap(surface_id, 0, width, height, &stream(pass, whole.clone(), tiles))
++                    .unwrap_or_else(|error| panic!("pass {pass} surface {surface_id} row {y_idx}: {error}"));
++                assert_eq!(drawn.len(), usize::from(tiles_wide), "every tile of the row is drawn");
++            }
++        }
++    }
++
++    let state = decoder.state_bytes();
++    eprintln!("two 4K desktops held={} state={state}", held() - base);
++    assert!(state <= DEFAULT_STATE_BUDGET / 2, "two 4K desktops hold {state} bytes");
++    assert!(held() - base <= state + SLACK);
++    drop(decoder);
++}
