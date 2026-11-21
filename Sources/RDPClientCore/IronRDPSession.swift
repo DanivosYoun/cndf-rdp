@@ -162,7 +162,7 @@ public final class IronRDPSession: RDPEngineSession {
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
             guard let clipboard = session.clipboardContext(for: generation) else { return }
             let text = utf8String(bytes, length)
-            session.deliverClipboard(generation, connection: clipboard.connection) { session in
+            session.deliverNewestRemoteClipboard(generation, connection: clipboard.connection) { session in
                 session.updateStatistics { $0.remoteClipboardTextsReceived += 1 }
                 session.clipboardCoordinator?.receiveRemoteText(text)
                 session.delegate?.rdpSession(session, didReceiveRemoteText: text)
@@ -175,7 +175,7 @@ public final class IronRDPSession: RDPEngineSession {
             let descriptors = UnsafeBufferPointer(start: files, count: count).map { file in
                 (name: utf8String(file.name_utf8, file.name_length), size: file.size)
             }
-            session.deliverClipboard(generation, connection: clipboard.connection) { session in
+            session.deliverNewestRemoteClipboard(generation, connection: clipboard.connection) { session in
                 let entries = descriptors.map { file in
                     RDPFileListEntry(
                         fileName: FileNameNormalization.normalizeForTransfer(file.name),
@@ -443,17 +443,57 @@ public final class IronRDPSession: RDPEngineSession {
         clipboardContext(for: generation)?.connection == connection
     }
 
+    private struct RemoteClipboardDelivery {
+        let generation: UInt64
+        let connection: UInt64
+        let deliver: (IronRDPSession) -> Void
+    }
+
+    private struct RemoteFileMaterialization {
+        let entries: [RDPFileListEntry]
+        let manager: RDPRemoteFileDownloadManager
+        let generation: UInt64
+        let connection: UInt64
+    }
+
+    // Server clipboard callbacks keep only the newest text or file list for main, and file
+    // lists materialize one at a time behind the newest waiting list.
+    private let remoteClipboardSlot = IronRDPRemoteClipboardSlot<RemoteClipboardDelivery>()
+    private let remoteFileMaterializations = IronRDPRemoteFileMaterializationQueue<RemoteFileMaterialization>()
+
+    /// Server text and file lists. A newer one replaces a delivery still waiting for main.
+    private func deliverNewestRemoteClipboard(
+        _ generation: UInt64,
+        connection: UInt64,
+        _ deliver: @escaping (IronRDPSession) -> Void
+    ) {
+        let delivery = RemoteClipboardDelivery(generation: generation, connection: connection, deliver: deliver)
+        guard remoteClipboardSlot.store(delivery) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let delivery = self.remoteClipboardSlot.take() else { return }
+            self.deliverClipboardNow(delivery.generation, connection: delivery.connection, delivery.deliver)
+        }
+    }
+
+    /// Materialization results. Each finished materialization queues one block.
     private func deliverClipboard(
         _ generation: UInt64,
         connection: UInt64,
         _ deliver: @escaping (IronRDPSession) -> Void
     ) {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.withSessionLock {
-                guard self.clipboardIsCurrent(generation, connection: connection) else { return }
-                deliver(self)
-            }
+            self?.deliverClipboardNow(generation, connection: connection, deliver)
+        }
+    }
+
+    private func deliverClipboardNow(
+        _ generation: UInt64,
+        connection: UInt64,
+        _ deliver: (IronRDPSession) -> Void
+    ) {
+        withSessionLock {
+            guard clipboardIsCurrent(generation, connection: connection) else { return }
+            deliver(self)
         }
     }
 
@@ -463,19 +503,25 @@ public final class IronRDPSession: RDPEngineSession {
         generation: UInt64,
         connection: UInt64
     ) {
+        let job = RemoteFileMaterialization(entries: entries, manager: manager, generation: generation, connection: connection)
+        guard remoteFileMaterializations.submit(job) else { return }
+        // The session stays weak while a materialization waits on range replies.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard self?.clipboardIsCurrent(generation, connection: connection) == true else { return }
-            do {
-                let urls = try manager.materialize(entries)
-                self?.deliverClipboard(generation, connection: connection) { session in
-                    session.clipboardCoordinator?.receiveRemoteFiles(urls)
-                    let fileNames = urls.map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
-                        .joined(separator: ", ")
-                    session.delegate?.rdpSession(session, didLog: "Remote files materialized to local pasteboard: \(fileNames).")
-                }
-            } catch {
-                self?.deliverClipboard(generation, connection: connection) { session in
-                    session.emitLog("Remote file materialization failed: \(error)")
+            while let job = self?.remoteFileMaterializations.next() {
+                let (generation, connection) = (job.generation, job.connection)
+                guard self?.clipboardIsCurrent(generation, connection: connection) == true else { continue }
+                do {
+                    let urls = try job.manager.materialize(job.entries)
+                    self?.deliverClipboard(generation, connection: connection) { session in
+                        session.clipboardCoordinator?.receiveRemoteFiles(urls)
+                        let fileNames = urls.map { FileNameNormalization.normalizeForTransfer($0.lastPathComponent) }
+                            .joined(separator: ", ")
+                        session.delegate?.rdpSession(session, didLog: "Remote files materialized to local pasteboard: \(fileNames).")
+                    }
+                } catch {
+                    self?.deliverClipboard(generation, connection: connection) { session in
+                        session.emitLog("Remote file materialization failed: \(error)")
+                    }
                 }
             }
         }
