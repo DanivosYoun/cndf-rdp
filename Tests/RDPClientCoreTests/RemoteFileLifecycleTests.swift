@@ -147,6 +147,32 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertEqual(recorder.count(prefix: "Remote files materialized"), 1)
     }
 
+    // S1: a list that finished after newer server text is not written and its copy is removed.
+    func testFreeRDPResultFinishedAfterNewerTextIsDiscarded() throws {
+        let server = RangeServer(answer: true)
+        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
+        let finished = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        session.materializeRemoteFileList = { manager, entries, shouldContinue in
+            let urls = try manager.materialize(entries, shouldContinue: shouldContinue)
+            finished.signal()
+            release.wait()
+            return urls
+        }
+
+        sendFreeRDPList([("a.txt", 3)], to: session)
+        XCTAssertTrue(waitUntil { finished.wait(timeout: .now()) == .success })
+        XCTAssertEqual(stagedNames, ["a.txt"])
+        Array("T".utf8).withUnsafeBufferPointer {
+            session.callbacks.remoteText?($0.baseAddress, $0.count, session.callbacks.context)
+        }
+        release.signal()
+
+        XCTAssertTrue(waitUntil { recorder.count(prefix: "Remote file materialization superseded") == 1 })
+        XCTAssertEqual(pasteboard.text, "T")
+        XCTAssertEqual(stagedNames, [])
+    }
+
     // S3 (FreeRDP): disconnect while a range waits ends it at once and leaves nothing staged.
     func testFreeRDPDisconnectEndsTheWaitingMaterialization() throws {
         for viaCallback in [false, true] {

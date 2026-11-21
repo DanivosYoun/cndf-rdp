@@ -150,6 +150,18 @@ final class RemoteDropTreeTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: outside.path), [])
     }
 
+    func testSymlinkPlantedInsideThisListsDirectoryIsNotFollowed() throws {
+        let outside = temp.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let tree = try staging.beginRemoteDrop()
+        try tree.createDirectory(path: "d")
+        try FileManager.default.createSymbolicLink(at: stagingRoot.appendingPathComponent("d/sub"), withDestinationURL: outside)
+
+        XCTAssertThrowsError(try tree.createFile(path: "d\\sub\\x.txt"))
+        XCTAssertThrowsError(try tree.createDirectory(path: "d\\sub\\inner"))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: outside.path), [])
+    }
+
     func testDuplicateFileNamesInsideOneDirectoryGetTheNextName() throws {
         let tree = try staging.beginRemoteDrop()
         let first = try write(tree, "d\\x.txt", "1")
