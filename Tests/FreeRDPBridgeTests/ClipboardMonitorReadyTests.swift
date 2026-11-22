@@ -15,6 +15,7 @@ final class ClipboardMonitorReadyTests: XCTestCase {
 
         let fixture = """
         #include <assert.h>
+        #include <stdbool.h>
         #include <stddef.h>
         #define CHANNEL_RC_OK 0
         #define CF_UNICODETEXT 13
@@ -53,6 +54,7 @@ final class ClipboardMonitorReadyTests: XCTestCase {
         #define bridge_logf(...) ((void)0)
         // 세대 상승·잠금 수명은 ClipboardResponsePairingTests 가 따로 시험한다(설계 D-G3, clip-lock D-L3).
         static void bridge_replace_remote_clipboard(RDPBridgeSession *session, unsigned *released) { (void)session; assert(released == NULL); }
+        \(try function("bridge_send_local_format_list"))
         \(try function("bridge_send_client_format_list"))
         \(try function("bridge_cliprdr_monitor_ready"))
         static UINT step, expected_count, expected_first, capability_result;
