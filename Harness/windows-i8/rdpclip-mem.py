@@ -26,7 +26,10 @@ PS_QUERY = (
     '" sess=" + $_.SessionId + '
     '" privKB=" + [math]::Round($_.PrivateMemorySize64/1KB) + '
     '" wsKB=" + [math]::Round($_.WorkingSet64/1KB) + '
-    '" handles=" + $_.HandleCount }'
+    '" handles=" + $_.HandleCount }; '
+    # No rdpclip (no session yet, or between logons) leaves $? false, which run-i8.sh ps reports
+    # as a failure; the sample is then just empty.
+    'exit 0'
 )
 
 SAMPLE_RE = re.compile(
