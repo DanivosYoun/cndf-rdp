@@ -608,6 +608,7 @@ public final class IronRDPSession: RDPEngineSession {
                 } catch {
                     // The connection's end is the usual cause, so this line does not wait for the
                     // connection, the session, or the delegate (INV-LOG1).
+                    // The main-queue delegate copy may be dropped if the view shuts down on disconnect. The file is the record (X-6).
                     let message = "Remote file materialization failed: \(RDPClipboardDiagnostics.reason(for: error))"
                     logFile?.append(message)
                     DispatchQueue.main.async { [weak self] in

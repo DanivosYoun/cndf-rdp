@@ -660,6 +660,53 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertEqual(stagedNames, [])
     }
 
+    // L-6 (IronRDP cut): shutdown in response to disconnect leaves the file log and staging
+    // cleanup independent of the main queue.
+    func testIronRDPFailureAfterDisconnectAndDelegateDetachFinishesWithoutMainQueue() throws {
+        XCTAssertTrue(Thread.isMainThread)
+        let server = RangeServer(answer: true)
+        var session: IronRDPSession?
+        let recorder: LogRecorder
+        let board: NSPasteboard
+        do {
+            let (created, createdRecorder, createdBoard) = try connectStub(server, logFileURL: logURL)
+            session = created
+            recorder = createdRecorder
+            board = createdBoard
+        }
+        defer { board.releaseGlobally() }
+        let held = holdMaterialization { session?.materializeRemoteFileList = $0 }
+
+        sendIronList([("A.txt", 3)], to: try XCTUnwrap(session))
+        let started = waitUntil { held.started.wait(timeout: .now()) == .success }
+        guard started else {
+            held.release.signal()
+            return XCTFail("Materialization did not start")
+        }
+        let callbacks = try XCTUnwrap(session?.callbacks)
+        callbacks.disconnect?(1, CNDF_IRON_DISCONNECT_SERVER, 0, callbacks.context)
+        session?.delegate = nil
+        held.release.signal()
+
+        let failure = "Remote file materialization failed:"
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while ProcessInfo.processInfo.systemUptime < deadline,
+              !stagedNames.isEmpty || logLines(containing: failure) != 1 {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        XCTAssertEqual(stagedNames, [])
+        XCTAssertEqual(logLines(containing: failure), 1)
+
+        weak var released = session
+        session = nil
+        XCTAssertNil(released)
+
+        _ = waitUntil(timeout: 0.3) { false }
+        XCTAssertEqual(recorder.count(prefix: failure), 0)
+        XCTAssertEqual(logLines(containing: "Remote file materialization"), 1)
+        XCTAssertEqual(stagedNames, [])
+    }
+
     // L-3 (FreeRDP close): the delegate is detached before the disconnect. The failure still
     // writes one line to the session log file.
     func testFreeRDPFailureAfterCloseWritesOneLogFileLine() throws {
