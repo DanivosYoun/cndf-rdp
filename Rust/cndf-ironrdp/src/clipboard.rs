@@ -188,13 +188,20 @@ pub(super) fn run_stub(connection: &Connection, commands: Receiver<ClipboardComm
 /// The largest RANGE served, 64 times the 256 KiB Windows requests.
 const MAX_FILE_RANGE_LENGTH: u32 = 16 * 1024 * 1024;
 
+/// RANGE never follows a link in any path component (O_NOFOLLOW_ANY). Product builds (Apple) must use it;
+/// the final-component O_NOFOLLOW fallback only lets Linux test builds compile, like FreeRDPBridge.c.
+#[cfg(target_vendor = "apple")]
+const RANGE_OPEN_NO_FOLLOW: libc::c_int = libc::O_NOFOLLOW_ANY;
+#[cfg(not(target_vendor = "apple"))]
+const RANGE_OPEN_NO_FOLLOW: libc::c_int = libc::O_NOFOLLOW;
+
 fn read_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
     if length > MAX_FILE_RANGE_LENGTH || offset.checked_add(u64::from(length))? > file.size {
         return None;
     }
     let mut source = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
+        .custom_flags(RANGE_OPEN_NO_FOLLOW | libc::O_NONBLOCK)
         .open(&file.path)
         .ok()?;
     if !source.metadata().ok()?.is_file() {
