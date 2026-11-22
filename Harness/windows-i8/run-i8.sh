@@ -12,8 +12,9 @@
 # result JSON, session log, Mac staging listing and probe log land in $WORK/results, the Mac
 # staging directory of that run is deleted, the session is logged off and C:\i8\dst is emptied.
 # CUT_AFTER=<s> kills the tunnel that many seconds after the harness starts (network cut) and
-# brings it back when the harness ends. teardown: remove the task and C:\i8, log off, stop the
-# tunnel and the container.
+# brings it back when the harness ends. I8_TREE=<dir under $I8_MAC_DIR> runs the harness of
+# another (measurement-only scratch) tree; CNDF_WIRELOG is passed through to it. teardown:
+# remove the task and C:\i8, log off, stop the tunnel and the container.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -150,17 +151,18 @@ run() {
   fi
   set +e
   mac "set -a; source \$HOME/${I8_MAC_DIR}/i8.env; set +a; M=\$HOME/${I8_MAC_DIR}; mkdir -p \$M/home \$M/work \$M/results \$M/tmp/${name}
-    HOME=\$M/home TMPDIR=\$M/tmp/${name}/ \$M/cndf-rdp/.build/release/rdp-engine-harness --scenario \$M/scenarios/${name}.json \
+    HOME=\$M/home TMPDIR=\$M/tmp/${name}/ CNDF_WIRELOG=${CNDF_WIRELOG:-} \$M/${I8_TREE:-cndf-rdp}/.build/release/rdp-engine-harness --scenario \$M/scenarios/${name}.json \
       --out \$M/results/${name}.json --engine ${engine} --trust-suite cndf.rdp-engine-harness.i8-${I8_BATCH} --work-dir \$M/work" \
     > "${WORK}/results/${name}.stdout.log" 2> "${WORK}/results/${name}.stderr.log"
   set -e
   # tunnel_up starts a new tunnel only when the recorded PID is gone, so a restored one is kept.
   if [[ -n "${cut_pid}" ]]; then kill "${cut_pid}" 2>/dev/null || true; wait "${cut_pid}" 2>/dev/null || true; tunnel_up; fi
   rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${I8_MAC_DIR}/results/${name}.json" "${WORK}/results/" 2>/dev/null || true
-  rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${I8_MAC_DIR}/work/${name}-1.session.log" "${WORK}/results/" 2>/dev/null || true
+  rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${I8_MAC_DIR}/work/${name}-*.session.log" "${WORK}/results/" 2>/dev/null || true
   mac "cd \$HOME/${I8_MAC_DIR}/tmp/${name} && find . -print0 | xargs -0 stat -f '%z %N' ; cd .. && rm -rf ${name}" > "${WORK}/results/${name}.staging.txt" 2>&1 || true
   printf '%s\n' 'Get-ChildItem -Recurse -Force C:\i8\dst -ErrorAction SilentlyContinue | ForEach-Object { "dst " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_.FullName.Substring(10))) + " " + $(if ($_.PSIsContainer) { "dir" } else { $_.Length }) }' | ps > "${WORK}/results/${name}.dst.txt" 2>&1 || true
-  logoff >/dev/null
+  # I8_NO_LOGOFF=1 keeps the Windows logon (and its rdpclip) for the next run (L-W7).
+  [[ -n "${I8_NO_LOGOFF:-}" ]] || logoff >/dev/null
   printf '$p = "C:\\i8\\out\\%s.log"; if (Test-Path $p) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($p)) }\nRemove-Item -Recurse -Force C:\\i8\\dst\\* -ErrorAction SilentlyContinue\n' "${name}" | ps \
     | tr -d '\r\n' | base64 -d > "${WORK}/results/${name}.probe.log" 2>/dev/null || true
   log "run ${name}: $(tail -1 "${WORK}/results/${name}.stdout.log" 2>/dev/null)"
