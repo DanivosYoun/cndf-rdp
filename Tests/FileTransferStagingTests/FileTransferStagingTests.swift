@@ -1,4 +1,4 @@
-import FileTransferStaging
+@testable import FileTransferStaging
 import XCTest
 
 final class FileTransferStagingTests: XCTestCase {
@@ -17,7 +17,7 @@ final class FileTransferStagingTests: XCTestCase {
         XCTAssertEqual(files.count, 1)
         XCTAssertEqual(files[0].fileName, "source.txt")
         XCTAssertEqual(files[0].byteCount, 5)
-        XCTAssertEqual(files[0].stagedURL, source)
+        XCTAssertEqual(try Data(contentsOf: files[0].stagedURL), Data("hello".utf8))
         XCTAssertFalse(FileManager.default.fileExists(atPath: stagingRoot.appendingPathComponent("source.txt").path))
     }
 
@@ -138,8 +138,8 @@ final class FileTransferStagingTests: XCTestCase {
         XCTAssertEqual(names.first, "R")
     }
 
-    /// T-M3: a package inside a folder yields no entry at all.
-    func testPackageInsideFolderProducesNoEntries() throws {
+    /// T-M3: packages and their contents are offered with ordinary files.
+    func testPackageInsideFolderIncludesContents() throws {
         let temp = try makeTemp()
         defer { try? FileManager.default.removeItem(at: temp) }
         let root = temp.appendingPathComponent("P", isDirectory: true)
@@ -149,7 +149,132 @@ final class FileTransferStagingTests: XCTestCase {
 
         let files = try FileTransferStaging(rootURL: temp.appendingPathComponent("staging")).stageLocalFilesForRemotePaste([root])
 
-        XCTAssertEqual(files.map(\.fileName), ["P"])
+        XCTAssertEqual(files.map(\.fileName), ["P", "P\\X.app", "P\\X.app\\Contents", "P\\X.app\\Contents\\Info.plist"])
+    }
+
+    func testMixedPackageAndLinksRetainsOrdinaryFiles() throws {
+        let temp = try makeTemp()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fm = FileManager.default
+        let root = temp.appendingPathComponent("P", isDirectory: true)
+        let packages = ["X.app/Contents", "X.app/Contents/Helper.app", "Note.rtfd",
+                        "Plugin.bundle", "Project.xcodeproj", ".bundle"]
+        for package in packages {
+            let folder = root.appendingPathComponent(package, isDirectory: true)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: folder.appendingPathComponent("data"))
+        }
+        let empty = temp.appendingPathComponent("Empty.app", isDirectory: true)
+        try fm.createDirectory(at: empty, withIntermediateDirectories: false)
+        let plain = temp.appendingPathComponent("plain")
+        try Data([9]).write(to: plain)
+        let rootLink = temp.appendingPathComponent("root-link")
+        try fm.createSymbolicLink(at: rootLink, withDestinationURL: root)
+        let bin = root.appendingPathComponent(".bin", isDirectory: true)
+        try fm.createDirectory(at: bin, withIntermediateDirectories: false)
+        try fm.createSymbolicLink(at: bin.appendingPathComponent("tool"), withDestinationURL: plain)
+        try fm.createSymbolicLink(at: root.appendingPathComponent("broken"), withDestinationURL: temp.appendingPathComponent("missing"))
+        try fm.createSymbolicLink(at: root.appendingPathComponent("package-link"),
+                                  withDestinationURL: root.appendingPathComponent("X.app"))
+
+        let staging = FileTransferStaging(rootURL: temp.appendingPathComponent("staging"))
+        let selection = [plain, root, empty, rootLink]
+        var expected: [String: UInt64] = ["plain": 1, "P": 0, "P\\.bin": 0, "P\\X.app": 0, "Empty.app": 0]
+        for package in packages {
+            let name = "P\\" + package.replacingOccurrences(of: "/", with: "\\")
+            expected[name] = 0
+            expected[name + "\\data"] = 3
+        }
+        for urls in [selection, Array(selection.reversed())] {
+            let result = try staging.stageLocalSelection(urls)
+            XCTAssertEqual(result.omittedCount, 4)
+            XCTAssertEqual(Set(result.files.map(\.fileName)), Set(expected.keys))
+            for file in result.files {
+                XCTAssertEqual(file.byteCount, expected[file.fileName])
+            }
+        }
+    }
+
+    func testSelectionThroughParentAliasesUsesPhysicalSourcePath() throws {
+        #if os(macOS)
+        let fm = FileManager.default
+        let temp = try makeTemp()
+        defer { try? fm.removeItem(at: temp) }
+        let physicalParent = temp.resolvingSymlinksInPath()
+        let source = physicalParent.appendingPathComponent("file")
+        try Data([1]).write(to: source)
+        let link = temp.appendingPathComponent("parent-link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: physicalParent)
+        let volume = try XCTUnwrap(fm.contentsOfDirectory(at: URL(fileURLWithPath: "/Volumes"), includingPropertiesForKeys: nil)
+            .first { (try? fm.destinationOfSymbolicLink(atPath: $0.path)) == "/" })
+        let parents = [link, URL(fileURLWithPath: "/tmp"), fm.temporaryDirectory,
+                       URL(fileURLWithPath: volume.path + temp.path, isDirectory: true)]
+        for parent in parents {
+            let work = parent.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try fm.createDirectory(at: work, withIntermediateDirectories: false)
+            defer { try? fm.removeItem(at: work) }
+            let selected = work.appendingPathComponent("file")
+            try Data([1]).write(to: selected)
+            let files = try FileTransferStaging(rootURL: temp.appendingPathComponent("staging"))
+                .stageLocalFilesForRemotePaste([selected])
+            let staged = try XCTUnwrap(files.first)
+            XCTAssertEqual(staged.sourceURL.lastPathComponent, "file")
+            let fd = open(staged.sourceURL.path, O_RDONLY | O_NOFOLLOW_ANY)
+            XCTAssertGreaterThanOrEqual(fd, 0, selected.path)
+            if fd >= 0 { close(fd) }
+        }
+        #endif
+    }
+
+    func testUnrepresentableNamesOmitOnlyTheirSubtreeAndKeepFirstCollision() throws {
+        let temp = try makeTemp()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fm = FileManager.default
+        let root = temp.appendingPathComponent(String(repeating: "a", count: 180), isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: false)
+        let fit = String(repeating: "한", count: 78)
+        let over = fit + "한"
+        try Data([1]).write(to: root.appendingPathComponent(fit))
+        let tooLong = root.appendingPathComponent(over, isDirectory: true)
+        try fm.createDirectory(at: tooLong, withIntermediateDirectories: false)
+        try Data([2]).write(to: tooLong.appendingPathComponent("child"))
+        let first = temp.appendingPathComponent("a\\b")
+        let second = temp.appendingPathComponent("a_b", isDirectory: true)
+        try Data([3]).write(to: first)
+        try fm.createDirectory(at: second, withIntermediateDirectories: false)
+        try Data([4]).write(to: second.appendingPathComponent("child"))
+        let drive = temp.appendingPathComponent("C:invalid")
+        try Data([5]).write(to: drive)
+
+        let result = try FileTransferStaging(rootURL: temp.appendingPathComponent("staging"))
+            .stageLocalSelection([root, first, second, drive])
+        XCTAssertEqual(result.omittedCount, 3)
+        XCTAssertEqual(result.files.map(\.fileName), [root.lastPathComponent, root.lastPathComponent + "\\" + fit, "a_b"])
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(result.files.last).sourceURL), Data([3]))
+    }
+
+    func testDirectoryFailuresRejectTheWholeSelection() throws {
+        let temp = try makeTemp()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let ordinary = temp.appendingPathComponent("ordinary")
+        try Data([1]).write(to: ordinary)
+        let directory = temp.appendingPathComponent("folder")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let outside = temp.appendingPathComponent("outside")
+        try Data([2]).write(to: outside)
+
+        let staging = FileTransferStaging(rootURL: temp.appendingPathComponent("staging"))
+        XCTAssertThrowsError(try staging.stageLocalSelection([ordinary, directory]) { _, _, _ in nil })
+        XCTAssertThrowsError(try staging.stageLocalSelection([ordinary, directory]) { url, _, reportError in
+            _ = reportError(url, CocoaError(.fileReadNoPermission))
+            return StagingTestEnumerator(nil)
+        })
+        XCTAssertThrowsError(try staging.stageLocalSelection([ordinary, directory]) { physicalRoot, _, _ in
+            StagingTestEnumerator(physicalRoot.appendingPathComponent("missing"))
+        })
+        XCTAssertThrowsError(try staging.stageLocalSelection([ordinary, directory]) { physicalRoot, _, _ in
+            StagingTestEnumerator(physicalRoot.deletingLastPathComponent().appendingPathComponent(outside.lastPathComponent))
+        })
     }
 
     /// T-M4: only folders end in `\` on the wire; a macOS file named `a\` becomes `a_`.
@@ -227,5 +352,19 @@ final class FileTransferStagingTests: XCTestCase {
                 localURL: URL(fileURLWithPath: "/tmp/staged/a.txt")
             )
         ])
+    }
+}
+
+private final class StagingTestEnumerator: FileManager.DirectoryEnumerator {
+    private var url: URL?
+
+    init(_ url: URL?) {
+        self.url = url
+        super.init()
+    }
+
+    override func nextObject() -> Any? {
+        defer { url = nil }
+        return url
     }
 }

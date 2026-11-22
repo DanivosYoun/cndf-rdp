@@ -1,4 +1,5 @@
 import AppKit
+import ClipboardBridge
 import FileTransferStaging
 import Foundation
 import IronRDPBridge
@@ -393,6 +394,34 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(session.statistics.remoteFileBytesReceived, UInt64(data.count))
     }
 
+    func testFileOfferOmissionsDoNotReachNativeSink() throws {
+        let fm = FileManager.default
+        let temp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: temp) }
+        let file = temp.appendingPathComponent("fixture")
+        try Data([1]).write(to: file)
+        let link = temp.appendingPathComponent("alias")
+        try fm.createSymbolicLink(at: link, withDestinationURL: file)
+        let missing = temp.appendingPathComponent("missing")
+        let staging = FileTransferStaging(rootURL: temp.appendingPathComponent("staging"))
+
+        var attempts = 0
+        let iron = IronRDPClipboardSink(staging: staging) { _ in attempts += 1 }
+        let onlyOmitted = ClipboardFileOffer(providedCount: 0, providedBytes: 0, omittedCount: 1)
+        XCTAssertEqual(try iron.sendLocalFiles([link]), onlyOmitted)
+        XCTAssertThrowsError(try iron.sendLocalFiles([file, missing]))
+        XCTAssertEqual(attempts, 0)
+        XCTAssertEqual(try iron.sendLocalFiles([file, link]),
+                       ClipboardFileOffer(providedCount: 1, providedBytes: 1, omittedCount: 1))
+        XCTAssertEqual(attempts, 1)
+
+        // A native FreeRDP offer on this disconnected session would throw.
+        let free = try RDPSession(staging: staging)
+        XCTAssertEqual(try free.sendLocalFiles([link]), onlyOmitted)
+        XCTAssertThrowsError(try free.sendLocalFiles([file, link]))
+    }
+
     /// T-M5: an empty folder offered through the stub (which echoes names) arrives as an empty directory.
     func testClipboardStubRoundTripsEmptyFolder() throws {
         try skipUnlessStub()
@@ -570,8 +599,10 @@ final class IronRDPSessionTests: XCTestCase {
         )
         XCTAssertTrue(waitUntil { session.isConnected })
 
-        // Offer 3 files so the stub answers range requests for indices 0, 1, 2 with `seedPayload`.
-        try session.sendLocalFiles([seedFile, seedFile, seedFile])
+        // Offer distinct names so the stub can answer ranges for indices 0, 1, and 2.
+        let additionalSeeds = [tempRoot.appendingPathComponent("seed-2.txt"), tempRoot.appendingPathComponent("seed-3.txt")]
+        for seed in additionalSeeds { try seedPayload.write(to: seed) }
+        try session.sendLocalFiles([seedFile] + additionalSeeds)
         XCTAssertTrue(waitUntil {
             (board.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?.count == 3
         })

@@ -4,7 +4,8 @@ import FileTransferStaging
 
 public protocol RemoteClipboardSink: AnyObject {
     func sendLocalText(_ text: String) throws
-    func sendLocalFiles(_ urls: [URL]) throws
+    @discardableResult
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer
 }
 
 public final class FreeRDPClipboardBridge: RemoteClipboardSink {
@@ -23,12 +24,17 @@ public final class FreeRDPClipboardBridge: RemoteClipboardSink {
         try throwIfNeeded(status)
     }
 
-    public func sendLocalFiles(_ urls: [URL]) throws {
-        let stagedFiles = try staging.stageLocalFilesForRemotePaste(urls)
+    @discardableResult
+    public func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer {
+        let selection = try staging.stageLocalSelection(urls)
+        let stagedFiles = selection.files
+        let result = ClipboardFileOffer(staged: selection)
+        guard result.didProvide else { return result }
         let status = try stagedFiles.withBridgeLocalFiles { files in
             rdp_bridge_send_local_files(session, files.baseAddress, files.count)
         }
         try throwIfNeeded(status)
+        return result
     }
 
     private func throwIfNeeded(_ status: RDPBridgeStatus) throws {

@@ -36,6 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
 
         let clientView = RDPClientView(frame: NSRect(x: 0, y: 0, width: root.bounds.width, height: root.bounds.height - connectionBarHeight))
         clientView.autoresizingMask = [.width, .height]
+        clientView.onClipboardItemsOmitted = { [weak connectionBar] count in
+            connectionBar?.setStatus(RDPClipboardDiagnostics.omissionMessage(count: count))
+        }
 
         root.addSubview(clientView)
         root.addSubview(connectionBar)
@@ -82,9 +85,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
             view.setStatus("Connecting")
             timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 do {
-                    try self?.session?.pollLocalClipboard()
+                    if let result = try self?.session?.pollLocalClipboard(), result.omittedCount > 0 {
+                        self?.connectionBar?.setStatus(RDPClipboardDiagnostics.omissionMessage(count: result.omittedCount))
+                    }
                 } catch {
-                    NSLog("[RDP] local clipboard poll failed: \(String(describing: error))")
+                    NSLog("[RDP] local clipboard poll failed: \(RDPClipboardDiagnostics.reason(for: error))")
                 }
             }
         } catch {
@@ -192,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
                 try self.sendShortcut(session: session, modifiers: [RDPKeyboardMapper.leftControl], key: 0x2E)
                 session.delegate?.rdpSession(session, didLog: "Explorer file copyback autotest sent Ctrl+C.")
             } catch {
-                session.delegate?.rdpSession(session, didLog: "Explorer file paste autotest failed: \(error)")
+                session.delegate?.rdpSession(session, didLog: "Explorer file paste autotest failed: \(RDPClipboardDiagnostics.reason(for: error))")
             }
         }
     }
@@ -229,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
                 try self.sendShortcut(session: session, modifiers: [RDPKeyboardMapper.leftControl], key: 0x2F)
                 session.delegate?.rdpSession(session, didLog: "Explorer folder paste autotest opened Desktop and sent Ctrl+V.")
             } catch {
-                session.delegate?.rdpSession(session, didLog: "Explorer folder paste autotest failed: \(error)")
+                session.delegate?.rdpSession(session, didLog: "Explorer folder paste autotest failed: \(RDPClipboardDiagnostics.reason(for: error))")
             }
         }
     }

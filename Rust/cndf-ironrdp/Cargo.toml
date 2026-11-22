@@ -8,7 +8,7 @@ crate-type = ["staticlib"]
 
 [features]
 default = ["engine"]
-engine = ["dep:ironrdp-client", "dep:ironrdp-cliprdr", "dep:ironrdp-core", "dep:ironrdp-cfg", "dep:ironrdp-rdpdr", "dep:ironrdp-rdpdr-native", "dep:ironrdp-svc", "dep:libc", "dep:ironrdp-connector", "dep:ironrdp-pdu", "dep:ironrdp-tls", "dep:tokio", "dep:tracing", "dep:rustls", "dep:smallvec", "dep:tracing-subscriber"]
+engine = ["dep:ironrdp-client", "dep:ironrdp-cliprdr", "dep:ironrdp-core", "dep:ironrdp-cfg", "dep:ironrdp-rdpdr", "dep:ironrdp-rdpdr-native", "dep:ironrdp-svc", "dep:ironrdp-connector", "dep:ironrdp-pdu", "dep:ironrdp-tls", "dep:tokio", "dep:tracing", "dep:rustls", "dep:smallvec", "dep:tracing-subscriber"]
 stub = []
 # Legacy TLS 1.0-1.1 through vendored OpenSSL 3 (design D-L1). Off by default.
 legacy-tls = ["engine", "dep:openssl", "dep:tokio-openssl"]
@@ -18,7 +18,7 @@ ironrdp-cfg = { path = "../../Vendor/IronRDP/src/crates/ironrdp-cfg", optional =
 ironrdp-rdpdr = { path = "../../Vendor/IronRDP/src/crates/ironrdp-rdpdr", optional = true }
 ironrdp-rdpdr-native = { path = "../../Vendor/IronRDP/src/crates/ironrdp-rdpdr-native", optional = true }
 ironrdp-svc = { path = "../../Vendor/IronRDP/src/crates/ironrdp-svc", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 ironrdp-cliprdr = { path = "../../Vendor/IronRDP/src/crates/ironrdp-cliprdr", optional = true }
 ironrdp-core = { path = "../../Vendor/IronRDP/src/crates/ironrdp-core", optional = true }
 zeroize = "1.8"

@@ -9,6 +9,11 @@ public enum FileTransferStagingError: Error, Equatable {
     case refusedToRemove(URL)
 }
 
+public struct LocalFileStagingResult {
+    public let files: [StagedFile]
+    public let omittedCount: Int
+}
+
 /// A new, empty file created exclusively inside the staging root for a remote clipboard file.
 public struct RemoteDropFile {
     public let url: URL
@@ -45,19 +50,84 @@ public final class FileTransferStaging {
     }
 
     public func stageLocalFilesForRemotePaste(_ urls: [URL]) throws -> [StagedFile] {
-        try prepare()
+        try stageLocalSelection(urls).files
+    }
 
-        return try urls.flatMap { sourceURL in
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory) else {
-                throw FileTransferStagingError.sourceDoesNotExist(sourceURL)
-            }
-            if isDirectory.boolValue {
-                return try stageLocalDirectoryForRemotePaste(sourceURL)
-            }
-
-            return [try stageLocalFileForRemotePaste(sourceURL, fileName: Self.sanitizeLocalTransferComponent(sourceURL.lastPathComponent))]
+    public func stageLocalSelection(_ urls: [URL]) throws -> LocalFileStagingResult {
+        try stageLocalSelection(urls) { root, keys, reportError in
+            fileManager.enumerator(at: root, includingPropertiesForKeys: keys, options: [], errorHandler: reportError)
         }
+    }
+
+    func stageLocalSelection(
+        _ urls: [URL],
+        enumerate: (URL, [URLResourceKey], @escaping (URL, Error) -> Bool) -> FileManager.DirectoryEnumerator?
+    ) throws -> LocalFileStagingResult {
+        try prepare()
+        var files: [StagedFile] = []
+        var names: Set<String> = []
+        var omitted = 0
+        let keys: Set<URLResourceKey> = [.isSymbolicLinkKey, .isDirectoryKey, .isRegularFileKey, .fileSizeKey]
+
+        func append(_ url: URL, name: String, values: URLResourceValues) throws -> Bool {
+            guard let isLink = values.isSymbolicLink, let isDirectory = values.isDirectory,
+                  let isRegularFile = values.isRegularFile else {
+                throw FileTransferStagingError.unableToReadFileSize(url)
+            }
+            guard !isLink, isDirectory || isRegularFile, !name.isEmpty, name.utf16.count <= 259,
+                  !name.hasPrefix("/"), name.utf8.dropFirst().first != 0x3A,
+                  names.insert(name).inserted else {
+                omitted += 1
+                return false
+            }
+            let size = isDirectory ? 0 : values.fileSize
+            guard let size, size >= 0 else {
+                throw FileTransferStagingError.unableToReadFileSize(url)
+            }
+            files.append(StagedFile(sourceURL: url, stagedURL: url, fileName: name,
+                                    byteCount: UInt64(size), isDirectory: isDirectory))
+            return isDirectory
+        }
+
+        for selected in urls {
+            // Resolve only the parent. The selected item itself must still be classified.
+            let parent = selected.deletingLastPathComponent()
+            guard let physicalPath = parent.withUnsafeFileSystemRepresentation({ path in
+                path.flatMap { realpath($0, nil) }
+            }) else {
+                throw FileTransferStagingError.sourceDoesNotExist(selected)
+            }
+            let root = URL(fileURLWithPath: String(cString: physicalPath), isDirectory: true)
+                .appendingPathComponent(selected.lastPathComponent)
+            free(physicalPath)
+            let rootName = Self.sanitizeLocalTransferComponent(selected.lastPathComponent)
+            let first = files.count
+            guard try append(root, name: rootName, values: root.resourceValues(forKeys: keys)) else { continue }
+
+            var enumerationError: Error?
+            guard let enumerator = enumerate(root, Array(keys), { _, error in
+                enumerationError = error
+                return false
+            }) else {
+                throw FileTransferStagingError.sourceDoesNotExist(root)
+            }
+            let prefix = root.pathComponents
+            for case let child as URL in enumerator {
+                let components = child.pathComponents
+                guard components.count > prefix.count, components.starts(with: prefix) else {
+                    throw FileTransferStagingError.unsafeRemoteFileName(rootName)
+                }
+                let name = ([rootName] + components.dropFirst(prefix.count).map(Self.sanitizeLocalTransferComponent))
+                    .joined(separator: "\\")
+                let values = try child.resourceValues(forKeys: keys)
+                if try !append(child, name: name, values: values), values.isDirectory == true {
+                    enumerator.skipDescendants()
+                }
+            }
+            if let enumerationError { throw enumerationError }
+            files.replaceSubrange(first..., with: files[first...].sorted { $0.fileName < $1.fileName })
+        }
+        return LocalFileStagingResult(files: files, omittedCount: omitted)
     }
 
     /// Creates a new file for a remote (server-supplied) file name directly under `rootURL`.
@@ -136,70 +206,8 @@ public final class FileTransferStaging {
         return base + tail
     }
 
-    private func stageLocalDirectoryForRemotePaste(_ directoryURL: URL) throws -> [StagedFile] {
-        guard let enumerator = fileManager.enumerator(
-            at: directoryURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey],
-            options: [.skipsPackageDescendants]
-        ) else {
-            return []
-        }
-
-        let rootName = Self.sanitizeLocalTransferComponent(directoryURL.lastPathComponent)
-        // Every folder, the root included, is an entry so empty folders reach the server (design D-1).
-        var files: [StagedFile] = [directoryEntry(directoryURL, fileName: rootName)]
-        for case let fileURL as URL in enumerator {
-            let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
-            if values.isDirectory == true {
-                // Packages are not descended into, so they would arrive as empty shells; skip them.
-                if values.isPackage != true {
-                    let relativePath = relativeTransferPath(fileURL: fileURL, rootURL: directoryURL, rootName: rootName)
-                    files.append(directoryEntry(fileURL, fileName: relativePath))
-                }
-                continue
-            }
-            let relativePath = relativeTransferPath(fileURL: fileURL, rootURL: directoryURL, rootName: rootName)
-            files.append(try stageLocalFileForRemotePaste(fileURL, fileName: relativePath))
-        }
-        // A prefix sorts first, so every parent precedes its descendants (INV-D1).
-        return files.sorted { $0.fileName < $1.fileName }
-    }
-
-    private func directoryEntry(_ url: URL, fileName: String) -> StagedFile {
-        StagedFile(sourceURL: url, stagedURL: url, fileName: normalizedTransferPath(fileName), byteCount: 0, isDirectory: true)
-    }
-
-    private func stageLocalFileForRemotePaste(_ sourceURL: URL, fileName: String) throws -> StagedFile {
-        let values = try sourceURL.resourceValues(forKeys: [.fileSizeKey])
-        guard let size = values.fileSize else {
-            throw FileTransferStagingError.unableToReadFileSize(sourceURL)
-        }
-
-        return StagedFile(
-            sourceURL: sourceURL,
-            stagedURL: sourceURL,
-            fileName: normalizedTransferPath(fileName),
-            byteCount: UInt64(size)
-        )
-    }
-
     private static func sanitizeLocalTransferComponent(_ component: String) -> String {
         FileNameNormalization.normalizeForTransfer(component).replacingOccurrences(of: "\\", with: "_")
-    }
-
-    private func relativeTransferPath(fileURL: URL, rootURL: URL, rootName: String) -> String {
-        let rootPath = rootURL.standardizedFileURL.path
-        let filePath = fileURL.standardizedFileURL.path
-        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        let relative = filePath.hasPrefix(prefix) ? String(filePath.dropFirst(prefix.count)) : fileURL.lastPathComponent
-        return ([rootName] + relative.split(separator: "/").map { Self.sanitizeLocalTransferComponent(String($0)) }).joined(separator: "\\")
-    }
-
-    private func normalizedTransferPath(_ path: String) -> String {
-        path
-            .split(separator: "\\", omittingEmptySubsequences: false)
-            .map { FileNameNormalization.normalizeForTransfer(String($0)) }
-            .joined(separator: "\\")
     }
 
     /// Starts materializing one remote file list. Folder entries become directories (design D1).

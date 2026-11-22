@@ -22,8 +22,12 @@ final class IronRDPClipboardSink: RemoteClipboardSink {
         }
     }
 
-    func sendLocalFiles(_ urls: [URL]) throws {
-        let stagedFiles = try staging.stageLocalFilesForRemotePaste(urls)
+    @discardableResult
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer {
+        let selection = try staging.stageLocalSelection(urls)
+        let stagedFiles = selection.files
+        let result = ClipboardFileOffer(staged: selection)
+        guard result.didProvide else { return result }
         let paths = stagedFiles.map { strdup($0.stagedURL.path) }
         let names = stagedFiles.map { strdup($0.wireName) }
         defer {
@@ -39,5 +43,6 @@ final class IronRDPClipboardSink: RemoteClipboardSink {
                 cndf_iron_clipboard_offer_files(session, generation, buffer.baseAddress, buffer.count)
             }
         }
+        return result
     }
 }
