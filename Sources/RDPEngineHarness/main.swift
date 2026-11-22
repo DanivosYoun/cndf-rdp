@@ -149,6 +149,13 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
         fputs("\(wallStamp()) [RDP] \(message)\n", stderr)
     }
 
+    /// staging-package: the Finder copy and the drop report omitted links / unrepresentable
+    /// names here (the app shows its non-modal notice from the same callback).
+    func rdpConnectionView(_ view: RDPConnectionView, didOmitClipboardItems count: Int) {
+        guard noteCallback() else { return }
+        fputs("\(wallStamp()) [OMIT] count=\(count)\n", stderr)
+    }
+
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {
         guard noteCallback() else { return }
         lock.lock()
@@ -743,6 +750,19 @@ private func runIteration(
             do { try view.pollLocalClipboard() } catch { ok = false }
             result.steps.append("\(step.op):\(ok ? "ok" : "failed")")
             aborted = !ok
+        case "dropLocalFiles":
+            // staging-package: the drop path (performDragOperation -> sendLocalFiles -> automatic
+            // Ctrl+V), fed by a private drag pasteboard so the general pasteboard is not touched.
+            guard let paths = step.paths, !paths.isEmpty else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            let drag = HarnessDraggingInfo(urls: paths.map { URL(fileURLWithPath: $0) })
+            let provided = view.clientView.performDragOperation(drag)
+            drag.pasteboard.releaseGlobally()
+            fputs("\(wallStamp()) [DROP] provided=\(provided) n=\(paths.count)\n", stderr)
+            result.steps.append("\(step.op):\(provided ? "ok" : "notProvided")")
         case "clipboardExpectLocalFiles":
             guard let pasteboard else {
                 result.steps.append("\(step.op):failed")
@@ -1105,4 +1125,37 @@ do {
 } catch {
     fputs("rdp-engine-harness failed: \(error)\n", stderr)
     exit(2)
+}
+
+/// A drag carrying file URLs on its own pasteboard, for the drop path (staging-package).
+private final class HarnessDraggingInfo: NSObject, NSDraggingInfo {
+    let pasteboard = NSPasteboard(name: NSPasteboard.Name("cndf.harness.drag.\(UUID().uuidString)"))
+
+    init(urls: [URL]) {
+        super.init()
+        pasteboard.clearContents()
+        pasteboard.writeObjects(urls.map { $0 as NSURL })
+    }
+
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggingLocation: NSPoint { .zero }
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+    var draggingPasteboard: NSPasteboard { pasteboard }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    var draggingFormation: NSDraggingFormation { get { .default } set {} }
+    var animatesToDestination: Bool { get { false } set {} }
+    var numberOfValidItemsForDrop: Int { get { 1 } set {} }
+    func enumerateDraggingItems(
+        options enumOpts: NSDraggingItemEnumerationOptions = [],
+        for view: NSView?,
+        classes classArray: [AnyClass],
+        searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:],
+        using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void
+    ) {}
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func resetSpringLoading() {}
 }

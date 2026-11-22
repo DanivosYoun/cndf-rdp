@@ -10,6 +10,13 @@
 #                             Ctrl+V, then wait until the tree is stable for 8 s, log it with
 #                             sizes and SHA-256, and copy "I8DONE <leaf> n=<entries> bytes=<sum>"
 #   sound <seconds>           play a 440 Hz tone that long
+#   droppaste <leaf>          like paste, but the probe never sends Ctrl+V itself: it focuses the
+#                             empty file list as soon as Explorer is up and waits for the paste the
+#                             Mac drop path sends (staging-package). No files 60 s after focus ends
+#                             the wait with "I8DONE <leaf> n=0 bytes=0".
+#   pastecancel <leaf> <ms>   like paste, and <ms> after Ctrl+V presses Esc on Explorer's copy
+#                             progress window (OperationStatusWindow); the wait ends 15 s after
+#                             the cancel once the tree is still for 5 s (staging-package cancel).
 # int-11 verbs (one-shot WinForms timers, so the owner window keeps pumping while waiting):
 #   mix <k> <delayMs> [<dir> <prefix>]  drop list C:\i8\src\gw1A\f00..f39.bin, then after delayMs
 #                             the same names from C:\i8\src\gw1B (same sizes, other bytes), or
@@ -86,6 +93,8 @@ public static class I8Probe {
     static long stateSince, lastChange;
     static string lastSignature;
     static bool pasteRetried;
+    static bool pasteByDrop;
+    static long pasteCancelAfter, pasteCancelAt;
     static SoundPlayer player;
     static Process x7Notepad;
     static IntPtr x7Explorer;
@@ -214,7 +223,21 @@ public static class I8Probe {
             pasteDir = @"C:\i8\dst\" + arg;
             Directory.CreateDirectory(pasteDir);
             Process.Start("explorer.exe", pasteDir);
-            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = false;
+            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = false; pasteByDrop = false; pasteCancelAfter = 0; pasteCancelAt = 0;
+        } else if (verb == "pastecancel") {
+            string[] a = arg.Split(' ');
+            pasteLeaf = a[0];
+            pasteDir = @"C:\i8\dst\" + a[0];
+            Directory.CreateDirectory(pasteDir);
+            Process.Start("explorer.exe", pasteDir);
+            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = true; pasteByDrop = false;
+            pasteCancelAfter = long.Parse(a[1]); pasteCancelAt = 0;
+        } else if (verb == "droppaste") {
+            pasteLeaf = arg;
+            pasteDir = @"C:\i8\dst\" + arg;
+            Directory.CreateDirectory(pasteDir);
+            Process.Start("explorer.exe", pasteDir);
+            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = true; pasteByDrop = true; pasteCancelAfter = 0; pasteCancelAt = 0;
         } else if (verb == "settext2") {
             string[] a = arg.Split(' ');
             string second = UnB64(a[2]);
@@ -368,7 +391,18 @@ public static class I8Probe {
         }
         if (pasteState == 1) {
             pasteWindow = FindWindow("CabinetWClass", pasteLeaf);
-            if (pasteWindow != IntPtr.Zero) { ShowWindow(pasteWindow, 3); Log("explorer ready"); pasteState = 2; stateSince = now; }
+            if (pasteWindow != IntPtr.Zero && pasteByDrop) {
+                ShowWindow(pasteWindow, 3); System.Threading.Thread.Sleep(500);
+                RECT r;
+                if (GetWindowRect(pasteWindow, out r)) {
+                    SetForegroundWindow(pasteWindow);
+                    System.Threading.Thread.Sleep(300);
+                    SetCursorPos(r.left + (r.right - r.left) * 3 / 4, r.top + (r.bottom - r.top) * 3 / 4);
+                    mouse_event(2, 0, 0, 0, IntPtr.Zero); mouse_event(4, 0, 0, 0, IntPtr.Zero);
+                }
+                Log("explorer focused for drop");
+                pasteState = 4; stateSince = now; lastChange = now; lastSignature = "";
+            } else if (pasteWindow != IntPtr.Zero) { ShowWindow(pasteWindow, 3); Log("explorer ready"); pasteState = 2; stateSince = now; }
             else if (now - stateSince > 15000) { Log("explorer missing"); pasteState = 0; }
         } else if (pasteState == 2 && now - stateSince > 120000) {
             Log("paste no files"); pasteState = 0;
@@ -393,6 +427,28 @@ public static class I8Probe {
             if (sig != lastSignature) { lastSignature = sig; lastChange = now; }
             // Ctrl+V sometimes does not reach Explorer (nothing appears): send it once more.
             if (count == 0 && !pasteRetried && now - stateSince > 20000) { pasteRetried = true; Log("paste retry"); pasteState = 3; stateSince = now - 1500; return; }
+            if (pasteCancelAfter > 0 && pasteCancelAt == 0 && now - stateSince > pasteCancelAfter) {
+                IntPtr op = FindWindow("OperationStatusWindow", null);
+                if (op != IntPtr.Zero) {
+                    SetForegroundWindow(op); System.Threading.Thread.Sleep(300);
+                    keybd_event(0x1B, 0x01, 0, IntPtr.Zero); keybd_event(0x1B, 0x01, 2, IntPtr.Zero);
+                    Log("cancel sent n=" + count + " bytes=" + bytes);
+                } else Log("cancel no progress window n=" + count + " bytes=" + bytes);
+                pasteCancelAt = now;
+            }
+            if (pasteCancelAt > 0 && now - pasteCancelAt > 15000 && now - lastChange > 5000) {
+                string ct = Tree(pasteDir, true, out count, out bytes);
+                Log("dialogs " + Dialogs());
+                Log("tree " + pasteLeaf + " n=" + count + " bytes=" + bytes + ct);
+                Copy("I8DONE " + pasteLeaf + " n=" + count + " bytes=" + bytes);
+                pasteState = 0; return;
+            }
+            if (count == 0 && pasteByDrop && now - stateSince > 60000) {
+                Log("dialogs " + Dialogs());
+                Log("tree " + pasteLeaf + " n=0 bytes=0 drop-no-files");
+                Copy("I8DONE " + pasteLeaf + " n=0 bytes=0");
+                pasteState = 0; return;
+            }
             bool hasDialog = Dialogs() != "none";
             if ((count > 0 && now - lastChange > 8000) || (hasDialog && now - stateSince > 10000 && now - lastChange > 8000) || now - stateSince > 900000) {
                 string tree = Tree(pasteDir, true, out count, out bytes);
