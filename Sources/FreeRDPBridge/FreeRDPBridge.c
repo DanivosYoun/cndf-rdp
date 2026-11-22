@@ -932,7 +932,9 @@ static UINT bridge_cliprdr_server_file_contents_request(
             return bridge_send_file_contents_failure(cliprdr, request);
         }
         // 링크(최종·중간 요소)는 따라가지 않고, 연 것이 일반 파일일 때만 읽는다.
-        const int fd = open(path, O_RDONLY | O_CLOEXEC | RDP_BRIDGE_O_NOFOLLOW);
+        // O_NONBLOCK: 제공 뒤 FIFO·장치로 바뀐 경로에서 open 이 채널 스레드를 멈추지 않고 S_ISREG 검사로 FAIL 하게 한다.
+        // 일반 파일의 pread 에는 영향이 없다.
+        const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | RDP_BRIDGE_O_NOFOLLOW);
         const int open_errno = errno;
         free(path);
         path = NULL;

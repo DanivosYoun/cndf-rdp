@@ -63,6 +63,7 @@ final class ClipboardResponsePairingTests: XCTestCase {
     func testRG2ConsecutiveWindowsSizedRangesReadTheWholeFile() throws { try run("rg2") }
     func testRG3OffsetsBelowAndAbove4GiBAndNoNegativeFileOffset() throws { try run("rg3") }
     func testRG4LinksAndDirectoriesAnswerFail() throws { try run("rg4") }
+    func testRG5FifoAndDeviceAnswerFailWithoutBlockingTheChannel() throws { try run("rg5") }
 
     private func run(_ scenario: String, extraFlags: [String] = [], file: StaticString = #filePath, line: UInt = #line) throws {
         let root = URL(fileURLWithPath: #filePath)
@@ -1134,6 +1135,26 @@ final class ClipboardResponsePairingTests: XCTestCase {
         #if defined(__APPLE__)
                 assert(RDP_BRIDGE_O_NOFOLLOW == O_NOFOLLOW_ANY);
         #endif
+                return 0;
+            }
+            if (!strcmp(s, "rg5")) {
+                // 제공 뒤 일반 파일이 FIFO 로 바뀌거나 장치를 가리키면 open 이 멈추지 않고(O_NONBLOCK) S_ISREG 로 FAIL 이다.
+                // 쓰는 쪽이 없는 FIFO 를 O_NONBLOCK 없이 열면 영원히 멈추므로 알람으로 끊어 실패로 만든다.
+                const char *scratch = getenv("PAIRING_SCRATCH");
+                char plain[512], fifo[512];
+                write_n(plain, "plain.bin", "PLAIN", 5);
+                snprintf(fifo, sizeof fifo, "%s/swapped.bin", scratch);
+                assert(mkfifo(fifo, 0600) == 0);
+                RDPBridgeLocalFile files[] = { { plain, "plain.bin", 5 }, { fifo, "swapped.bin", 5 }, { "/dev/null", "null.bin", 5 } };
+                session.local_files = files;
+                session.local_file_count = 3;
+                alarm(5);
+                assert(file_range(1, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                assert(file_range(2, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                alarm(0);
+                // 대조군: 일반 파일 pread 는 그대로다.
+                assert(file_range(0, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "PLAIN", 5);
+                assert(file_range(0, 2, 2) == 1); expect_range(CB_RESPONSE_OK, "AI", 2);
                 return 0;
             }
             if (!strcmp(s, "clrace")) {
