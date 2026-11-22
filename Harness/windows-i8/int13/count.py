@@ -13,11 +13,8 @@ for l in open(shaf):
 def nsum(txt, pat):
     return sum(int(m.group(1)) for m in re.finditer(pat, txt))
 for name in sys.argv[2:]:
-    p = f'{R}/{name}-1.session.log'
-    txt = open(p, errors='replace').read() if os.path.exists(p) else ''
-    if not txt:
-        # repeat scenarios write -1..-N; join them
-        txt = ''.join(open(f'{R}/{f}', errors='replace').read() for f in sorted(os.listdir(R)) if f.startswith(name + '-') and f.endswith('.session.log'))
+    # repeat scenarios write <run>-1..-N.session.log; join them all
+    txt = ''.join(open(f'{R}/{f}', errors='replace').read() for f in sorted(os.listdir(R)) if re.fullmatch(re.escape(name) + r'-\d+\.session\.log', f))
     c = {k: txt.count(s) for k, s in KEYS}
     # refusal summaries carry count=N (IronRDP): add N-1 for those lines
     for k, s in KEYS:

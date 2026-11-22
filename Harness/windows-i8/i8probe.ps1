@@ -240,7 +240,16 @@ public static class I8Probe {
             string leaf = Path.GetFileName(Path.GetDirectoryName(path));
             Process.Start("explorer.exe", "/select,\"" + path + "\"");
             WhenWindow("excopy", delegate { return FindWindow("CabinetWClass", leaf); }, delegate (IntPtr h) {
-                x7Explorer = h; Chord(0x43, 0x2E);
+                x7Explorer = h;
+                // Clicking the title bar activates the window without changing the /select selection,
+                // so the file list gets the keyboard focus back (a bare SetForegroundWindow did not).
+                RECT r;
+                if (GetWindowRect(h, out r)) {
+                    SetCursorPos(r.left + (r.right - r.left) / 2, r.top + 10);
+                    mouse_event(2, 0, 0, 0, IntPtr.Zero); mouse_event(4, 0, 0, 0, IntPtr.Zero);
+                }
+                System.Threading.Thread.Sleep(300);
+                Chord(0x43, 0x2E);
             });
         } else if (verb == "mix") {
             string[] a = arg.Split(' ');

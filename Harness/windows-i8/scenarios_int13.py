@@ -57,23 +57,28 @@ write("x3-order", x3)
 
 write("x5-cut", [READY, cmd("settext " + b64("X5-A")), {"op": "clipboardExpectLocal", "text": "X5-A", "timeout": 15},
     {"op": "idle", "seconds": 0.1}, {"op": "clipboardSetLocal", "text": "X5-M"},
-    {"op": "waitDisconnected", "timeout": 90}, {"op": "reconnect", "timeout": 60}, {"op": "watch", "seconds": 8},
+    {"op": "waitDisconnected", "timeout": 90},
+    # As gw4-cut: an immediate reconnect after the disconnect failed (2/2 per engine); wait first.
+    {"op": "idle", "seconds": 8}, {"op": "reconnect", "timeout": 60}, {"op": "watch", "seconds": 8},
     {"op": "clipboardSnapshotLocal", "prefix": "after-reconnect"}],
     expect={"connected": True, "firstFrame": True, "disconnect": "error"})
 
-x7 = [READY]
-for src in ["net", "notepad", "explorer"]:
-    for d in [0, 100, 300, 450, 600, 800]:
-        for i in range(1, 4):
-            r, m = f"X7-{src}-{d}-{i}", f"X7-m-{src}-{d}-{i}"
-            if src == "explorer":
-                x7 += [cmd("excopy " + b64(r"C:\i8\src\multi\small.txt")),
-                       {"op": "clipboardExpectLocalFiles", "count": 1, "timeout": 20}]
-            else:
-                x7 += [cmd(("settext " if src == "net" else "notepad ") + b64(r)),
-                       {"op": "clipboardExpectLocal", "text": r, "timeout": 20}]
-            x7 += [{"op": "idle", "seconds": d / 1000}, {"op": "clipboardSetLocal", "text": m}, {"op": "idle", "seconds": 3}]
-write("x7-diag", x7)
+def x7_steps(sources):
+    x7 = [READY]
+    for src in sources:
+        for d in [0, 100, 300, 450, 600, 800]:
+            for i in range(1, 4):
+                r, m = f"X7-{src}-{d}-{i}", f"X7-m-{src}-{d}-{i}"
+                if src == "explorer":
+                    x7 += [cmd("excopy " + b64(r"C:\i8\src\multi\small.txt")),
+                           {"op": "clipboardExpectLocalFiles", "count": 1, "timeout": 20}]
+                else:
+                    x7 += [cmd(("settext " if src == "net" else "notepad ") + b64(r)),
+                           {"op": "clipboardExpectLocal", "text": r, "timeout": 20}]
+                x7 += [{"op": "idle", "seconds": d / 1000}, {"op": "clipboardSetLocal", "text": m}, {"op": "idle", "seconds": 3}]
+    return x7
+write("x7-diag", x7_steps(["net", "notepad", "explorer"]))
+write("x7-explorer", x7_steps(["explorer"]))
 
 write("lw7-reconnect", [{"op": "idle", "seconds": 4}, cmd("files " + b64(A40)),
     {"op": "clipboardExpectLocalFiles", "count": 40, "timeout": 60}, {"op": "idle", "seconds": 1}], repeat=10)
