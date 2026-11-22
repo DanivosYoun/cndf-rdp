@@ -250,7 +250,10 @@ impl Logs {
 impl<S: tracing::Subscriber> Layer<S> for Logs {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
-        let own = matches!(metadata.target(), DISPLAY_LOG_TARGET | TLS_LOG_TARGET);
+        let own = matches!(
+            metadata.target(),
+            DISPLAY_LOG_TARGET | TLS_LOG_TARGET | crate::h264::H264_LOG_TARGET
+        );
         if !own && !metadata.target().starts_with("ironrdp") {
             return;
         }
@@ -262,7 +265,8 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
             tracing::Level::ERROR => CNDFIronLogLevel::CNDF_IRON_LOG_ERROR,
         };
         if own {
-            // These targets contain only display geometry, scale factors and TLS parameters.
+            // These targets contain only display geometry, scale factors, TLS parameters and
+            // H.264 picture sizes and counts.
             let mut message = SafeLogMessage::default();
             event.record(&mut message);
             log(&self.connection, self.minimum, level, &message.0);
@@ -380,6 +384,7 @@ fn run(
         .with_server_pointer(true)
         .with_pointer_software_rendering(false)
         .with_graphics_pipeline(options.graphics)
+        .with_h264_decoder(options.graphics.then(crate::h264::factory).flatten())
         .with_certificate_validation(ironrdp_tls::CertificateValidation::Strict)
         .with_certificate_chain_validation_callback(trust);
     builder = with_keyboard(builder, options.keyboard);

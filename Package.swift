@@ -88,6 +88,10 @@ let package = Package(
                 .linkedFramework("Foundation"),
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("CoreAudio"),
+                // VideoToolbox H.264 decoding (design m4-h264 D8).
+                .linkedFramework("VideoToolbox"),
+                .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
                 .linkedLibrary("iconv")
             ]
         ),

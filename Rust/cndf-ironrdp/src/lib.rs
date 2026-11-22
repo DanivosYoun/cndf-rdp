@@ -10,6 +10,8 @@ mod errors;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 mod frame;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
+mod h264;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
 mod input;
 #[cfg(all(feature = "legacy-tls", not(feature = "stub")))]
 mod legacy_tls;

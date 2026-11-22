@@ -357,6 +357,8 @@ dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-connector",
  "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-egfx",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
  "ironrdp-rdpdr-native",
