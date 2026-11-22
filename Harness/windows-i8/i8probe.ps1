@@ -328,7 +328,8 @@ public static class I8Probe {
             if (sig != lastSignature) { lastSignature = sig; lastChange = now; }
             // Ctrl+V sometimes does not reach Explorer (nothing appears): send it once more.
             if (count == 0 && !pasteRetried && now - stateSince > 20000) { pasteRetried = true; Log("paste retry"); pasteState = 3; stateSince = now - 1500; return; }
-            if ((count > 0 && now - lastChange > 8000) || now - stateSince > 900000) {
+            bool hasDialog = Dialogs() != "none";
+            if ((count > 0 && now - lastChange > 8000) || (hasDialog && now - stateSince > 10000 && now - lastChange > 8000) || now - stateSince > 900000) {
                 string tree = Tree(pasteDir, true, out count, out bytes);
                 // Explorer sets the full length up front and keeps the file open while it copies:
                 // a stable size is not the end of the copy while a file is still locked.
