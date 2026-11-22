@@ -79,3 +79,7 @@ write("lw12-flip", [READY, cmd("paste lw12-flip"), {"op": "idle", "seconds": 5},
     + flip + [{"op": "clipboardWaitLocalPrefix", "prefix": "I8DONE", "timeout": 300}])
 # the same big package copied to the end (size and hash of the 300 MiB file inside it)
 write("pk-bigpkg", finder("pk-bigpkg", [f"{src}/pkg/BigPkg.app"], timeout=600))
+# the same without waiting for the probe's tree at the end (more repetitions per hour)
+write("lw12-flipq", [READY, cmd("paste lw12-flipq"), {"op": "idle", "seconds": 5},
+    {"op": "clipboardSetLocalFiles", "paths": [f"{src}/big-m.bin"]}, {"op": "idle", "seconds": 20}]
+    + flip + [{"op": "idle", "seconds": 5}])
