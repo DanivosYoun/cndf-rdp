@@ -62,7 +62,20 @@ write("pk-linkonly", [READY, cmd("paste pk-linkonly"), {"op": "idle", "seconds":
     {"op": "clipboardSetLocalFiles", "paths": [f"{src}/pkg/rootlink.txt"]}, {"op": "idle", "seconds": 20}])
 write("pk-droplinkonly", drop("pk-droplinkonly", [f"{src}/pkg/rootlink.txt"]))
 # a big package cancelled on Windows, then a normal copy in the same session
-write("pk-cancel", [READY, cmd("pastecancel pk-cancel 20000"), {"op": "idle", "seconds": 5},
+write("pk-cancel", [READY, cmd("pastecancel pk-cancel 25000"), {"op": "idle", "seconds": 5},
     {"op": "clipboardSetLocalFiles", "paths": [f"{src}/pkg/BigPkg.app"]},
     {"op": "clipboardWaitLocalPrefix", "prefix": "I8DONE", "timeout": 300}]
     + finder("pk-after-cancel", [f"{src}/multi/small.txt", f"{src}/multi/mid.bin"])[1:])
+
+# L-W12 (FreeRDP, ASan harness build): a 1 GiB paste, then from 20 s on the Mac board flips every
+# 50 ms between a file offer and a text for 60 s (design clip-lock-boundary L-W12).
+flip = []
+for k in range(600):
+    flip.append({"op": "clipboardSetLocalFiles", "paths": [f"{src}/multi/mid.bin"]} if k % 2 == 0
+                else {"op": "clipboardSetLocal", "text": f"LW12-{k}"})
+    flip.append({"op": "idle", "seconds": 0.05})
+write("lw12-flip", [READY, cmd("paste lw12-flip"), {"op": "idle", "seconds": 5},
+    {"op": "clipboardSetLocalFiles", "paths": [f"{src}/big-m.bin"]}, {"op": "idle", "seconds": 20}]
+    + flip + [{"op": "clipboardWaitLocalPrefix", "prefix": "I8DONE", "timeout": 300}])
+# the same big package copied to the end (size and hash of the 300 MiB file inside it)
+write("pk-bigpkg", finder("pk-bigpkg", [f"{src}/pkg/BigPkg.app"], timeout=600))

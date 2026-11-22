@@ -1,3 +1,4 @@
+# int-15 Mac fixtures (run on the Mac: ssh <mac> 'bash -s' < macfix.sh). Big files stay in the Mac work dir.
 set -euo pipefail
 S=$HOME/xcode-work/int15-win-184c94d7/src; mkdir -p $S; cd $S
 mkdir -p "폴더M/하위/깊은" "폴더M/빈폴더" multi gw7/'x\' secret
@@ -17,7 +18,7 @@ head -c 70000 /dev/urandom > $P/X.app/Contents/MacOS/X; chmod +x $P/X.app/Conten
 printf 'res-한글\n' > "$P/X.app/Contents/Resources/표.txt"
 printf '<plist>Helper</plist>\n' > $P/X.app/Contents/Frameworks/Helper.app/Contents/Info.plist
 head -c 3000 /dev/urandom > $P/X.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper
-ln -s ../../../../secret/secret.txt $P/X.app/Contents/Resources/inlink.txt   # link inside a package
+ln -s ../../../../../secret/secret.txt $P/X.app/Contents/Resources/inlink.txt   # link inside a package
 mkdir -p $P/Note.rtfd; printf '{\\rtf1 note}' > $P/Note.rtfd/TXT.rtf; head -c 1234 /dev/urandom > $P/Note.rtfd/img.png
 mkdir -p $P/Plug.bundle/Contents/MacOS; printf '<plist>Plug</plist>\n' > $P/Plug.bundle/Contents/Info.plist; head -c 500 /dev/urandom > $P/Plug.bundle/Contents/MacOS/Plug
 mkdir -p $P/Proj.xcodeproj/project.xcworkspace; printf '// pbxproj\n' > $P/Proj.xcodeproj/project.pbxproj; printf '<ws/>\n' > $P/Proj.xcodeproj/project.xcworkspace/contents.xcworkspacedata
@@ -32,7 +33,12 @@ ln -s ../tool/cli.js $L/node_modules/.bin/tool
 ln -s ../../secret/secret.txt $L/secret-link.txt         # file link to outside secret
 ln -s $S/secret $L/dirlink                               # directory link (absolute) outside
 ln -s /nonexistent/i8-184c94d7 $L/broken                 # broken link
-ln -s ../../secret/secret.txt pkg/rootlink.txt            # a selected root that is a link
+ln -s ../secret/secret.txt pkg/rootlink.txt               # a selected root that is a link
+# a path past 259 UTF-16 units (A1) and a 300 MiB file inside a package (cancel row)
+A=$(printf "a%.0s" $(seq 100)); B=$(printf "b%.0s" $(seq 100)); C=$(printf "c%.0s" $(seq 70))
+mkdir -p "pkg/D/$A/$B/$C"; printf "ok in D\n" > pkg/D/ok.txt; printf "b-level\n" > "pkg/D/$A/$B/b.txt"; printf "too deep\n" > "pkg/D/$A/$B/$C/deep.txt"
+mkdir -p pkg/BigPkg.app/Contents/Resources; printf "<plist>Big</plist>\n" > pkg/BigPkg.app/Contents/Info.plist
+head -c 314572800 /dev/urandom > pkg/BigPkg.app/Contents/Resources/big.bin
 # /tmp selection (parent path has the /tmp -> /private/tmp link)
 T=/tmp/i8pkg-184c94d7; rm -rf $T; mkdir -p $T/T/inner; printf 'tmp file\n' > $T/T/inner/t.txt; printf 'tmp top\n' > $T/t1.txt
 cd $S; find . -path ./big-m.bin -prune -o -type f -print0 | xargs -0 shasum -a 256 > sha.txt; shasum -a 256 big-m.bin >> sha.txt

@@ -14,13 +14,14 @@
 #                             empty file list as soon as Explorer is up and waits for the paste the
 #                             Mac drop path sends (staging-package). No files 60 s after focus ends
 #                             the wait with "I8DONE <leaf> n=0 bytes=0".
-#   pastecancel <leaf> <ms>   like paste, and <ms> after Ctrl+V presses Esc on Explorer's copy
-#                             progress window (OperationStatusWindow); the wait ends 15 s after
+#   pastecancel <leaf> <ms>   like paste (one Ctrl+V retry), and <ms> after the last Ctrl+V presses Esc on Explorer's copy
+#                             progress window (#32770 "Copying..." or OperationStatusWindow); the wait ends 15 s after
 #                             the cancel once the tree is still for 5 s (staging-package cancel).
 # int-11 verbs (one-shot WinForms timers, so the owner window keeps pumping while waiting):
 #   mix <k> <delayMs> [<dir> <prefix>]  drop list C:\i8\src\gw1A\f00..f39.bin, then after delayMs
 #                             the same names from C:\i8\src\gw1B (same sizes, other bytes), or
 #                             C:\i8\src\<dir>\<prefix>00..39.bin
+#   mixn <k> <ms> <adir> <aprefix> <an> <bdir> <bprefix>  W-B1: A = <an> files, B = 40 files
 #   fileimg <b64 path> <ms>   drop list that path, then Clipboard.SetImage after ms
 #   flip <ft|tf> <k> <ms>     files(small.txt) then text "M4-<k>" after ms, or the reverse
 #   hold <b64 path> <ms> <holdMs>  drop list that file, after ms open it with FileShare.None for holdMs
@@ -230,7 +231,7 @@ public static class I8Probe {
             pasteDir = @"C:\i8\dst\" + a[0];
             Directory.CreateDirectory(pasteDir);
             Process.Start("explorer.exe", pasteDir);
-            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = true; pasteByDrop = false;
+            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = false; pasteByDrop = false;
             pasteCancelAfter = long.Parse(a[1]); pasteCancelAt = 0;
         } else if (verb == "droppaste") {
             pasteLeaf = arg;
@@ -282,6 +283,16 @@ public static class I8Probe {
             // Optional third/fourth argument: another B folder and file prefix (other names).
             string dirB = a.Length > 3 ? @"C:\i8\src\" + a[2] : @"C:\i8\src\gw1B", prefixB = a.Length > 3 ? a[3] : "f";
             Later(ms, delegate { SetFiles(Set40(dirB, prefixB)); Log("mix " + a[0] + " B set after=" + ms + " dir=" + dirB); });
+        } else if (verb == "mixn") {
+            // W-B1: A = <an> files <adir>\<aprefix>0000.., then after ms B = 40 files <bdir>\<bprefix>00..39
+            string[] a = arg.Split(' ');
+            int ms = int.Parse(a[1]), an = int.Parse(a[4]);
+            var listA = new List<string>();
+            for (int i = 0; i < an; i++) listA.Add(@"C:\i8\src\" + a[2] + "\\" + a[3] + i.ToString("0000") + ".bin");
+            SetFiles(listA);
+            Log("mixn " + a[0] + " A set n=" + an);
+            string dirB = @"C:\i8\src\" + a[5], prefixB = a[6];
+            Later(ms, delegate { SetFiles(Set40(dirB, prefixB)); Log("mixn " + a[0] + " B set after=" + ms + " dir=" + dirB); });
         } else if (verb == "fileimg") {
             string[] a = arg.Split(' ');
             SetFiles(new[] { UnB64(a[0]) });
@@ -428,7 +439,9 @@ public static class I8Probe {
             // Ctrl+V sometimes does not reach Explorer (nothing appears): send it once more.
             if (count == 0 && !pasteRetried && now - stateSince > 20000) { pasteRetried = true; Log("paste retry"); pasteState = 3; stateSince = now - 1500; return; }
             if (pasteCancelAfter > 0 && pasteCancelAt == 0 && now - stateSince > pasteCancelAfter) {
-                IntPtr op = FindWindow("OperationStatusWindow", null);
+                // Win2019 shows a classic #32770 "Copying..." dialog for clipboard streams.
+                IntPtr op = FindWindow("#32770", "Copying...");
+                if (op == IntPtr.Zero) op = FindWindow("OperationStatusWindow", null);
                 if (op != IntPtr.Zero) {
                     SetForegroundWindow(op); System.Threading.Thread.Sleep(300);
                     keybd_event(0x1B, 0x01, 0, IntPtr.Zero); keybd_event(0x1B, 0x01, 2, IntPtr.Zero);
