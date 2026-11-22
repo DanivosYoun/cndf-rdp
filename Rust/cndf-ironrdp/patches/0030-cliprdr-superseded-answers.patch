@@ -1,0 +1,388 @@
+diff --git a/crates/ironrdp-cliprdr/src/backend.rs b/crates/ironrdp-cliprdr/src/backend.rs
+index 41130792..a762afc8 100644
+--- a/crates/ironrdp-cliprdr/src/backend.rs
++++ b/crates/ironrdp-cliprdr/src/backend.rs
+@@ -203,6 +203,13 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
+         self.on_format_data_response(response);
+     }
+ 
++    /// Receives the answer to a request of `kind` [`RequestedFormat::Other`] sent before a later
++    /// FormatList: the remote's clipboard changed after the request, so the answer is not of its
++    /// newest copy. The default implementation handles it as any other answer.
++    fn on_superseded_format_data_answer(&mut self, response: FormatDataResponse<'_>, kind: RequestedFormat) {
++        self.on_format_data_answer(response, Some(kind));
++    }
++
+     /// Called by [`crate::Cliprdr`] instead of [`Self::on_format_data_response`] when the response to
+     /// the oldest unanswered format data request exceeds [`crate::MAX_MESSAGE_SIZE`] and was dropped.
+     ///
+diff --git a/crates/ironrdp-cliprdr/src/lib.rs b/crates/ironrdp-cliprdr/src/lib.rs
+index 774ec4f2..9c00360a 100644
+--- a/crates/ironrdp-cliprdr/src/lib.rs
++++ b/crates/ironrdp-cliprdr/src/lib.rs
+@@ -46,6 +46,9 @@ struct PendingFormatDataRequest {
+     /// response is classified by what was requested, not by the state at
+     /// response time.
+     kind: RequestedFormat,
++    /// Whether a FormatList arrived after this request was sent: the remote's clipboard has
++    /// changed since, so the answer describes a copy that is no longer the newest.
++    superseded: bool,
+ }
+ 
+ /// [MS-RDPECLIP] 2.2.5.3 / 2.2.5.4 - Tracks state of a file contents transfer
+@@ -828,6 +831,11 @@ impl<R: Role> Cliprdr<R> {
+         // Requests already sent are still answered, in order, after a new
+         // FormatList — so pending requests are kept, not cleared, or their
+         // responses would pair with the wrong request.
++        // Their answers describe an older copy, so they are marked before this
++        // FormatList's own paste is queued below.
++        for request in &mut self.pending_format_data_requests {
++            request.superseded = true;
++        }
+ 
+         // [MS-RDPECLIP] 2.2.4.2 - Expire locks when clipboard changes
+         // Locks enter grace period with activity-based timeout
+@@ -1042,8 +1050,10 @@ impl<R: Role> Cliprdr<R> {
+         // When user initiates paste, send format data request to server, and expect to
+         // receive response with contents via `FormatDataResponse` PDU.
+         // Track the request so we can correlate the response correctly.
+-        self.pending_format_data_requests
+-            .push_back(PendingFormatDataRequest { kind });
++        self.pending_format_data_requests.push_back(PendingFormatDataRequest {
++            kind,
++            superseded: false,
++        });
+ 
+         if kind == RequestedFormat::FileList {
+             trace!(format_id = ?requested_format, "User initiated paste for FileGroupDescriptorW");
+@@ -1951,12 +1961,18 @@ impl<R: Role> SvcProcessor for Cliprdr<R> {
+                 // Correlate this response with the oldest unanswered FormatDataRequest.
+                 // Only intercept as a file list if the request was for the file list format;
+                 // forward all other responses (text, images, etc.) to the backend.
+-                let requested = self
+-                    .pending_format_data_requests
+-                    .pop_front()
+-                    .map(|request| request.kind);
++                let pending = self.pending_format_data_requests.pop_front();
++                let requested = pending.map(|request| request.kind);
+ 
+-                if requested == Some(RequestedFormat::FileList) {
++                if let Some(PendingFormatDataRequest {
++                    kind: RequestedFormat::Other,
++                    superseded: true,
++                }) = pending
++                {
++                    self.backend
++                        .on_superseded_format_data_answer(response, RequestedFormat::Other);
++                    Ok(Vec::new())
++                } else if requested == Some(RequestedFormat::FileList) {
+                     if response.is_error() {
+                         warn!("FileGroupDescriptorW request failed");
+                         self.backend.on_format_data_answer(response, requested);
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+index fcb681ec..a80cc6c4 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+@@ -18,6 +18,7 @@ mod paste_correlation;
+ mod path_sanitization;
+ mod preferred_drop_effect;
+ mod server_role;
++mod superseded_answers;
+ mod upload_and_cleanup;
+ 
+ use expect_test::expect;
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/superseded_answers.rs b/crates/ironrdp-testsuite-core/tests/clipboard/superseded_answers.rs
+new file mode 100644
+index 00000000..3cf03eda
+--- /dev/null
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/superseded_answers.rs
+@@ -0,0 +1,289 @@
++use std::sync::{Arc, Mutex};
++
++use ironrdp_cliprdr::CliprdrClient;
++use ironrdp_cliprdr::backend::{CliprdrBackend, RequestedFormat};
++use ironrdp_cliprdr::pdu::{
++    Capabilities, ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
++    ClipboardPdu, ClipboardProtocolVersion, FileContentsRequest, FileContentsResponse, FileDescriptor,
++    FormatDataRequest, FormatDataResponse, FormatList, FormatListResponse, LockDataId, PackedFileList,
++};
++use ironrdp_core::encode_vec;
++use ironrdp_svc::SvcProcessor as _;
++use ironrdp_testsuite_core::clipboard::{HANDSHAKE_SERVER_FLAGS, real_now_ms};
++
++/// What CLIPRDR handed the backend, in order.
++#[derive(Debug, PartialEq, Eq)]
++enum Call {
++    Answer(Option<RequestedFormat>, bool, Vec<u8>),
++    Superseded(RequestedFormat, Vec<u8>),
++    FileList(Vec<String>),
++}
++
++type Calls = Arc<Mutex<Vec<Call>>>;
++
++/// Pastes every remote copy at once and records the superseded hook.
++#[derive(Debug)]
++struct Backend {
++    calls: Calls,
++}
++
++ironrdp_core::impl_as_any!(Backend);
++
++impl CliprdrBackend for Backend {
++    fn temporary_directory(&self) -> &str {
++        ""
++    }
++    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
++        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
++            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
++    }
++    fn on_ready(&mut self) {}
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
++    fn paste_on_remote_copy(&mut self, formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
++        formats.first().map(|format| format.id)
++    }
++    fn on_format_data_request(&mut self, _: FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
++    fn on_format_data_answer(&mut self, response: FormatDataResponse<'_>, kind: Option<RequestedFormat>) {
++        self.calls
++            .lock()
++            .unwrap()
++            .push(Call::Answer(kind, response.is_error(), response.data().to_vec()));
++    }
++    fn on_superseded_format_data_answer(&mut self, response: FormatDataResponse<'_>, kind: RequestedFormat) {
++        self.calls
++            .lock()
++            .unwrap()
++            .push(Call::Superseded(kind, response.data().to_vec()));
++    }
++    fn on_remote_file_list(&mut self, files: &[FileDescriptor], _: Option<u32>) {
++        self.calls
++            .lock()
++            .unwrap()
++            .push(Call::FileList(files.iter().map(|file| file.name.clone()).collect()));
++    }
++    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: LockDataId) {}
++    fn on_unlock(&mut self, _: LockDataId) {}
++    fn now_ms(&self) -> u64 {
++        real_now_ms()
++    }
++}
++
++/// A backend that does not override the superseded hook, so it gets the trait default.
++#[derive(Debug)]
++struct DefaultBackend(Calls);
++
++ironrdp_core::impl_as_any!(DefaultBackend);
++
++impl CliprdrBackend for DefaultBackend {
++    fn temporary_directory(&self) -> &str {
++        ""
++    }
++    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
++        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
++    }
++    fn on_ready(&mut self) {}
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
++    fn paste_on_remote_copy(&mut self, formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
++        formats.first().map(|format| format.id)
++    }
++    fn on_format_data_request(&mut self, _: FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
++    fn on_format_data_answer(&mut self, response: FormatDataResponse<'_>, kind: Option<RequestedFormat>) {
++        self.0
++            .lock()
++            .unwrap()
++            .push(Call::Answer(kind, response.is_error(), response.data().to_vec()));
++    }
++    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: LockDataId) {}
++    fn on_unlock(&mut self, _: LockDataId) {}
++    fn now_ms(&self) -> u64 {
++        real_now_ms()
++    }
++}
++
++fn pdu(pdu: ClipboardPdu<'_>) -> Vec<u8> {
++    encode_vec(&pdu).unwrap()
++}
++
++fn ready(mut cliprdr: CliprdrClient) -> CliprdrClient {
++    cliprdr
++        .process(&pdu(ClipboardPdu::Capabilities(Capabilities::new(
++            ClipboardProtocolVersion::V2,
++            HANDSHAKE_SERVER_FLAGS,
++        ))))
++        .unwrap();
++    cliprdr
++        .process(&pdu(ClipboardPdu::FormatListResponse(FormatListResponse::Ok)))
++        .unwrap();
++    cliprdr
++}
++
++fn client() -> (CliprdrClient, Calls) {
++    let calls = Calls::default();
++    let backend = Backend {
++        calls: Arc::clone(&calls),
++    };
++    (ready(CliprdrClient::new(Box::new(backend))), calls)
++}
++
++fn text_format() -> ClipboardFormat {
++    ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)
++}
++
++fn file_list_format() -> ClipboardFormat {
++    ClipboardFormat::new(ClipboardFormatId::new(49534)).with_name(ClipboardFormatName::FILE_LIST)
++}
++
++/// The remote copies `format`; the backend pastes it in the same iteration.
++fn copy(cliprdr: &mut CliprdrClient, format: ClipboardFormat) -> usize {
++    let output = cliprdr
++        .process(&pdu(ClipboardPdu::FormatList(
++            FormatList::new_unicode(&[format], true).unwrap(),
++        )))
++        .unwrap();
++    output.len()
++}
++
++fn answer(cliprdr: &mut CliprdrClient, response: FormatDataResponse<'_>) {
++    assert!(
++        cliprdr
++            .process(&pdu(ClipboardPdu::FormatDataResponse(response)))
++            .unwrap()
++            .is_empty()
++    );
++}
++
++fn data(text: &[u8]) -> FormatDataResponse<'static> {
++    FormatDataResponse::new_data(text.to_vec())
++}
++
++fn file_list(name: &str) -> FormatDataResponse<'static> {
++    let list = PackedFileList {
++        files: vec![FileDescriptor::new(name).with_file_size(1)],
++    };
++    FormatDataResponse::new_file_list(&list).unwrap()
++}
++
++// P-1. oracle: mutant not marking pending requests on a FormatList, or marking them after the
++// FormatList's own paste is queued.
++#[test]
++fn answer_sent_before_the_next_format_list_is_superseded() {
++    use RequestedFormat::Other;
++
++    let (mut cliprdr, calls) = client();
++    assert_eq!(copy(&mut cliprdr, text_format()), 2);
++    assert_eq!(copy(&mut cliprdr, text_format()), 2);
++    answer(&mut cliprdr, data(b"A"));
++    answer(&mut cliprdr, data(b"B"));
++    assert_eq!(
++        *calls.lock().unwrap(),
++        [
++            Call::Superseded(Other, b"A".to_vec()),
++            Call::Answer(Some(Other), false, b"B".to_vec())
++        ]
++    );
++}
++
++// P-2. oracle: mutant marking a FormatList's own paste, or carrying the mark over to requests sent
++// after the FormatList.
++#[test]
++fn answers_received_before_the_next_format_list_are_not_superseded() {
++    use RequestedFormat::Other;
++
++    let (mut cliprdr, calls) = client();
++    copy(&mut cliprdr, text_format());
++    answer(&mut cliprdr, data(b"A"));
++    copy(&mut cliprdr, text_format());
++    answer(&mut cliprdr, data(b"B"));
++    assert_eq!(
++        std::mem::take(&mut *calls.lock().unwrap()),
++        [
++            Call::Answer(Some(Other), false, b"A".to_vec()),
++            Call::Answer(Some(Other), false, b"B".to_vec()),
++        ]
++    );
++
++    // After a superseded answer, the next copy's answer is fresh again.
++    copy(&mut cliprdr, text_format());
++    copy(&mut cliprdr, text_format());
++    answer(&mut cliprdr, data(b"C"));
++    answer(&mut cliprdr, data(b"D"));
++    copy(&mut cliprdr, text_format());
++    answer(&mut cliprdr, data(b"E"));
++    assert_eq!(
++        *calls.lock().unwrap(),
++        [
++            Call::Superseded(Other, b"C".to_vec()),
++            Call::Answer(Some(Other), false, b"D".to_vec()),
++            Call::Answer(Some(Other), false, b"E".to_vec()),
++        ]
++    );
++}
++
++// P-3. oracle: mutant default hook dropping the superseded answer or its kind.
++#[test]
++fn default_hook_delivers_superseded_answers_as_before() {
++    use RequestedFormat::Other;
++
++    let calls = Calls::default();
++    let mut cliprdr = ready(CliprdrClient::new(Box::new(DefaultBackend(Arc::clone(&calls)))));
++    copy(&mut cliprdr, text_format());
++    copy(&mut cliprdr, text_format());
++    answer(&mut cliprdr, data(b"A"));
++    answer(&mut cliprdr, data(b"B"));
++    assert_eq!(
++        *calls.lock().unwrap(),
++        [
++            Call::Answer(Some(Other), false, b"A".to_vec()),
++            Call::Answer(Some(Other), false, b"B".to_vec())
++        ]
++    );
++}
++
++// P-4. oracle: mutant routing a superseded file list response to the superseded hook, or a
++// local failure at the bound taking the oldest pending request.
++#[test]
++fn file_list_answers_and_local_failures_are_not_superseded() {
++    use RequestedFormat::{FileList, Other};
++
++    let (mut cliprdr, calls) = client();
++    copy(&mut cliprdr, file_list_format());
++    copy(&mut cliprdr, file_list_format());
++    copy(&mut cliprdr, text_format());
++    answer(&mut cliprdr, file_list("first.txt"));
++    answer(&mut cliprdr, FormatDataResponse::new_error());
++    answer(&mut cliprdr, data(b"T"));
++    assert_eq!(
++        std::mem::take(&mut *calls.lock().unwrap()),
++        [
++            Call::FileList(vec!["first.txt".to_owned()]),
++            Call::Answer(Some(FileList), true, Vec::new()),
++            Call::Answer(Some(Other), false, b"T".to_vec()),
++        ]
++    );
++
++    for _ in 0..64 {
++        copy(&mut cliprdr, text_format());
++    }
++    // At the bound the paste fails locally; it answers no pending request.
++    assert_eq!(copy(&mut cliprdr, text_format()), 1);
++    assert_eq!(
++        std::mem::take(&mut *calls.lock().unwrap()),
++        [Call::Answer(Some(Other), true, Vec::new())]
++    );
++    for _ in 0..65 {
++        answer(&mut cliprdr, data(b"x"));
++    }
++    let mut expected: Vec<Call> = (0..64).map(|_| Call::Superseded(Other, b"x".to_vec())).collect();
++    expected.push(Call::Answer(None, false, b"x".to_vec()));
++    assert_eq!(*calls.lock().unwrap(), expected);
++}
