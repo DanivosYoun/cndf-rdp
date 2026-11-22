@@ -1,0 +1,504 @@
+diff --git a/crates/ironrdp-cliprdr/src/backend.rs b/crates/ironrdp-cliprdr/src/backend.rs
+index a762afc..afe6d2c 100644
+--- a/crates/ironrdp-cliprdr/src/backend.rs
++++ b/crates/ironrdp-cliprdr/src/backend.rs
+@@ -363,6 +363,21 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
+         let _ = clip_data_ids;
+     }
+ 
++    /// Whether an outgoing lock lives only until the next remote Format List.
++    ///
++    /// When `true`, [crate::Cliprdr] holds at most the lock of the newest remote copy of files:
++    /// - a remote Format List unlocks every outgoing lock in its own output, after the Format List
++    ///   Response and before the new copy's Lock, and reports them to
++    ///   [`CliprdrBackend::on_outgoing_locks_cleared`] instead of expiring them;
++    /// - a file list paste returned by [`CliprdrBackend::paste_on_ready`] is preceded by a Lock;
++    /// - a Lock is sent only on a channel whose remote sent its Capabilities PDU.
++    ///
++    /// The default `false` keeps expired locks until [`crate::Cliprdr::drive_timeouts`] releases
++    /// them.
++    fn locks_only_the_newest_remote_copy(&self) -> bool {
++        false
++    }
++
+     /// Returns the current monotonic time in milliseconds.
+     ///
+     /// Used by [`crate::Cliprdr`] for lock inactivity tracking and cleanup scheduling.
+diff --git a/crates/ironrdp-cliprdr/src/lib.rs b/crates/ironrdp-cliprdr/src/lib.rs
+index 9c00360..c45ce77 100644
+--- a/crates/ironrdp-cliprdr/src/lib.rs
++++ b/crates/ironrdp-cliprdr/src/lib.rs
+@@ -552,6 +552,11 @@ pub struct Cliprdr<R: Role> {
+     /// Set when a lock is created on FormatList, cleared when last lock is removed.
+     current_lock_id: Option<u32>,
+ 
++    /// Whether the remote sent its Capabilities PDU on this channel. With
++    /// [`CliprdrBackend::locks_only_the_newest_remote_copy`], a Lock is sent only after it did,
++    /// because the client's own flags stand for negotiated ones until then.
++    server_capabilities_received: bool,
++
+     /// Counter for generating unique clipDataId values for lock operations.
+     /// Incremented each time a new lock is needed. Zero is avoided per convention.
+     next_clip_data_id: u32,
+@@ -677,6 +682,7 @@ impl<R: Role> Cliprdr<R> {
+             sent_file_contents_requests: HashMap::new(),
+             outgoing_locks: HashMap::new(),
+             current_lock_id: None,
++            server_capabilities_received: false,
+             next_clip_data_id: 1, // Start at 1, avoiding 0
+             lock_inactivity_timeout: inactivity_timeout,
+             lock_max_lifetime: max_lifetime,
+@@ -733,6 +739,7 @@ impl<R: Role> Cliprdr<R> {
+ 
+     fn handle_server_capabilities(&mut self, server_capabilities: Capabilities) -> PduResult<Vec<SvcMessage>> {
+         self.capabilities.downgrade(&server_capabilities);
++        self.server_capabilities_received = true;
+         self.backend
+             .on_process_negotiated_capabilities(self.capabilities.flags());
+ 
+@@ -812,10 +819,18 @@ impl<R: Role> Cliprdr<R> {
+             }
+         }
+ 
+-        match paste {
+-            Some(format) => Ok(self.initiate_paste(format)?.into()),
+-            None => Ok(Vec::new()),
++        let Some(format) = paste else {
++            return Ok(Vec::new());
++        };
++        let mut messages = Vec::new();
++        // A remote copy of files made before the channel was ready is locked when it is pasted.
++        if self.backend.locks_only_the_newest_remote_copy() && Some(format) == self.remote_file_list_format_id {
++            if let Some(lock_messages) = self.send_lock() {
++                messages.extend(lock_messages);
++            }
+         }
++        messages.extend(Vec::from(self.initiate_paste(format)?));
++        Ok(messages)
+     }
+ 
+     fn handle_format_list(&mut self, format_list: FormatList<'_>) -> PduResult<Vec<SvcMessage>> {
+@@ -837,6 +852,14 @@ impl<R: Role> Cliprdr<R> {
+             request.superseded = true;
+         }
+ 
++        // A backend locking only the newest remote copy unlocks every earlier copy instead, in
++        // this output after the Format List Response and before the new copy's Lock.
++        let unlocks = if self.backend.locks_only_the_newest_remote_copy() {
++            self.unlock_all_outgoing_locks()
++        } else {
++            Vec::new()
++        };
++
+         // [MS-RDPECLIP] 2.2.4.2 - Expire locks when clipboard changes
+         // Locks enter grace period with activity-based timeout
+         if !self.outgoing_locks.is_empty() {
+@@ -913,6 +936,7 @@ impl<R: Role> Cliprdr<R> {
+         messages.push(into_cliprdr_message(ClipboardPdu::FormatListResponse(
+             FormatListResponse::Ok,
+         )));
++        messages.extend(unlocks);
+ 
+         // [MS-RDPECLIP] 2.2.4.1 / Figure 3 - Automatically lock remote clipboard
+         // when file data is detected. Sent after FormatListResponse to complete
+@@ -1124,6 +1148,11 @@ impl<R: Role> Cliprdr<R> {
+             return None;
+         }
+ 
++        // Until the remote sends its Capabilities PDU, the flags are the client's own.
++        if self.backend.locks_only_the_newest_remote_copy() && !self.server_capabilities_received {
++            return None;
++        }
++
+         // Defense-in-depth: limit outgoing locks
+         if MAX_OUTGOING_LOCKS <= self.outgoing_locks.len() {
+             warn!(
+@@ -1222,6 +1251,32 @@ impl<R: Role> Cliprdr<R> {
+         // Backend notification deferred until actual cleanup
+     }
+ 
++    /// Drops every outgoing clipboard lock, in use or not, and returns their `Unlock` PDUs.
++    ///
++    /// For [`CliprdrBackend::locks_only_the_newest_remote_copy`] on a remote Format List: a
++    /// request already sent under a lock precedes its `Unlock` on the wire, and a later request
++    /// carries the lock of the new copy, or none.
++    fn unlock_all_outgoing_locks(&mut self) -> Vec<SvcMessage> {
++        self.current_lock_id = None;
++        if self.outgoing_locks.is_empty() {
++            return Vec::new();
++        }
++        let mut released: Vec<LockDataId> = self.outgoing_locks.drain().map(|(id, _)| LockDataId(id)).collect();
++        released.sort_unstable_by_key(|id| id.0);
++        for id in &released {
++            // The remote releases its File Stream data on Unlock, so the snapshot we
++            // validated against goes with it.
++            self.locked_remote_file_lists.remove(&id.0);
++        }
++        debug!(count = released.len(), "Releasing outgoing locks on a remote copy");
++        let messages = released
++            .iter()
++            .map(|id| into_cliprdr_message(ClipboardPdu::UnlockData(LockDataId(id.0))))
++            .collect();
++        self.backend.on_outgoing_locks_cleared(&released);
++        messages
++    }
++
+     /// Immediately sends `Unlock` PDUs for — and drops — every outgoing clipboard lock no
+     /// download is still using.
+     ///
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/lock_lifetime.rs b/crates/ironrdp-testsuite-core/tests/clipboard/lock_lifetime.rs
+new file mode 100644
+index 0000000..b5c3ce3
+--- /dev/null
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/lock_lifetime.rs
+@@ -0,0 +1,338 @@
++//! Tests for a backend whose outgoing locks live only until the next remote Format List
++//! (`CliprdrBackend::locks_only_the_newest_remote_copy`).
++
++use std::sync::{Arc, Mutex};
++
++use ironrdp_cliprdr::CliprdrClient;
++use ironrdp_cliprdr::backend::CliprdrBackend;
++use ironrdp_cliprdr::pdu::{
++    Capabilities, ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
++    ClipboardPdu, ClipboardProtocolVersion, FileContentsFlags, FileContentsRequest, FileContentsResponse,
++    FileDescriptor, FormatDataRequest, FormatDataResponse, FormatList, FormatListResponse, LockDataId, PackedFileList,
++};
++use ironrdp_core::encode_vec;
++use ironrdp_svc::{SvcMessage, SvcProcessor as _};
++use ironrdp_testsuite_core::clipboard::{HANDSHAKE_SERVER_FLAGS, init_ready_locking_client, real_now_ms};
++
++#[derive(Debug, Default)]
++struct Calls {
++    /// The lock CLIPRDR handed with each remote file list.
++    file_list_locks: Vec<Option<u32>>,
++    cleared: Vec<u32>,
++}
++
++/// Pastes the first format of every remote copy, deferring a copy made before the channel is ready.
++#[derive(Debug)]
++struct Backend {
++    newest_only: bool,
++    ready: bool,
++    deferred: Option<ClipboardFormatId>,
++    calls: Arc<Mutex<Calls>>,
++}
++
++ironrdp_core::impl_as_any!(Backend);
++
++impl CliprdrBackend for Backend {
++    fn temporary_directory(&self) -> &str {
++        ""
++    }
++    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
++        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
++            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
++            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
++    }
++    fn on_ready(&mut self) {}
++    fn paste_on_ready(&mut self) -> Option<ClipboardFormatId> {
++        self.ready = true;
++        self.deferred.take()
++    }
++    fn on_request_format_list(&mut self) {}
++    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
++    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
++    fn paste_on_remote_copy(&mut self, formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
++        let choice = formats.first().map(|format| format.id);
++        if !self.ready {
++            self.deferred = choice;
++            return None;
++        }
++        choice
++    }
++    fn on_format_data_request(&mut self, _: FormatDataRequest) {}
++    fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
++    fn on_remote_file_list(&mut self, _: &[FileDescriptor], clip_data_id: Option<u32>) {
++        self.calls.lock().unwrap().file_list_locks.push(clip_data_id);
++    }
++    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
++    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
++    fn on_lock(&mut self, _: LockDataId) {}
++    fn on_unlock(&mut self, _: LockDataId) {}
++    fn on_outgoing_locks_cleared(&mut self, clip_data_ids: &[LockDataId]) {
++        self.calls
++            .lock()
++            .unwrap()
++            .cleared
++            .extend(clip_data_ids.iter().map(|id| id.0));
++    }
++    fn locks_only_the_newest_remote_copy(&self) -> bool {
++        self.newest_only
++    }
++    fn now_ms(&self) -> u64 {
++        real_now_ms()
++    }
++}
++
++fn pdu(pdu: ClipboardPdu<'_>) -> Vec<u8> {
++    encode_vec(&pdu).unwrap()
++}
++
++fn new_client(newest_only: bool) -> (CliprdrClient, Arc<Mutex<Calls>>) {
++    let calls = Arc::new(Mutex::new(Calls::default()));
++    let backend = Backend {
++        newest_only,
++        ready: false,
++        deferred: None,
++        calls: Arc::clone(&calls),
++    };
++    (CliprdrClient::new(Box::new(backend)), calls)
++}
++
++fn server_capabilities(cliprdr: &mut CliprdrClient, flags: ClipboardGeneralCapabilityFlags) {
++    let output = cliprdr
++        .process(&pdu(ClipboardPdu::Capabilities(Capabilities::new(
++            ClipboardProtocolVersion::V2,
++            flags,
++        ))))
++        .unwrap();
++    assert!(output.is_empty());
++}
++
++fn ready(cliprdr: &mut CliprdrClient) -> Vec<String> {
++    decoded(
++        cliprdr
++            .process(&pdu(ClipboardPdu::FormatListResponse(FormatListResponse::Ok)))
++            .unwrap(),
++    )
++}
++
++/// A ready client that negotiated locking.
++fn locking_client(newest_only: bool) -> (CliprdrClient, Arc<Mutex<Calls>>) {
++    let (mut cliprdr, calls) = new_client(newest_only);
++    server_capabilities(&mut cliprdr, HANDSHAKE_SERVER_FLAGS);
++    assert!(ready(&mut cliprdr).is_empty());
++    (cliprdr, calls)
++}
++
++fn file_list_format() -> ClipboardFormat {
++    ClipboardFormat::new(ClipboardFormatId::new(49534)).with_name(ClipboardFormatName::FILE_LIST)
++}
++
++fn text_format() -> ClipboardFormat {
++    ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)
++}
++
++/// The remote copies `format`; returns the output of its Format List.
++fn copy(cliprdr: &mut CliprdrClient, format: ClipboardFormat) -> Vec<String> {
++    decoded(
++        cliprdr
++            .process(&pdu(ClipboardPdu::FormatList(
++                FormatList::new_unicode(&[format], true).unwrap(),
++            )))
++            .unwrap(),
++    )
++}
++
++fn answer_file_list(cliprdr: &mut CliprdrClient, name: &str) {
++    let list = PackedFileList {
++        files: vec![FileDescriptor::new(name).with_file_size(4)],
++    };
++    let response = FormatDataResponse::new_file_list(&list).unwrap();
++    assert!(
++        cliprdr
++            .process(&pdu(ClipboardPdu::FormatDataResponse(response)))
++            .unwrap()
++            .is_empty()
++    );
++}
++
++/// Requests a RANGE of the current remote file list; returns the clipDataId it carries.
++fn request_range(cliprdr: &mut CliprdrClient, stream_id: u32) -> Option<u32> {
++    let messages: Vec<SvcMessage> = cliprdr
++        .request_file_contents(FileContentsRequest {
++            stream_id,
++            index: 0,
++            flags: FileContentsFlags::RANGE,
++            position: 0,
++            requested_size: 4,
++            data_id: None,
++        })
++        .unwrap()
++        .into();
++    assert_eq!(messages.len(), 1);
++    let bytes = messages[0].encode_unframed_pdu().unwrap();
++    match ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap() {
++        ClipboardPdu::FileContentsRequest(request) => request.data_id,
++        other => panic!("unexpected request {other:?}"),
++    }
++}
++
++fn answer_range(cliprdr: &mut CliprdrClient, stream_id: u32) {
++    let response = FileContentsResponse::new_data_response(stream_id, b"data".as_slice());
++    assert!(
++        cliprdr
++            .process(&pdu(ClipboardPdu::FileContentsResponse(response)))
++            .unwrap()
++            .is_empty()
++    );
++}
++
++/// Each output message as `FLR`, `Lock(id)`, `Unlock(id)` or `FDR(format)`, or its PDU kind.
++fn decoded(messages: Vec<SvcMessage>) -> Vec<String> {
++    messages
++        .iter()
++        .map(|message| {
++            let bytes = message.encode_unframed_pdu().unwrap();
++            match ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap() {
++                ClipboardPdu::FormatListResponse(FormatListResponse::Ok) => "FLR".to_owned(),
++                ClipboardPdu::LockData(id) => format!("Lock({})", id.0),
++                ClipboardPdu::UnlockData(id) => format!("Unlock({})", id.0),
++                ClipboardPdu::FormatDataRequest(request) => format!("FDR({})", request.format.value()),
++                other => format!("{other:?}").split('(').next().unwrap().to_owned(),
++            }
++        })
++        .collect()
++}
++
++fn count(output: &[String], prefix: &str) -> usize {
++    output.iter().filter(|message| message.starts_with(prefix)).count()
++}
++
++// T-L1. oracle: mutant ignoring the hook (expiring as upstream does), placing the Unlock after the
++// Lock, or placing the Unlock before the Format List Response.
++#[test]
++fn each_remote_copy_unlocks_the_previous_copy_after_its_response() {
++    let (mut cliprdr, calls) = locking_client(true);
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR", "Lock(1)", "FDR(49534)"]);
++    assert_eq!(
++        copy(&mut cliprdr, file_list_format()),
++        ["FLR", "Unlock(1)", "Lock(2)", "FDR(49534)"]
++    );
++    assert_eq!(copy(&mut cliprdr, text_format()), ["FLR", "Unlock(2)", "FDR(13)"]);
++    assert_eq!(calls.lock().unwrap().cleared, [1, 2]);
++}
++
++// T-L2. oracle: mutant releasing only the locks no download is using.
++#[test]
++fn locks_in_use_do_not_accumulate_over_many_copies() {
++    let (mut cliprdr, _calls) = locking_client(true);
++    let mut locks = 0;
++    let mut unlocks = 0;
++    for step in 1..=300u32 {
++        let output = copy(&mut cliprdr, file_list_format());
++        assert_eq!(count(&output, "Lock("), 1, "copy {step}: {output:?}");
++        locks += count(&output, "Lock(");
++        unlocks += count(&output, "Unlock(");
++        assert_eq!(locks - unlocks, 1, "copy {step}: {output:?}");
++        // A download uses the lock of each copy.
++        answer_file_list(&mut cliprdr, "file.txt");
++        let lock = request_range(&mut cliprdr, step);
++        assert!(lock.is_some());
++        answer_range(&mut cliprdr, step);
++    }
++}
++
++// T-L3. oracle: mutant not locking the copy pasted on the Ready transition.
++#[test]
++fn a_copy_made_before_ready_is_locked_when_pasted_on_ready() {
++    let (mut cliprdr, calls) = new_client(true);
++    server_capabilities(&mut cliprdr, HANDSHAKE_SERVER_FLAGS);
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR"]);
++    assert_eq!(ready(&mut cliprdr), ["Lock(1)", "FDR(49534)"]);
++    answer_file_list(&mut cliprdr, "file.txt");
++    assert_eq!(calls.lock().unwrap().file_list_locks, [Some(1)]);
++    assert_eq!(
++        copy(&mut cliprdr, file_list_format()),
++        ["FLR", "Unlock(1)", "Lock(2)", "FDR(49534)"]
++    );
++}
++
++// T-L4. oracle: mutant locking without the remote's Capabilities PDU.
++#[test]
++fn no_lock_is_sent_unless_the_remote_announced_locking() {
++    // No Capabilities PDU at all: the client's own CAN_LOCK_CLIPDATA stays in its flags.
++    let (mut cliprdr, _calls) = new_client(true);
++    assert!(ready(&mut cliprdr).is_empty());
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR", "FDR(49534)"]);
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR", "FDR(49534)"]);
++
++    let (mut cliprdr, _calls) = new_client(true);
++    server_capabilities(
++        &mut cliprdr,
++        HANDSHAKE_SERVER_FLAGS.difference(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA),
++    );
++    assert!(ready(&mut cliprdr).is_empty());
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR", "FDR(49534)"]);
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR", "FDR(49534)"]);
++}
++
++// T-L5. oracle: mutant defaulting the hook to true, or applying it to a backend returning false.
++#[test]
++fn the_default_backend_keeps_expired_locks() {
++    // A backend that does not override the hook.
++    let mut cliprdr = init_ready_locking_client();
++    for id in 1..=3 {
++        assert_eq!(
++            copy(&mut cliprdr, file_list_format()),
++            ["FLR".to_owned(), format!("Lock({id})")]
++        );
++    }
++    assert_eq!(cliprdr.__test_outgoing_locks().len(), 3);
++
++    let (mut cliprdr, calls) = locking_client(false);
++    for id in 1..=3 {
++        assert_eq!(
++            copy(&mut cliprdr, file_list_format()),
++            ["FLR".to_owned(), format!("Lock({id})"), "FDR(49534)".to_owned()]
++        );
++    }
++    assert!(calls.lock().unwrap().cleared.is_empty());
++
++    // Ready transition: no Lock before the paste either.
++    let (mut cliprdr, _calls) = new_client(false);
++    server_capabilities(&mut cliprdr, HANDSHAKE_SERVER_FLAGS);
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR"]);
++    assert_eq!(ready(&mut cliprdr), ["FDR(49534)"]);
++}
++
++// T-L6. Windows announces one copy with two Format Lists and answers both pastes after the second.
++// oracle: mutant binding a list to the lock current when its request was sent.
++#[test]
++fn a_file_list_is_bound_to_the_lock_current_when_it_arrives() {
++    let (mut cliprdr, calls) = locking_client(true);
++    copy(&mut cliprdr, file_list_format());
++    copy(&mut cliprdr, file_list_format());
++    answer_file_list(&mut cliprdr, "first.txt");
++    assert_eq!(calls.lock().unwrap().file_list_locks, [Some(2)]);
++    assert_eq!(request_range(&mut cliprdr, 1), Some(2));
++}
++
++// T-L7. oracle: mutant keeping, on a remote copy, a lock kept past a local file copy.
++#[test]
++fn a_lock_kept_past_a_local_copy_is_unlocked_by_the_next_remote_copy() {
++    let (mut cliprdr, _calls) = locking_client(true);
++    assert_eq!(copy(&mut cliprdr, file_list_format()), ["FLR", "Lock(1)", "FDR(49534)"]);
++    answer_file_list(&mut cliprdr, "remote.txt");
++    assert_eq!(request_range(&mut cliprdr, 1), Some(1));
++
++    let output = decoded(
++        cliprdr
++            .initiate_file_copy(vec![FileDescriptor::new("local.txt").with_file_size(1)])
++            .unwrap()
++            .into(),
++    );
++    assert_eq!(count(&output, "Unlock("), 0, "{output:?}");
++    // The local copy detached the lock, so a later request carries none.
++    assert_eq!(request_range(&mut cliprdr, 2), None);
++
++    assert_eq!(copy(&mut cliprdr, text_format()), ["FLR", "Unlock(1)", "FDR(13)"]);
++    assert_eq!(copy(&mut cliprdr, text_format()), ["FLR", "FDR(13)"]);
++}
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+index a80cc6c..306b457 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+@@ -10,6 +10,7 @@ mod format_data_correlation;
+ mod immediate_responses;
+ mod inline_copy_and_paste;
+ mod lock_lifecycle;
++mod lock_lifetime;
+ mod lock_strategy;
+ mod lock_timeout;
+ mod loop_detector;
