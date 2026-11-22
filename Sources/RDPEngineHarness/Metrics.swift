@@ -125,6 +125,26 @@ struct IterationResult: Encodable {
     var localFiles: [[String: String]] = []
     /// clipboardWaitLocalPrefix: the pasteboard text that matched.
     var localTexts: [String] = []
+    /// cpuWindow steps (M4 acceptance), in order.
+    var cpuWindows: [CPUWindowResult] = []
+    /// dumpFrame step (M4 acceptance): the last frame written to the work directory.
+    var finalFrame: FinalFrameResult?
+}
+
+/// Client CPU over one cpuWindow step. getrusage(RUSAGE_SELF): the same user + system time
+/// proc_pid_rusage reports for this process.
+struct CPUWindowResult: Encodable {
+    var seconds: Double
+    var userMs: Double
+    var systemMs: Double
+    var framesReceived: UInt64
+}
+
+struct FinalFrameResult: Encodable {
+    /// PPM file name inside the work directory.
+    var file: String
+    var size: [Int]
+    var sha256: String
 }
 
 struct RunResult: Encodable {

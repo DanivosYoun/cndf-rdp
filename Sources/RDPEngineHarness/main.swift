@@ -308,6 +308,29 @@ private final class FrameProbe {
     }
 }
 
+/// Binary PPM (P6, RGB) of a BGRA frame tap buffer: the M4 judge's input.
+func ppmData(_ buffer: CVPixelBuffer) -> Data {
+    CVPixelBufferLockBaseAddress(buffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+    let width = CVPixelBufferGetWidth(buffer)
+    let height = CVPixelBufferGetHeight(buffer)
+    let stride = CVPixelBufferGetBytesPerRow(buffer)
+    var data = Data("P6\n\(width) \(height)\n255\n".utf8)
+    guard let base = CVPixelBufferGetBaseAddress(buffer)?.assumingMemoryBound(to: UInt8.self) else { return data }
+    var rgb = [UInt8](repeating: 0, count: width * height * 3)
+    for y in 0..<height {
+        let row = base + y * stride
+        for x in 0..<width {
+            let o = (y * width + x) * 3
+            rgb[o] = row[x * 4 + 2]
+            rgb[o + 1] = row[x * 4 + 1]
+            rgb[o + 2] = row[x * 4]
+        }
+    }
+    data.append(contentsOf: rgb)
+    return data
+}
+
 /// Wall clock with milliseconds (KST) for stderr lines: the session log has whole seconds only.
 func wallStamp() -> String {
     let formatter = DateFormatter()
@@ -870,6 +893,60 @@ private func runIteration(
             if urls.isEmpty { result.localTexts.append("\(label): " + String((pasteboard.string(forType: .string) ?? "<none>").prefix(400))) }
             fputs("\(wallStamp()) [SNAP] \(label) \(boardSummary(pasteboard))\n", stderr)
             result.steps.append("\(step.op):\(label) n=\(urls.count)")
+        case "cpuWindow":
+            // M4 A1/A2: press the trigger key (screen starts its colour change), then client
+            // CPU (user + system) and frames received over `seconds`, with no frame tap.
+            view.onRenderedFrame = nil
+            let framesBefore = view.statistics?.framesReceived ?? 0
+            let cpuBefore = processCPUMilliseconds()
+            let scanCode = step.scanCode ?? 0x1E
+            view.injectKey(virtualKeyCode: 0, scanCode: scanCode, flags: .down)
+            view.injectKey(virtualKeyCode: 0, scanCode: scanCode, flags: .up)
+            drainRunLoop(step.seconds ?? 9)
+            let cpuAfter = processCPUMilliseconds()
+            let measured = CPUWindowResult(
+                seconds: step.seconds ?? 9,
+                userMs: cpuAfter.user - cpuBefore.user,
+                systemMs: cpuAfter.system - cpuBefore.system,
+                framesReceived: (view.statistics?.framesReceived ?? 0) - framesBefore
+            )
+            result.cpuWindows.append(measured)
+            result.steps.append("cpuWindow:\(measured.framesReceived) frames")
+        case "dumpFrame":
+            // M4 A1/A2: attach a tap, press the key that draws the final picture, and once no
+            // frame arrived for `seconds` (or `timeout` passed) write the last one as PPM.
+            var last: CVPixelBuffer?
+            var lastAt = CACurrentMediaTime()
+            view.onRenderedFrame = { buffer, time in
+                last = buffer
+                lastAt = time
+            }
+            let scanCode = step.scanCode ?? 0x30
+            let pressedAt = CACurrentMediaTime()
+            view.injectKey(virtualKeyCode: 0, scanCode: scanCode, flags: .down)
+            view.injectKey(virtualKeyCode: 0, scanCode: scanCode, flags: .up)
+            let quiet = step.seconds ?? 2
+            _ = waitUntil(step.timeout ?? 15) {
+                last != nil && CACurrentMediaTime() - max(lastAt, pressedAt) >= quiet
+            }
+            view.onRenderedFrame = nil
+            guard let last else {
+                result.steps.append("dumpFrame:noFrame")
+                continue
+            }
+            let url = workDirectory.appendingPathComponent("\(run.id)-\(iteration).final.ppm")
+            do {
+                let data = ppmData(last)
+                try data.write(to: url)
+                result.finalFrame = FinalFrameResult(
+                    file: url.lastPathComponent,
+                    size: [CVPixelBufferGetWidth(last), CVPixelBufferGetHeight(last)],
+                    sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                )
+                result.steps.append("dumpFrame:ok")
+            } catch {
+                result.steps.append("dumpFrame:writeFailed")
+            }
         case "shutdown":
             result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {

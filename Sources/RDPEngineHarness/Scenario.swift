@@ -71,7 +71,8 @@ struct HarnessStep: Decodable {
     /// inputLatency: remote pixel whose colour the probe app changes on each key press.
     var probeX: Int?
     var probeY: Int?
-    /// inputLatency: scan code to press (default 0x1E, "A").
+    /// inputLatency / cpuWindow: scan code to press (default 0x1E, "A");
+    /// dumpFrame: default 0x30 ("B").
     var scanCode: UInt16?
     /// scroll: "line" or "pixel" builds a real scroll-wheel NSEvent (CGEvent with that unit)
     /// and hands it to the view's scrollWheel(with:), like a mouse wheel or a trackpad;
