@@ -86,6 +86,12 @@ struct HarnessStep: Decodable {
     /// scroll: remote pixel the pointer moves to before the first event.
     var pointerX: Int32?
     var pointerY: Int32?
+    /// clipboardSetLocalFiles: absolute Mac paths put on the local pasteboard as file URLs.
+    var paths: [String]?
+    /// clipboardExpectLocalFiles: number of file URLs the pasteboard must carry.
+    var count: Int?
+    /// clipboardWaitLocalPrefix: text prefix the local pasteboard must start with.
+    var prefix: String?
 }
 
 struct HarnessExpectation: Decodable {
