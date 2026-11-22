@@ -43,7 +43,7 @@ public final class IronRDPSession: RDPEngineSession {
     private var pendingTrust: CertificateTrustDecision?
     private var trustClosed = false
     private var lastRemotePointer: RDPRemotePointer?
-    private var logFileURL: URL?
+    private var logFile: RDPSessionLogFile?
     private let logLock = NSLock()
     private let statisticsLock = NSLock()
     private var statisticsStorage = MutableRDPConnectionStatistics()
@@ -302,9 +302,9 @@ public final class IronRDPSession: RDPEngineSession {
                 throw RDPSessionError.unableToCreateBridgeSession
             }
 
-            logFileURL = options.logFileURL
-            if let logFileURL {
-                try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            logFile = options.logFileURL.map { RDPSessionLogFile(url: $0, lock: logLock) }
+            if let logFile {
+                try? FileManager.default.createDirectory(at: logFile.url.deletingLastPathComponent(), withIntermediateDirectories: true)
             }
             resetStatistics()
             emitLog("RDP engine=ironrdp version=\(Self.engineVersion)")
@@ -492,6 +492,8 @@ public final class IronRDPSession: RDPEngineSession {
         let freshness: UInt64
         /// The pasteboard change count when the job was queued (design D3).
         let changeCount: Int?
+        /// Taken when the job is made, so every ending off the pasteboard is logged (design D-T3).
+        let logFile: RDPSessionLogFile?
     }
 
     // Server clipboard callbacks keep only the newest text or file list for main, and file
@@ -562,7 +564,8 @@ public final class IronRDPSession: RDPEngineSession {
             generation: generation,
             connection: connection,
             freshness: freshness,
-            changeCount: clipboardCoordinator?.pasteboardChangeCount
+            changeCount: clipboardCoordinator?.pasteboardChangeCount,
+            logFile: logFile
         )
         guard remoteFileMaterializations.submit(job) else { return }
         // The session stays weak while a materialization waits on range replies.
@@ -572,7 +575,7 @@ public final class IronRDPSession: RDPEngineSession {
                 guard self?.clipboardIsCurrent(generation, connection: connection) == true,
                       self?.remoteClipboardFreshness.isNewest(freshness) == true,
                       let materialize = self?.materializeRemoteFileList else { continue }
-                let manager = job.manager
+                let (manager, logFile) = (job.manager, job.logFile)
                 do {
                     let urls = try materialize(manager, job.entries) { [weak self] in
                         self?.clipboardIsCurrent(generation, connection: connection) == true
@@ -581,9 +584,13 @@ public final class IronRDPSession: RDPEngineSession {
                     // The worker owns the result until it is handed over (INV-T3).
                     guard let self else {
                         manager.discard(urls)
+                        logFile?.append("Remote file materialization discarded: the connection ended.")
                         continue
                     }
-                    self.deliverClipboard(generation, connection: connection, dropped: { manager.discard(urls) }) { session in
+                    self.deliverClipboard(generation, connection: connection, dropped: {
+                        manager.discard(urls)
+                        logFile?.append("Remote file materialization discarded: the connection ended.")
+                    }) { session in
                         guard session.remoteClipboardFreshness.isNewest(freshness) else {
                             manager.discard(urls)
                             session.emitLog("Remote file materialization superseded by a newer server clipboard.")
@@ -598,8 +605,13 @@ public final class IronRDPSession: RDPEngineSession {
                         session.delegate?.rdpSession(session, didLog: "Remote files materialized to local pasteboard: \(urls.count) item(s).")
                     }
                 } catch {
-                    self?.deliverClipboard(generation, connection: connection) { session in
-                        session.emitLog("Remote file materialization failed: \(error)")
+                    // The connection's end is the usual cause, so this line does not wait for the
+                    // connection, the session, or the delegate (INV-LOG1).
+                    let message = "Remote file materialization failed: \(error)"
+                    logFile?.append(message)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.delegate?.rdpSession(self, didLog: message)
                     }
                 }
             }
@@ -798,21 +810,7 @@ public final class IronRDPSession: RDPEngineSession {
     }
 
     private func emitLog(_ message: String) {
-        if let logFileURL {
-            logLock.lock()
-            defer { logLock.unlock() }
-            let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-            if let data = line.data(using: .utf8) {
-                if FileManager.default.fileExists(atPath: logFileURL.path),
-                   let handle = try? FileHandle(forWritingTo: logFileURL) {
-                    _ = try? handle.seekToEnd()
-                    try? handle.write(contentsOf: data)
-                    try? handle.close()
-                } else {
-                    try? data.write(to: logFileURL, options: .atomic)
-                }
-            }
-        }
+        logFile?.append(message)
         delegate?.rdpSession(self, didLog: message)
     }
 
