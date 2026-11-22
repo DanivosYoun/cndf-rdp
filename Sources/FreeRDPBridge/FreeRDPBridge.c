@@ -43,6 +43,8 @@
 #define RDP_BRIDGE_CODEC_SLOTS 17
 // 보낸 뒤 응답을 기다리는 RANGE 스트림의 최대 수(설계 D-G3). 가득 차면 새 요청을 거부한다.
 #define RDP_BRIDGE_CLIP_RANGES 8
+// 서버가 건 잠금(Mac→Windows)을 기억하는 최대 수(설계 D-L5). 넘치면 가장 오래된 것을 잊는다.
+#define RDP_BRIDGE_CLIP_SERVER_LOCKS 100
 
 struct RDPBridgeSession {
     RDPBridgeCallbacks callbacks;
@@ -80,11 +82,24 @@ struct RDPBridgeSession {
     // 보내는 호출자 스레드가 함께 쓰므로 clip_range_lock 아래에서만 읽고 쓴다.
     // clip_copy: 서버 FL·MonitorReady 마다 오른다. clip_ranges_copy: 마지막으로 앱에 넘긴
     // 파일 목록의 세대(0 = 넘긴 것 없음). clip_ranges: 보낸 뒤 응답을 기다리는 스트림.
-    // 잠금을 쥔 채 FreeRDP 호출이나 Swift 콜백을 부르지 않는다.
+    // 잠금을 쥔 채 Swift 콜백을 부르지 않는다. FreeRDP 호출은 RANGE 송신(큐 투입만 하는 비차단 호출) 하나만
+    // 잠금 안에서 한다(설계 clip-lock D-L3): 관문 통과와 큐 투입이 FL 의 Unlock 보다 먼저인지가 한 잠금으로 정해진다.
     uint64_t clip_copy;
     uint64_t clip_ranges_copy;
     uint32_t clip_ranges[RDP_BRIDGE_CLIP_RANGES];
     size_t clip_range_count;
+    // 원격 복사 잠금(설계 clip-lock D-L3·D-L4·D-L5, INV-L1~L8). 위 세대와 같이 clip_range_lock 아래에서만
+    // 읽고 쓴다. clip_lock_next: 다음 잠금 id(0 은 건너뜀). clip_lock_cur: 보유 중인 송신 잠금(0 = 없음,
+    // 다음 서버 FL 에서 푼다). clip_ranges_lock: 앱에 넘긴 목록의 잠금, RANGE 의 clipDataId.
+    // clip_stale_answer: 최신 서버 FL 뒤에 기다리지 않던 RANGE 응답이 왔다(P4 의심 표지).
+    // clip_server_locks: 서버가 건 잠금과 그때의 로컬 제공 세대 clip_local_gen(FIFO).
+    UINT32 clip_lock_next;
+    UINT32 clip_lock_cur;
+    UINT32 clip_ranges_lock;
+    bool clip_stale_answer;
+    uint64_t clip_local_gen;
+    struct { UINT32 id; uint64_t gen; } clip_server_locks[RDP_BRIDGE_CLIP_SERVER_LOCKS];
+    size_t clip_server_lock_count;
     CRITICAL_SECTION clip_range_lock;
     bool clip_range_lock_initialized;
     // TLS 1.2 자동 폴백 재시도: 첫 연결이 TLS connect 단계에서 실패하면(예: Entra
@@ -305,6 +320,10 @@ static UINT bridge_send_client_format_list(RDPBridgeSession *session) {
     list.common.msgType = CB_FORMAT_LIST;
     list.numFormats = count;
     list.formats = formats;
+    // 새 로컬 제공: 이전 제공에 걸린 서버 잠금으로 온 요청은 FAIL 로 답한다(설계 D-L5, INV-L8).
+    EnterCriticalSection(&session->clip_range_lock);
+    session->clip_local_gen++;
+    LeaveCriticalSection(&session->clip_range_lock);
     bridge_logf(
         session,
         "Clipboard local formats advertised: text=%s files=%zu.",
@@ -430,10 +449,17 @@ static bool bridge_take_waiting_range(RDPBridgeSession *session, uint32_t stream
 
 // 원격 복사 세대를 올린다(설계 D-G3, INV-G1·G3). 기다리던 RANGE 는 모두 FAIL(NULL, 0)로
 // 끝내고, 그 뒤 도착하는 응답은 표에 없으므로 버려진다. 콜백은 잠금을 푼 뒤에 부른다.
-static void bridge_replace_remote_clipboard(RDPBridgeSession *session) {
+// released 가 있으면(서버 FL) 같은 잠금 안에서 보유 잠금을 내놓고 의심 표지를 지운다(설계 clip-lock D-L3·D-L4).
+// MonitorReady 는 NULL 을 준다: 같은 채널의 잠금은 잊지 않고 다음 FL 에서 푼다(INV-L6).
+static void bridge_replace_remote_clipboard(RDPBridgeSession *session, UINT32 *released) {
     uint32_t streams[RDP_BRIDGE_CLIP_RANGES];
     EnterCriticalSection(&session->clip_range_lock);
     session->clip_copy++;
+    if (released != NULL) {
+        *released = session->clip_lock_cur;
+        session->clip_lock_cur = 0;
+        session->clip_stale_answer = false;
+    }
     const size_t count = session->clip_range_count;
     memcpy(streams, session->clip_ranges, count * sizeof(streams[0]));
     session->clip_range_count = 0;
@@ -445,6 +471,18 @@ static void bridge_replace_remote_clipboard(RDPBridgeSession *session) {
     for (size_t index = 0; index < count; index++) {
         session->callbacks.remoteFileContents(streams[index], NULL, 0, session->callbacks.context);
     }
+}
+
+// 새 cliprdr 채널: 이전 채널의 서버 능력·잠금·의심 표지·서버 잠금 표는 Unlock 없이 잊는다(설계 clip-lock INV-L6).
+// 잠금 id 는 이어서 센다.
+static void bridge_reset_clip_channel(RDPBridgeSession *session) {
+    session->server_clip_flags = 0;
+    EnterCriticalSection(&session->clip_range_lock);
+    session->clip_lock_cur = 0;
+    session->clip_ranges_lock = 0;
+    session->clip_stale_answer = false;
+    session->clip_server_lock_count = 0;
+    LeaveCriticalSection(&session->clip_range_lock);
 }
 
 static UINT bridge_cliprdr_server_format_data_response(
@@ -478,9 +516,23 @@ static UINT bridge_cliprdr_server_format_data_response(
             bridge_logf(session, "Clipboard received remote file descriptor list: bytes=%u.", response->common.dataLen);
             // 넘기기 직전에 이 세대를 RANGE 대상으로 정한다(INV-G4). D-2 덕분에 여기 오는 응답은
             // 늘 최신 FL 의 요청에 대한 것이다. 콜백 안에서 곧바로 보낸 RANGE 도 수락된다.
+            // 이 목록의 잠금은 응답이 도착한 지금의 보유 잠금이다(INV-L3). 잠금 없는 목록은 의심 표지가 선 동안
+            // 넘기지 않는다(P4, INV-L7): 옛 요청의 응답이 섞인 서버 목록일 수 있다.
             EnterCriticalSection(&session->clip_range_lock);
-            session->clip_ranges_copy = session->clip_copy;
+            const UINT32 lock_id = session->clip_lock_cur;
+            const bool refused = (lock_id == 0) && session->clip_stale_answer;
+            if (!refused) {
+                session->clip_ranges_copy = session->clip_copy;
+                session->clip_ranges_lock = lock_id;
+            }
             LeaveCriticalSection(&session->clip_range_lock);
+            if ((lock_id == 0) && (session->server_clip_flags & CB_CAN_LOCK_CLIPDATA)) {
+                bridge_log(session, "Clipboard remote file list has no lock.");
+            }
+            if (refused) {
+                bridge_log(session, "Clipboard remote file list refused reason=stale-server-list.");
+                return CHANNEL_RC_OK;
+            }
             session->callbacks.remoteFileList(
                 response->requestedFormatData,
                 response->common.dataLen,
@@ -552,7 +604,7 @@ static UINT bridge_cliprdr_monitor_ready(
     session->clip_requests_stale = 0;
     session->clip_request_format = 0;
     // 채널 경계: 이전 채널에서 넘긴 목록의 RANGE 는 더 이상 보내지 않는다(INV-G1).
-    bridge_replace_remote_clipboard(session);
+    bridge_replace_remote_clipboard(session, NULL);
     CLIPRDR_GENERAL_CAPABILITY_SET general = { 0 };
     CLIPRDR_CAPABILITIES capabilities = { 0 };
     general.capabilitySetType = CB_CAPSTYPE_GENERAL;
@@ -561,6 +613,7 @@ static UINT bridge_cliprdr_monitor_ready(
     general.generalFlags = CB_USE_LONG_FORMAT_NAMES |
                            CB_STREAM_FILECLIP_ENABLED |
                            CB_FILECLIP_NO_FILE_PATHS |
+                           CB_CAN_LOCK_CLIPDATA |
                            CB_HUGE_FILE_SUPPORT_ENABLED;
     capabilities.common.msgType = CB_CLIP_CAPS;
     capabilities.cCapabilitiesSets = 1;
@@ -582,7 +635,9 @@ static UINT bridge_cliprdr_server_format_list(
         return CHANNEL_RC_OK;
     }
     // 새 복사: 진행 중인 RANGE 를 끝내고, 지금까지 넘긴 목록의 RANGE 를 막는다(INV-G2·G3).
-    bridge_replace_remote_clipboard((RDPBridgeSession *)cliprdr->custom);
+    // 보유 잠금도 함께 내놓는다: 관문이 닫힌 뒤라 그 id 를 단 RANGE 는 더 나가지 않는다(INV-L4).
+    UINT32 released = 0;
+    bridge_replace_remote_clipboard((RDPBridgeSession *)cliprdr->custom, &released);
 
     CLIPRDR_FORMAT_LIST_RESPONSE list_response = { 0 };
     list_response.common.msgType = CB_FORMAT_LIST_RESPONSE;
@@ -592,6 +647,15 @@ static UINT bridge_cliprdr_server_format_list(
     bridge_logf(session, "Clipboard remote format list received: count=%u.", format_list->numFormats);
     // 이 FL 이전에 보낸 요청의 응답은 Swift 로 보내지 않는다(설계 D-2).
     session->clip_requests_stale = session->clip_requests_pending;
+    // 순서 FLR → Unlock(이전 잠금) → Lock(파일일 때) → 서술자 요청(설계 clip-lock D-L1, INV-L2).
+    // 나가 있던 옛 RANGE 는 이 Unlock 보다 먼저 큐에 들어갔다(관문~큐 투입이 한 잠금 안, D-L3).
+    if ((released != 0) && (cliprdr->ClientUnlockClipboardData != NULL)) {
+        CLIPRDR_UNLOCK_CLIPBOARD_DATA unlock = { 0 };
+        unlock.common.msgType = CB_UNLOCK_CLIPDATA;
+        unlock.clipDataId = released;
+        const UINT status = cliprdr->ClientUnlockClipboardData(cliprdr, &unlock);
+        bridge_logf(session, "Clipboard unlocked remote clipboard data: id=%u status=%u.", released, status);
+    }
 
     for (UINT32 index = 0; index < format_list->numFormats; index++) {
         bridge_logf(
@@ -605,6 +669,25 @@ static UINT bridge_cliprdr_server_format_list(
             CLIPRDR_FORMAT_DATA_REQUEST request = { 0 };
             request.common.msgType = CB_FORMAT_DATA_REQUEST;
             request.requestedFormatId = format_list->formats[index].formatId;
+            // 서버가 CAN_LOCK 을 알린 채널에서만 잠근다(INV-L5). 잠금이 잡는 데이터 = 서술자가 기술하는 데이터.
+            if ((session->server_clip_flags & CB_CAN_LOCK_CLIPDATA) && (cliprdr->ClientLockClipboardData != NULL)) {
+                EnterCriticalSection(&session->clip_range_lock);
+                if (++session->clip_lock_next == 0) {
+                    session->clip_lock_next = 1;
+                }
+                const UINT32 lock_id = session->clip_lock_next;
+                LeaveCriticalSection(&session->clip_range_lock);
+                CLIPRDR_LOCK_CLIPBOARD_DATA lock = { 0 };
+                lock.common.msgType = CB_LOCK_CLIPDATA;
+                lock.clipDataId = lock_id;
+                const UINT lock_status = cliprdr->ClientLockClipboardData(cliprdr, &lock);
+                if (lock_status == CHANNEL_RC_OK) {
+                    EnterCriticalSection(&session->clip_range_lock);
+                    session->clip_lock_cur = lock_id;
+                    LeaveCriticalSection(&session->clip_range_lock);
+                }
+                bridge_logf(session, "Clipboard locked remote clipboard data: id=%u status=%u.", lock_id, lock_status);
+            }
             bridge_logf(session, "Clipboard requesting remote file descriptor format: id=%u.", request.requestedFormatId);
             const UINT status = cliprdr->ClientFormatDataRequest(cliprdr, &request);
             if (status == CHANNEL_RC_OK) {
@@ -641,6 +724,63 @@ static UINT bridge_send_file_contents_failure(
     return cliprdr->ClientFileContentsResponse(cliprdr, &response);
 }
 
+// 서버 잠금 표에서 id 의 칸을 찾는다(없으면 count). 호출자가 clip_range_lock 을 쥐고 있어야 한다.
+static size_t bridge_find_server_lock(RDPBridgeSession *session, UINT32 id) {
+    size_t index = 0;
+    while ((index < session->clip_server_lock_count) && (session->clip_server_locks[index].id != id)) {
+        index++;
+    }
+    return index;
+}
+
+// 서버 잠금 표에서 index 칸을 빼고 뒤를 당긴다(FIFO 순서 유지). 호출자가 clip_range_lock 을 쥐고 있어야 한다.
+static void bridge_drop_server_lock(RDPBridgeSession *session, size_t index) {
+    session->clip_server_lock_count--;
+    memmove(&session->clip_server_locks[index],
+            &session->clip_server_locks[index + 1],
+            (session->clip_server_lock_count - index) * sizeof(session->clip_server_locks[0]));
+}
+
+// 서버가 Mac 데이터를 잠갔다: 그 잠금을 지금의 로컬 제공 세대에 묶는다(설계 D-L5, INV-L8).
+static UINT bridge_cliprdr_server_lock_clipboard_data(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_LOCK_CLIPBOARD_DATA *lock) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (lock == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    EnterCriticalSection(&session->clip_range_lock);
+    size_t index = bridge_find_server_lock(session, lock->clipDataId);
+    if (index < session->clip_server_lock_count) {
+        bridge_drop_server_lock(session, index);
+    } else if (session->clip_server_lock_count == RDP_BRIDGE_CLIP_SERVER_LOCKS) {
+        bridge_drop_server_lock(session, 0);
+    }
+    session->clip_server_locks[session->clip_server_lock_count].id = lock->clipDataId;
+    session->clip_server_locks[session->clip_server_lock_count].gen = session->clip_local_gen;
+    session->clip_server_lock_count++;
+    LeaveCriticalSection(&session->clip_range_lock);
+    bridge_logf(session, "Clipboard server locked local clipboard data: id=%u.", lock->clipDataId);
+    return CHANNEL_RC_OK;
+}
+
+static UINT bridge_cliprdr_server_unlock_clipboard_data(
+    CliprdrClientContext *cliprdr,
+    const CLIPRDR_UNLOCK_CLIPBOARD_DATA *unlock) {
+    if ((cliprdr == NULL) || (cliprdr->custom == NULL) || (unlock == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+    RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    EnterCriticalSection(&session->clip_range_lock);
+    const size_t index = bridge_find_server_lock(session, unlock->clipDataId);
+    if (index < session->clip_server_lock_count) {
+        bridge_drop_server_lock(session, index);
+    }
+    LeaveCriticalSection(&session->clip_range_lock);
+    bridge_logf(session, "Clipboard server unlocked local clipboard data: id=%u.", unlock->clipDataId);
+    return CHANNEL_RC_OK;
+}
+
 static UINT bridge_cliprdr_server_file_contents_request(
     CliprdrClientContext *cliprdr,
     const CLIPRDR_FILE_CONTENTS_REQUEST *request) {
@@ -649,6 +789,18 @@ static UINT bridge_cliprdr_server_file_contents_request(
     }
 
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    // 잠금 id 를 단 요청은 그 잠금이 지금 제공에 걸린 것일 때만 답한다(설계 D-L5, INV-L8). 모르는 id 도 FAIL.
+    if (request->haveClipDataId) {
+        EnterCriticalSection(&session->clip_range_lock);
+        const size_t index = bridge_find_server_lock(session, request->clipDataId);
+        const bool current = (index < session->clip_server_lock_count) &&
+                             (session->clip_server_locks[index].gen == session->clip_local_gen);
+        LeaveCriticalSection(&session->clip_range_lock);
+        if (!current) {
+            bridge_logf(session, "Clipboard local file request refused reason=replaced-offer: id=%u.", request->clipDataId);
+            return bridge_send_file_contents_failure(cliprdr, request);
+        }
+    }
     if (request->listIndex >= session->local_file_count) {
         bridge_logf(session, "Clipboard local file request rejected: listIndex=%u count=%zu.", request->listIndex, session->local_file_count);
         return bridge_send_file_contents_failure(cliprdr, request);
@@ -724,6 +876,10 @@ static UINT bridge_cliprdr_server_file_contents_response(
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
     EnterCriticalSection(&session->clip_range_lock);
     const bool waiting = bridge_take_waiting_range(session, response->streamId);
+    if (!waiting) {
+        // 최신 서버 FL 뒤에 온 옛 요청의 응답: 서버 목록이 고착됐을 수 있다(P4 의심 표지, INV-L7).
+        session->clip_stale_answer = true;
+    }
     LeaveCriticalSection(&session->clip_range_lock);
     if (!waiting) {
         bridge_logf(session, "Clipboard dropped remote file contents for a stream not waiting: stream=%u.", response->streamId);
@@ -908,6 +1064,9 @@ static void bridge_channel_connected(void *context, const ChannelConnectedEventA
         session->cliprdr->ServerFormatDataResponse = bridge_cliprdr_server_format_data_response;
         session->cliprdr->ServerFileContentsRequest = bridge_cliprdr_server_file_contents_request;
         session->cliprdr->ServerFileContentsResponse = bridge_cliprdr_server_file_contents_response;
+        session->cliprdr->ServerLockClipboardData = bridge_cliprdr_server_lock_clipboard_data;
+        session->cliprdr->ServerUnlockClipboardData = bridge_cliprdr_server_unlock_clipboard_data;
+        bridge_reset_clip_channel(session);
         bridge_log(session, "Clipboard channel connected.");
     }
 }
@@ -935,6 +1094,9 @@ static void bridge_attach_cliprdr(RDPBridgeSession *session) {
     session->cliprdr->ServerFormatDataResponse = bridge_cliprdr_server_format_data_response;
     session->cliprdr->ServerFileContentsRequest = bridge_cliprdr_server_file_contents_request;
     session->cliprdr->ServerFileContentsResponse = bridge_cliprdr_server_file_contents_response;
+    session->cliprdr->ServerLockClipboardData = bridge_cliprdr_server_lock_clipboard_data;
+    session->cliprdr->ServerUnlockClipboardData = bridge_cliprdr_server_unlock_clipboard_data;
+    bridge_reset_clip_channel(session);
     bridge_log(session, "Clipboard channel attached.");
 }
 
@@ -2195,15 +2357,16 @@ RDPBridgeStatus rdp_bridge_request_remote_file_range(
         return RDPBridgeStatusInternalError;
     }
     session->clip_ranges[session->clip_range_count++] = stream_id;
-    LeaveCriticalSection(&session->clip_range_lock);
-
-    if (session->cliprdr->ClientFileContentsRequest(session->cliprdr, &request) != CHANNEL_RC_OK) {
-        EnterCriticalSection(&session->clip_range_lock);
+    // 넘긴 목록의 잠금을 달고, 관문을 통과한 그 잠금 안에서 큐에 넣는다(설계 clip-lock D-L3, INV-L3·L4).
+    // 그래서 FL 이 푼 id 는 와이어에 나가지 않는다. ClientFileContentsRequest 는 큐 투입만 하고 돌아온다.
+    request.haveClipDataId = (session->clip_ranges_lock != 0) ? TRUE : FALSE;
+    request.clipDataId = session->clip_ranges_lock;
+    const UINT status = session->cliprdr->ClientFileContentsRequest(session->cliprdr, &request);
+    if (status != CHANNEL_RC_OK) {
         (void)bridge_take_waiting_range(session, stream_id);
-        LeaveCriticalSection(&session->clip_range_lock);
-        return RDPBridgeStatusInternalError;
     }
-    return RDPBridgeStatusOK;
+    LeaveCriticalSection(&session->clip_range_lock);
+    return (status == CHANNEL_RC_OK) ? RDPBridgeStatusOK : RDPBridgeStatusInternalError;
 #else
     (void)stream_id;
     (void)list_index;
