@@ -400,7 +400,10 @@ mod tests {
                 clip_receive.recv_timeout(Duration::from_secs(2)).unwrap(),
                 (generation, text.as_bytes().to_vec())
             );
-            let path = std::env::temp_dir().join(format!("cndf-iron-stub-{}", std::process::id()));
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("cndf-iron-stub-{}", std::process::id()));
             std::fs::write(&path, b"file").unwrap();
             let path_c = CString::new(path.to_str().unwrap()).unwrap();
             let name = c"root\\한글.txt";

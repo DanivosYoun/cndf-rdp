@@ -1128,6 +1128,8 @@ mod real {
         #[test]
         fn file_contents_range_returns_the_remaining_bytes_at_eof() {
             let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("cndf-iron-file-contents-{}", std::process::id()));
             let mut fixture = std::fs::File::create_new(&path).unwrap();
             std::io::Write::write_all(&mut fixture, b"CNDF").unwrap();
@@ -1436,8 +1438,10 @@ mod real {
 
         /// A sparse file, so reads cost no disk space.
         fn sparse_file(name: &str, size: u64) -> (Fixture, LocalFile) {
-            let path =
-                std::env::temp_dir().join(format!("cndf-iron-{name}-{}", std::process::id()));
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("cndf-iron-{name}-{}", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let file = std::fs::File::create_new(&path).unwrap();
             let fixture = Fixture(path.clone());
