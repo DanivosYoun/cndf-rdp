@@ -1,0 +1,518 @@
+diff --git a/crates/ironrdp-egfx/src/avc444.rs b/crates/ironrdp-egfx/src/avc444.rs
+index d5fc2459..e0ef226a 100644
+--- a/crates/ironrdp-egfx/src/avc444.rs
++++ b/crates/ironrdp-egfx/src/avc444.rs
+@@ -190,6 +190,49 @@ impl Yuv444Frame {
+     ///
+     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+     pub fn to_rgba(&self, rect: &ExclusiveRectangle) -> Vec<u8> {
++        let right = usize::from(rect.right.min(self.width));
++        let bottom = usize::from(rect.bottom.min(self.height));
++        let (left, top) = (usize::from(rect.left), usize::from(rect.top));
++        if !(left < right && top < bottom) {
++            return Vec::new();
++        }
++        let row_bytes = (right - left) * 4;
++        let mut rgba = vec![0; row_bytes * (bottom - top)];
++        for (row, dst) in (top..bottom).zip(rgba.chunks_exact_mut(row_bytes)) {
++            let line = row * self.stride;
++            let span = line + left..line + right;
++            let pixels = self.y[span.clone()]
++                .iter()
++                .zip(&self.u[span.clone()])
++                .zip(&self.v[span]);
++            let output = dst.chunks_exact_mut(4);
++            if row % 2 == 0 {
++                // The reverse filter reads the whole 2x2 block, even past the
++                // region edge. The even padded dimensions keep those reads in bounds.
++                for (col, (((&y, &u), &v), out)) in (left..right).zip(pixels.zip(output)) {
++                    let (u, v) = if col % 2 == 0 {
++                        let next = line + col + 1;
++                        let below = line + self.stride + col;
++                        (
++                            reverse_filter(u, self.u[next], self.u[below], self.u[below + 1]),
++                            reverse_filter(v, self.v[next], self.v[below], self.v[below + 1]),
++                        )
++                    } else {
++                        (u, v)
++                    };
++                    out.copy_from_slice(&rgba_from_offsets(y, chroma_offsets(u, v)));
++                }
++            } else {
++                for (((&y, &u), &v), out) in pixels.zip(output) {
++                    out.copy_from_slice(&rgba_from_offsets(y, chroma_offsets(u, v)));
++                }
++            }
++        }
++        rgba
++    }
++
++    #[cfg(test)]
++    fn to_rgba_reference(&self, rect: &ExclusiveRectangle) -> Vec<u8> {
+         let right = usize::from(rect.right.min(self.width));
+         let bottom = usize::from(rect.bottom.min(self.height));
+         let (left, top) = (usize::from(rect.left), usize::from(rect.top));
+@@ -209,7 +252,7 @@ impl Yuv444Frame {
+                     u = reverse_filter(u, self.u[at + 1], self.u[below], self.u[below + 1]);
+                     v = reverse_filter(v, self.v[at + 1], self.v[below], self.v[below + 1]);
+                 }
+-                rgba.extend_from_slice(&yuv_to_rgba(self.y[at], u, v));
++                rgba.extend_from_slice(&yuv_to_rgba_reference(self.y[at], u, v));
+             }
+         }
+         rgba
+@@ -434,7 +477,24 @@ fn average(a: u8, b: u8, c: u8, d: u8) -> u8 {
+ /// Converts a pixel with the reverse transform of [MS-RDPEGFX] 3.3.8.3.1 ("Color Conversion").
+ ///
+ /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+-pub(crate) fn yuv_to_rgba(y: u8, u: u8, v: u8) -> [u8; 4] {
++pub(crate) fn chroma_offsets(u: u8, v: u8) -> [i32; 3] {
++    let u = i32::from(u) - 128;
++    let v = i32::from(v) - 128;
++    [403 * v, -48 * u - 120 * v, 475 * u]
++}
++
++pub(crate) fn rgba_from_offsets(y: u8, [r, g, b]: [i32; 3]) -> [u8; 4] {
++    let luma = 256 * i32::from(y);
++    [
++        clamp_channel((luma + r) >> 8),
++        clamp_channel((luma + g) >> 8),
++        clamp_channel((luma + b) >> 8),
++        0xFF,
++    ]
++}
++
++#[cfg(test)]
++pub(crate) fn yuv_to_rgba_reference(y: u8, u: u8, v: u8) -> [u8; 4] {
+     let luma = 256 * i32::from(y);
+     let u = i32::from(u) - 128;
+     let v = i32::from(v) - 128;
+@@ -463,3 +523,26 @@ fn clamp_channel(value: i32) -> u8 {
+     let [low, ..] = value.clamp(0, 255).to_le_bytes();
+     low
+ }
++
++#[cfg(test)]
++#[test]
++fn t9_avc444_regions_match_reference() {
++    use crate::decode::conversion_tests::{SIZES, regions, samples};
++
++    let mut seed = 0x271f_551b;
++    for (width, height) in SIZES {
++        for (min, y_max, uv_max) in [(0, 255, 255), (16, 235, 240)] {
++            let mut frame = Yuv444Frame::new(width, height);
++            frame.y = samples(&mut seed, frame.y, min, y_max);
++            frame.u = samples(&mut seed, frame.u, min, uv_max);
++            frame.v = samples(&mut seed, frame.v, min, uv_max);
++            for rect in regions(&mut seed, width, height) {
++                assert_eq!(
++                    frame.to_rgba(&rect),
++                    frame.to_rgba_reference(&rect),
++                    "{width}x{height} {rect:?}"
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index e63b9171..349a4a8f 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -1344,14 +1344,23 @@ impl GraphicsPipelineClient {
+             return Ok(());
+         };
+ 
+-        // A decoder returning YUV planes is converted with the transform MS-RDPEGFX
+-        // specifies, whatever matrix it would convert with itself.
++        enum Picture {
++            Yuv(crate::decode::Yuv420Frame),
++            Rgba(crate::decode::DecodedFrame),
++        }
++
++        // Convert YUV with the transform MS-RDPEGFX specifies, and defer
++        // conversion until the rectangle to emit is known.
+         let frame = if decoder.supports_yuv420() {
+-            decoder.decode_yuv420(stream.data).map(|picture| picture.to_rgba())
++            decoder.decode_yuv420(stream.data).map(Picture::Yuv)
+         } else {
+-            decoder.decode(stream.data)
++            decoder.decode(stream.data).map(Picture::Rgba)
+         }
+         .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
++        let (frame_width, frame_height) = match &frame {
++            Picture::Yuv(picture) => (u32::from(picture.width()), u32::from(picture.height())),
++            Picture::Rgba(picture) => (picture.width(), picture.height()),
++        };
+ 
+         // MS-RDPEGFX 2.2.1.4.1: RDPGFX_RECT16 right/bottom are exclusive (one-past-end),
+         // so dimensions are right-left / bottom-top despite the parsed type's name.
+@@ -1361,13 +1370,11 @@ impl GraphicsPipelineClient {
+         // Decoded frame must be at least as large as the destination rectangle.
+         // Larger is expected (macroblock alignment) and handled by cropping.
+         // Smaller means the server sent mismatched dimensions.
+-        if frame.width() < u32::from(dest_width) || frame.height() < u32::from(dest_height) {
++        if frame_width < u32::from(dest_width) || frame_height < u32::from(dest_height) {
+             return Err(pdu_other_err!(
+                 "decoded frame smaller than destination rectangle",
+                 source: crate::decode::DecoderError::msg(format!(
+-                    "frame_width={}, frame_height={}, dest_width={dest_width}, dest_height={dest_height}",
+-                    frame.width(),
+-                    frame.height(),
++                    "frame_width={frame_width}, frame_height={frame_height}, dest_width={dest_width}, dest_height={dest_height}",
+                 )),
+             ));
+         }
+@@ -1415,7 +1422,17 @@ impl GraphicsPipelineClient {
+             // No region metadata: fall back to the single bounding-box update,
+             // copying from the frame origin. This matches the pre-#2042 behavior
+             // for streams that legitimately omit regionRects.
+-            let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
++            let cropped_data = match &frame {
++                Picture::Yuv(picture) => picture.to_rgba_region(&ExclusiveRectangle {
++                    left: 0,
++                    top: 0,
++                    right: dest_width,
++                    bottom: dest_height,
++                }),
++                Picture::Rgba(picture) => {
++                    crop_decoded_frame(picture.data(), frame_width, frame_height, dest_width, dest_height)
++                }
++            };
+             emit_avc420(dest_rect.clone(), cropped_data);
+             return Ok(());
+         }
+@@ -1424,8 +1441,8 @@ impl GraphicsPipelineClient {
+             // Clip the region to the surface and the decoded frame so a
+             // malformed or over-large rect cannot read out of bounds or paint
+             // outside the surface.
+-            let frame_w = u16::try_from(frame.width()).unwrap_or(u16::MAX);
+-            let frame_h = u16::try_from(frame.height()).unwrap_or(u16::MAX);
++            let frame_w = u16::try_from(frame_width).unwrap_or(u16::MAX);
++            let frame_h = u16::try_from(frame_height).unwrap_or(u16::MAX);
+             let clip_right = region.right.min(surface_bounds.0).min(frame_w);
+             let clip_bottom = region.bottom.min(surface_bounds.1).min(frame_h);
+             if region.left >= clip_right || region.top >= clip_bottom {
+@@ -1459,7 +1476,10 @@ impl GraphicsPipelineClient {
+ 
+             // Copy pixels (x, y) -> (x, y): the source in the decoded frame is the
+             // region's own top-left, not the frame origin.
+-            let data = copy_frame_region(frame.data(), frame.width(), &clipped);
++            let data = match &frame {
++                Picture::Yuv(picture) => picture.to_rgba_region(&clipped),
++                Picture::Rgba(picture) => copy_frame_region(picture.data(), frame_width, &clipped),
++            };
+             emit_avc420(clipped, data);
+         }
+         Ok(())
+@@ -3749,6 +3769,121 @@ mod tests {
+         buf
+     }
+ 
++    #[test]
++    fn t9_avc420_emits_reference_updates() {
++        use crate::decode::conversion_tests::{SIZES, picture, regions};
++        use crate::decode::{DecodedFrame, DecoderResult, Yuv420Frame};
++
++        struct PlanarDecoder(Yuv420Frame);
++        impl H264Decoder for PlanarDecoder {
++            fn decode(&mut self, _: &[u8]) -> DecoderResult<DecodedFrame> {
++                panic!("AVC420 must consume the planes")
++            }
++
++            fn supports_yuv420(&self) -> bool {
++                true
++            }
++
++            fn decode_yuv420(&mut self, _: &[u8]) -> DecoderResult<Yuv420Frame> {
++                Ok(self.0.clone())
++            }
++        }
++
++        type CapturedRegion = (ExclusiveRectangle, Vec<u8>);
++
++        #[derive(Default)]
++        struct Updates(Arc<Mutex<Vec<CapturedRegion>>>);
++        impl GraphicsPipelineHandler for Updates {
++            fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
++                assert_eq!(update.surface_id, 1);
++                assert_eq!(update.codec_id, Codec1Type::Avc420);
++                let rect = &update.destination_rectangle;
++                assert_eq!(update.width, rect.right - rect.left);
++                assert_eq!(update.height, rect.bottom - rect.top);
++                self.0.lock().unwrap().push((rect.clone(), update.data.clone()));
++            }
++        }
++
++        let mut seed = 0xb1ca_800f;
++        for (width, height) in SIZES {
++            for video_range in [false, true] {
++                let picture = picture(&mut seed, width, height, video_range);
++                let reference = picture.to_rgba_reference();
++                // Clip right to the surface and bottom to the decoded frame.
++                let surface_width = width.saturating_sub(1).max(1);
++                let mut rects = regions(&mut seed, width, height);
++                rects.push(ExclusiveRectangle {
++                    left: 0,
++                    top: 0,
++                    right: width + 2,
++                    bottom: height + 2,
++                });
++                let expected = rects
++                    .iter()
++                    .filter_map(|rect| {
++                        let clipped = ExclusiveRectangle {
++                            right: rect.right.min(surface_width),
++                            bottom: rect.bottom.min(height),
++                            ..rect.clone()
++                        };
++                        if clipped.left >= clipped.right || clipped.top >= clipped.bottom {
++                            return None;
++                        }
++                        let data = copy_frame_region(reference.data(), reference.width(), &clipped);
++                        Some((clipped, data))
++                    })
++                    .collect::<Vec<_>>();
++
++                let updates = Updates::default();
++                let captured = Arc::clone(&updates.0);
++                let mut client = GraphicsPipelineClient::new(Box::new(updates), Some(Box::new(PlanarDecoder(picture))));
++                client
++                    .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++                        surface_id: 1,
++                        width: surface_width,
++                        height: height + 2,
++                        pixel_format: PixelFormat::XRgb,
++                    }))
++                    .unwrap();
++                client
++                    .decode_avc420(
++                        1,
++                        &ExclusiveRectangle {
++                            left: 0,
++                            top: 0,
++                            right: width,
++                            bottom: height,
++                        },
++                        &encode_avc420_wire(&rects),
++                    )
++                    .unwrap();
++                assert_eq!(*captured.lock().unwrap(), expected, "{width}x{height} regions");
++
++                // Without metadata the destination can be offset, but its source is the origin.
++                captured.lock().unwrap().clear();
++                let dest = ExclusiveRectangle {
++                    left: 1,
++                    top: 2,
++                    right: surface_width + 1,
++                    bottom: height + 2,
++                };
++                client.decode_avc420(1, &dest, &encode_avc420_wire(&[])).unwrap();
++                let data = crop_decoded_frame(
++                    reference.data(),
++                    reference.width(),
++                    reference.height(),
++                    surface_width,
++                    height,
++                );
++                assert_eq!(
++                    *captured.lock().unwrap(),
++                    vec![(dest, data)],
++                    "{width}x{height} fallback"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn avc420_size_mismatch_keeps_dimensions_in_error() {
+         let mut client = GraphicsPipelineClient::new(
+diff --git a/crates/ironrdp-egfx/src/decode.rs b/crates/ironrdp-egfx/src/decode.rs
+index dc225eab..b549ec1e 100644
+--- a/crates/ironrdp-egfx/src/decode.rs
++++ b/crates/ironrdp-egfx/src/decode.rs
+@@ -20,6 +20,10 @@
+ 
+ use core::fmt;
+ 
++use ironrdp_pdu::geometry::ExclusiveRectangle;
++
++use crate::avc444::{chroma_offsets, rgba_from_offsets};
++
+ // ============================================================================
+ // Decoded Frame
+ // ============================================================================
+@@ -191,6 +195,62 @@ impl Yuv420Frame {
+     ///
+     /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
+     pub fn to_rgba(&self) -> DecodedFrame {
++        let rgba = self.to_rgba_region(&ExclusiveRectangle {
++            left: 0,
++            top: 0,
++            right: self.width,
++            bottom: self.height,
++        });
++        DecodedFrame::new(rgba, u32::from(self.width), u32::from(self.height))
++    }
++
++    /// Converts an area in picture coordinates, clipped to the picture bounds.
++    pub(crate) fn to_rgba_region(&self, rect: &ExclusiveRectangle) -> Vec<u8> {
++        let (left, top) = (usize::from(rect.left), usize::from(rect.top));
++        let right = usize::from(rect.right.min(self.width));
++        let bottom = usize::from(rect.bottom.min(self.height));
++        if left >= right || top >= bottom {
++            return Vec::new();
++        }
++
++        let row_bytes = (right - left) * 4;
++        let mut rgba = vec![0; row_bytes * (bottom - top)];
++        let pair_start = left.next_multiple_of(2);
++        let pair_end = right & !1;
++        for (row, dst) in (top..bottom).zip(rgba.chunks_exact_mut(row_bytes)) {
++            let y = self.luma_row(row).expect("validated luma plane");
++            let u = self.u_row(row / 2).expect("validated U plane");
++            let v = self.v_row(row / 2).expect("validated V plane");
++            let mut dst = dst;
++
++            // A region starting at an odd column first uses the preceding pair's chroma.
++            if left != pair_start {
++                let (first, remaining_pixels) = dst.split_at_mut(4);
++                first.copy_from_slice(&rgba_from_offsets(y[left], chroma_offsets(u[left / 2], v[left / 2])));
++                dst = remaining_pixels;
++            }
++
++            let chroma = pair_start / 2..pair_end / 2;
++            let pairs = y[pair_start..pair_end].chunks_exact(2);
++            let mut pixels = dst.chunks_exact_mut(8);
++            for (((ys, &u), &v), out) in pairs.zip(&u[chroma.clone()]).zip(&v[chroma]).zip(&mut pixels) {
++                let offsets = chroma_offsets(u, v);
++                out[..4].copy_from_slice(&rgba_from_offsets(ys[0], offsets));
++                out[4..].copy_from_slice(&rgba_from_offsets(ys[1], offsets));
++            }
++            let tail = pixels.into_remainder();
++            if !tail.is_empty() {
++                tail.copy_from_slice(&rgba_from_offsets(
++                    y[pair_end],
++                    chroma_offsets(u[pair_end / 2], v[pair_end / 2]),
++                ));
++            }
++        }
++        rgba
++    }
++
++    #[cfg(test)]
++    pub(crate) fn to_rgba_reference(&self) -> DecodedFrame {
+         let (width, height) = (usize::from(self.width), usize::from(self.height));
+         let mut rgba = Vec::with_capacity(width * height * 4);
+         for row in 0..height {
+@@ -198,7 +258,7 @@ impl Yuv420Frame {
+                 break;
+             };
+             for (col, &y) in y.iter().enumerate() {
+-                rgba.extend_from_slice(&crate::avc444::yuv_to_rgba(y, u[col / 2], v[col / 2]));
++                rgba.extend_from_slice(&crate::avc444::yuv_to_rgba_reference(y, u[col / 2], v[col / 2]));
+             }
+         }
+         DecodedFrame::new(rgba, u32::from(self.width), u32::from(self.height))
+@@ -552,3 +612,102 @@ mod openh264_impl {
+ 
+ #[cfg(feature = "openh264")]
+ pub use openh264_impl::OpenH264Decoder;
++
++#[cfg(test)]
++pub(crate) mod conversion_tests {
++    use super::*;
++
++    pub(crate) const SIZES: [(u16, u16); 5] = [(1, 1), (3, 5), (17, 9), (1104, 704), (1920, 1088)];
++
++    pub(crate) fn random(seed: &mut u32) -> u32 {
++        *seed ^= *seed << 13;
++        *seed ^= *seed >> 17;
++        *seed ^= *seed << 5;
++        *seed
++    }
++
++    pub(crate) fn samples(seed: &mut u32, mut bytes: Vec<u8>, min: u8, max: u8) -> Vec<u8> {
++        for sample in &mut bytes {
++            let value = random(seed) % (u32::from(max) - u32::from(min) + 1);
++            *sample = min + u8::try_from(value).unwrap();
++        }
++        bytes
++    }
++
++    pub(crate) fn picture(seed: &mut u32, width: u16, height: u16, video_range: bool) -> Yuv420Frame {
++        let y_stride = usize::from(width) + 7;
++        let uv_stride = usize::from(width.div_ceil(2)) + 5;
++        let uv_len = uv_stride * usize::from(height.div_ceil(2));
++        let (min, luma_max, chroma_max) = if video_range { (16, 235, 240) } else { (0, 255, 255) };
++        let y = samples(seed, vec![0; y_stride * usize::from(height)], min, luma_max);
++        let u = samples(seed, vec![0; uv_len], min, chroma_max);
++        let v = samples(seed, vec![0; uv_len], min, chroma_max);
++        Yuv420Frame::new(width, height, y, y_stride, u, v, uv_stride).unwrap()
++    }
++
++    pub(crate) fn regions(seed: &mut u32, width: u16, height: u16) -> Vec<ExclusiveRectangle> {
++        let mut coordinate = |limit| u16::try_from(random(seed) % u32::from(limit + 3)).unwrap();
++        let mut rects = vec![
++            ExclusiveRectangle {
++                left: 0,
++                top: 0,
++                right: width,
++                bottom: height,
++            },
++            ExclusiveRectangle {
++                left: width - 1,
++                top: height - 1,
++                right: width + 1,
++                bottom: height + 1,
++            },
++            ExclusiveRectangle {
++                left: 1,
++                top: 1,
++                right: 2,
++                bottom: 2,
++            },
++            ExclusiveRectangle {
++                left: width,
++                top: 0,
++                right: width + 1,
++                bottom: height,
++            },
++        ];
++        for _ in 0..16 {
++            let (x0, x1) = (coordinate(width), coordinate(width));
++            let (y0, y1) = (coordinate(height), coordinate(height));
++            rects.push(ExclusiveRectangle {
++                left: x0.min(x1),
++                top: y0.min(y1),
++                right: x0.max(x1),
++                bottom: y0.max(y1),
++            });
++        }
++        rects
++    }
++
++    #[test]
++    fn t9_avc420_regions_match_reference() {
++        let mut seed = 0x24ab_b6de;
++        for (width, height) in SIZES {
++            for video_range in [false, true] {
++                let picture = picture(&mut seed, width, height, video_range);
++                let reference = picture.to_rgba_reference();
++                assert_eq!(picture.to_rgba().data(), reference.data());
++                for rect in regions(&mut seed, width, height) {
++                    let left = usize::from(rect.left);
++                    let right = usize::from(rect.right.min(width));
++                    let stride = usize::from(width) * 4;
++                    let expected = (rect.top..rect.bottom.min(height))
++                        .filter(|_| left < right)
++                        .flat_map(|row| {
++                            let start = usize::from(row) * stride;
++                            reference.data()[start + left * 4..start + right * 4].iter().copied()
++                        })
++                        .collect::<Vec<_>>();
++                    assert_eq!(picture.to_rgba_region(&rect), expected, "{width}x{height} {rect:?}");
++                }
++            }
++        }
++    }
++}
