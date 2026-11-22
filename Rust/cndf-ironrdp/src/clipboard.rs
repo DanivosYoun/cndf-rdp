@@ -905,6 +905,17 @@ mod real {
                 .offer_remote(Remote::Text(response.data().to_vec()));
         }
 
+        /// The server copied again after the paste was requested, so the answer is of an older
+        /// copy: dropped, as FreeRDP drops a response to a request sent before the last Format List.
+        fn on_superseded_format_data_answer(
+            &mut self,
+            response: FormatDataResponse<'_>,
+            _: RequestedFormat,
+        ) {
+            lock(&self.channel.jobs.refusals)
+                .record(Refusal::Superseded, response.data().len() as u64);
+        }
+
         /// A response CLIPRDR dropped for its size answers the oldest paste, which then fails.
         fn on_format_data_response_oversized(&mut self, declared_length: usize) {
             lock(&self.channel.jobs.refusals).record(Refusal::Oversized, declared_length as u64);
@@ -2210,6 +2221,7 @@ mod real {
             assert_eq!(requests, 64);
             let mut delivered = Delivered::default();
             let connection = delivering_connection(&mut delivered);
+            // Every request was sent before a later copy, so each answer is dropped as superseded.
             for index in 1..=64 {
                 let text = index.to_string();
                 assert!(process(ClipboardPdu::FormatDataResponse(
@@ -2217,9 +2229,16 @@ mod real {
                 ))
                 .is_empty());
                 channel.jobs.flush(&connection);
-                assert_eq!(delivered.texts.last(), Some(&text));
             }
-            assert_eq!(delivered.texts.len(), 64);
+            assert!(delivered.texts.is_empty());
+            let superseded = delivered
+                .logs
+                .iter()
+                .filter(|log| {
+                    log.starts_with("Clipboard remote data dropped reason=superseded count=1 ")
+                })
+                .count();
+            assert_eq!(superseded, 64, "{:?}", delivered.logs);
         }
 
         fn process(cliprdr: &mut CliprdrClient, pdu: ClipboardPdu<'_>) -> Vec<SvcMessage> {
@@ -2258,6 +2277,75 @@ mod real {
             process(cliprdr, ClipboardPdu::FormatDataResponse(response));
         }
 
+        // R-O1. Windows announces one copy with two Format Lists and answers both pastes after the
+        // second. oracle: mutant forwarding the superseded answer as any other answer.
+        #[test]
+        fn answer_to_a_paste_before_the_next_remote_copy_is_dropped() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut cliprdr = client(&channel);
+            ready(&mut cliprdr);
+            copy(&mut cliprdr, text_format());
+            copy(&mut cliprdr, text_format());
+
+            answer(&mut cliprdr, FormatDataResponse::new_unicode_string("A"));
+            channel.jobs.flush(&connection);
+            answer(&mut cliprdr, FormatDataResponse::new_unicode_string("A"));
+            channel.jobs.flush(&connection);
+            assert_eq!(delivered.texts, ["A"]);
+            assert_eq!(
+                delivered.logs,
+                ["Clipboard remote data dropped reason=superseded count=1 max_length=4"]
+            );
+        }
+
+        // R-O2. oracle: mutant dropping every server text.
+        #[test]
+        fn answers_to_separate_remote_copies_are_each_delivered() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut cliprdr = client(&channel);
+            ready(&mut cliprdr);
+            for text in ["A", "B"] {
+                copy(&mut cliprdr, text_format());
+                answer(&mut cliprdr, FormatDataResponse::new_unicode_string(text));
+                channel.jobs.flush(&connection);
+            }
+            assert_eq!(delivered.texts, ["A", "B"]);
+            assert!(delivered.logs.is_empty());
+        }
+
+        // R-O3. A later copy with no format the app pastes still makes the earlier answer stale, as
+        // in FreeRDP. oracle: mutant marking only when the later copy pastes.
+        #[test]
+        fn answer_before_a_remote_copy_without_text_is_dropped() {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (channel, _jobs) = test_channel(input);
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let mut cliprdr = client(&channel);
+            ready(&mut cliprdr);
+            copy(&mut cliprdr, text_format());
+            assert_eq!(
+                kinds(&copy(
+                    &mut cliprdr,
+                    ClipboardFormat::new(ClipboardFormatId::CF_BITMAP)
+                )),
+                ["FormatListResponse"]
+            );
+            answer(&mut cliprdr, FormatDataResponse::new_unicode_string("A"));
+            channel.jobs.flush(&connection);
+            assert!(delivered.texts.is_empty());
+            assert_eq!(
+                delivered.logs,
+                ["Clipboard remote data dropped reason=superseded count=1 max_length=4"]
+            );
+        }
+
         #[test]
         fn ready_paste_precedes_the_next_remote_copy() {
             let (input, _events, mut ordered) = RdpInputSender::channel_with_ordered_queue(1);
@@ -2282,7 +2370,8 @@ mod real {
                 FormatDataResponse::new_unicode_string("older"),
             );
             channel.jobs.flush(&connection);
-            assert_eq!(delivered.texts, ["older"]);
+            // The paste was sent before the file copy, so its answer is superseded.
+            assert!(delivered.texts.is_empty());
             assert!(delivered.files.is_empty());
             answer(&mut cliprdr, file_list("newer.txt", 1));
             channel.jobs.flush(&connection);
@@ -2312,7 +2401,8 @@ mod real {
                 FormatDataResponse::new_unicode_string("first"),
             );
             channel.jobs.flush(&connection);
-            assert_eq!(delivered.texts, ["first"]);
+            // Sent before the later copies: superseded, though it still answers the oldest request.
+            assert!(delivered.texts.is_empty());
             answer(&mut cliprdr, file_list("second.txt", 1));
             channel.jobs.flush(&connection);
             assert_eq!(delivered.files, [vec![("second.txt".to_owned(), 1)]]);
