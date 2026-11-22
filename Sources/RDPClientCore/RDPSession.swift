@@ -101,7 +101,8 @@ public final class RDPSession {
     private var remoteClipboardSink: RemoteClipboardSink?
     var remoteFileDownloadManager: RDPRemoteFileDownloadManager?
     var callbacks: RDPBridgeCallbacks
-    private var logFileURL: URL?
+    // Internal so tests can give a session that never connects a log file.
+    var logFile: RDPSessionLogFile?
     private let logLock = NSLock()
     private let sessionLock = NSRecursiveLock()
     private var inputConnectionGeneration: UInt64 = 0
@@ -363,9 +364,9 @@ public final class RDPSession {
                 throw RDPSessionError.unableToCreateBridgeSession
             }
 
-            logFileURL = options.logFileURL
-            if let logFileURL {
-                try? FileManager.default.createDirectory(at: logFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            logFile = options.logFileURL.map { RDPSessionLogFile(url: $0, lock: logLock) }
+            if let logFile {
+                try? FileManager.default.createDirectory(at: logFile.url.deletingLastPathComponent(), withIntermediateDirectories: true)
             }
 
             resetStatistics()
@@ -631,21 +632,7 @@ public final class RDPSession {
     }
 
     private func emitLog(_ message: String) {
-        if let logFileURL {
-            logLock.lock()
-            defer { logLock.unlock() }
-            let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-            if let data = line.data(using: .utf8) {
-                if FileManager.default.fileExists(atPath: logFileURL.path),
-                   let handle = try? FileHandle(forWritingTo: logFileURL) {
-                    _ = try? handle.seekToEnd()
-                    try? handle.write(contentsOf: data)
-                    try? handle.close()
-                } else {
-                    try? data.write(to: logFileURL, options: .atomic)
-                }
-            }
-        }
+        logFile?.append(message)
         delegate?.rdpSession(self, didLog: message)
     }
 
@@ -695,6 +682,8 @@ public final class RDPSession {
         let freshness: UInt64
         /// The pasteboard change count when the job was queued (design D3).
         let changeCount: Int?
+        /// Taken when the job is made, so every ending off the pasteboard is logged (design D-T3).
+        let logFile: RDPSessionLogFile?
     }
 
     // Same types and rules as IronRDPSession (design D2): one materialization runs, the newest
@@ -716,7 +705,8 @@ public final class RDPSession {
                 entries: entries,
                 manager: manager,
                 freshness: freshness,
-                changeCount: self.clipboardCoordinator?.pasteboardChangeCount
+                changeCount: self.clipboardCoordinator?.pasteboardChangeCount,
+                logFile: self.logFile
             )
             guard self.remoteFileMaterializations.submit(job) else { return }
             DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -732,13 +722,18 @@ public final class RDPSession {
                         DispatchQueue.main.async { [weak self] in
                             guard let self else {
                                 manager.discard(urls)
+                                job.logFile?.append("Remote file materialization discarded: the connection ended.")
                                 return
                             }
                             self.deliverMaterializedFiles(urls, of: job)
                         }
                     } catch {
+                        // Written through the job's copy: a closing view detaches the delegate
+                        // first, and the session may already be gone (INV-LOG1).
+                        let message = "Remote file materialization failed: \(error)"
+                        job.logFile?.append(message)
                         if let self {
-                            self.delegate?.rdpSession(self, didLog: "Remote file materialization failed: \(error)")
+                            self.delegate?.rdpSession(self, didLog: message)
                         }
                     }
                 }
