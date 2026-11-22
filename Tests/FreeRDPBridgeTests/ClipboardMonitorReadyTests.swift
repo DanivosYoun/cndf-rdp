@@ -29,6 +29,7 @@ final class ClipboardMonitorReadyTests: XCTestCase {
         #define CB_STREAM_FILECLIP_ENABLED 4
         #define CB_FILECLIP_NO_FILE_PATHS 8
         #define CB_HUGE_FILE_SUPPORT_ENABLED 32
+        #define CB_CAN_LOCK_CLIPDATA 16
         typedef unsigned UINT;
         typedef unsigned UINT32;
         typedef struct { UINT msgType; } Header;
@@ -44,16 +45,23 @@ final class ClipboardMonitorReadyTests: XCTestCase {
             UINT (*ClientCapabilities)(CliprdrClientContext *, const CLIPRDR_CAPABILITIES *);
             UINT (*ClientFormatList)(CliprdrClientContext *, const CLIPRDR_FORMAT_LIST *);
         };
-        typedef struct { CliprdrClientContext *cliprdr; const char *local_text; size_t local_file_count; unsigned clip_requests_pending, clip_requests_stale, clip_request_format; } RDPBridgeSession;
+        typedef struct { int depth; } CRITICAL_SECTION;
+        static void EnterCriticalSection(CRITICAL_SECTION *lock) { assert(lock->depth++ == 0); }
+        static void LeaveCriticalSection(CRITICAL_SECTION *lock) { assert(--lock->depth == 0); }
+        typedef struct { CliprdrClientContext *cliprdr; const char *local_text; size_t local_file_count; unsigned clip_requests_pending, clip_requests_stale, clip_request_format; unsigned long long clip_local_gen; CRITICAL_SECTION clip_range_lock; } RDPBridgeSession;
         #define bridge_log(...) ((void)0)
         #define bridge_logf(...) ((void)0)
-        // 세대 상승은 ClipboardResponsePairingTests 가 따로 시험한다(설계 D-G3).
-        static void bridge_replace_remote_clipboard(RDPBridgeSession *session) { (void)session; }
+        // 세대 상승·잠금 수명은 ClipboardResponsePairingTests 가 따로 시험한다(설계 D-G3, clip-lock D-L3).
+        static void bridge_replace_remote_clipboard(RDPBridgeSession *session, unsigned *released) { (void)session; assert(released == NULL); }
         \(try function("bridge_send_client_format_list"))
         \(try function("bridge_cliprdr_monitor_ready"))
         static UINT step, expected_count, expected_first, capability_result;
         static UINT send_capabilities(CliprdrClientContext *context, const CLIPRDR_CAPABILITIES *caps) {
             assert(step++ == 0 && caps->common.msgType == CB_CLIP_CAPS);
+            // 클라 caps 에 CAN_LOCK 을 알린다(설계 clip-lock D-L3). 서버가 알리지 않으면 FreeRDP 가 지운다.
+            assert(caps->capabilitySets[0].generalFlags == (CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED |
+                                                            CB_FILECLIP_NO_FILE_PATHS | CB_CAN_LOCK_CLIPDATA |
+                                                            CB_HUGE_FILE_SUPPORT_ENABLED));
             return capability_result;
         }
         static UINT send_formats(CliprdrClientContext *context, const CLIPRDR_FORMAT_LIST *list) {

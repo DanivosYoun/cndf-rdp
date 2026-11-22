@@ -25,8 +25,21 @@ final class ClipboardResponsePairingTests: XCTestCase {
     func testHugeFileDescriptorIsSerializedWhenServerAdvertisesHugeSupport() throws { try run("huge") }
     func testDescriptorSerializationFailureAnswersFail() throws { try run("hugefail") }
     func testLocalFileRequestFailuresAnswerFail() throws { try run("local") }
+    // 설계 clip-lock K3: C-L1~C-L8 과 관문~큐 투입 경합(ThreadSanitizer 로도 돌린다).
+    func testCL1FormatListOrderIsResponseUnlockLockRequest() throws { try run("cl1") }
+    func testCL2NoLocksWhenTheServerDoesNotAdvertiseCanLock() throws { try run("cl2") }
+    func testCL3RangeCarriesTheListLockAndIsQueuedInsideTheLock() throws { try run("cl3") }
+    func testCL4LocklessListAfterAStaleAnswerIsRefused() throws { try run("cl4") }
+    func testCL5FormatListClearsTheStaleAnswerMark() throws { try run("cl5") }
+    func testCL6LockedListIsDeliveredDespiteAStaleAnswer() throws { try run("cl6") }
+    func testCL7NewChannelForgetsLocksWithoutUnlock() throws { try run("cl7") }
+    func testCL8ServerLockOfAReplacedOfferAnswersFail() throws { try run("cl8") }
+    func testCLRangeRacingFormatListsNeverSendsAReleasedLock() throws { try run("clrace") }
+    func testCLRangeRacingFormatListsUnderThreadSanitizer() throws {
+        try run("clrace", extraFlags: ["-fsanitize=thread", "-g", "-O1"])
+    }
 
-    private func run(_ scenario: String, file: StaticString = #filePath, line: UInt = #line) throws {
+    private func run(_ scenario: String, extraFlags: [String] = [], file: StaticString = #filePath, line: UInt = #line) throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("Sources/FreeRDPBridge/FreeRDPBridge.c"), encoding: .utf8)
@@ -39,6 +52,7 @@ final class ClipboardResponsePairingTests: XCTestCase {
 
         let fixture = #"""
         #include <assert.h>
+        #include <pthread.h>
         #include <stdbool.h>
         #include <stdint.h>
         #include <stdio.h>
@@ -47,6 +61,12 @@ final class ClipboardResponsePairingTests: XCTestCase {
         #include <sys/types.h>
         #define RDP_FREERDP_REAL 1
         #define RDP_BRIDGE_CLIP_RANGES 8
+        #define RDP_BRIDGE_CLIP_SERVER_LOCKS 100
+        #define CB_CAN_LOCK_CLIPDATA 0x10
+        #define CB_LOCK_CLIPDATA 0x0A
+        #define CB_UNLOCK_CLIPDATA 0x0B
+        #define TRUE 1
+        #define FALSE 0
         #define CB_FILECONTENTS_REQUEST 8
         #define CHANNEL_RC_OK 0
         #define CHANNEL_RC_NO_MEMORY 14
@@ -82,6 +102,7 @@ final class ClipboardResponsePairingTests: XCTestCase {
         typedef uint32_t DWORD;
         typedef uint8_t BYTE;
         typedef uint16_t WCHAR;
+        typedef int BOOL;
         typedef struct { UINT msgType; UINT msgFlags; UINT dataLen; } Header;
         typedef struct { UINT formatId; const char *formatName; } CLIPRDR_FORMAT;
         typedef struct { Header common; UINT numFormats; CLIPRDR_FORMAT *formats; } CLIPRDR_FORMAT_LIST;
@@ -93,7 +114,9 @@ final class ClipboardResponsePairingTests: XCTestCase {
         typedef struct { Header common; UINT cCapabilitiesSets; CLIPRDR_CAPABILITY_SET *capabilitySets; } CLIPRDR_CAPABILITIES;
         typedef struct { Header common; } CLIPRDR_MONITOR_READY;
         typedef struct { DWORD dwFlags; DWORD dwFileAttributes; DWORD nFileSizeHigh; DWORD nFileSizeLow; WCHAR cFileName[260]; } FILEDESCRIPTORW;
-        typedef struct { Header common; UINT32 streamId, listIndex, dwFlags, nPositionLow, nPositionHigh, cbRequested; } CLIPRDR_FILE_CONTENTS_REQUEST;
+        typedef struct { Header common; UINT32 streamId, listIndex, dwFlags, nPositionLow, nPositionHigh, cbRequested; BOOL haveClipDataId; UINT32 clipDataId; } CLIPRDR_FILE_CONTENTS_REQUEST;
+        typedef struct { Header common; UINT32 clipDataId; } CLIPRDR_LOCK_CLIPBOARD_DATA;
+        typedef struct { Header common; UINT32 clipDataId; } CLIPRDR_UNLOCK_CLIPBOARD_DATA;
         typedef struct { Header common; UINT32 streamId; UINT32 cbRequested; const BYTE *requestedData; } CLIPRDR_FILE_CONTENTS_RESPONSE;
         typedef struct CliprdrClientContext CliprdrClientContext;
         struct CliprdrClientContext {
@@ -106,6 +129,8 @@ final class ClipboardResponsePairingTests: XCTestCase {
             UINT (*ClientFormatDataResponse)(CliprdrClientContext *, const CLIPRDR_FORMAT_DATA_RESPONSE *);
             UINT (*ClientFileContentsResponse)(CliprdrClientContext *, const CLIPRDR_FILE_CONTENTS_RESPONSE *);
             UINT (*ClientFileContentsRequest)(CliprdrClientContext *, const CLIPRDR_FILE_CONTENTS_REQUEST *);
+            UINT (*ClientLockClipboardData)(CliprdrClientContext *, const CLIPRDR_LOCK_CLIPBOARD_DATA *);
+            UINT (*ClientUnlockClipboardData)(CliprdrClientContext *, const CLIPRDR_UNLOCK_CLIPBOARD_DATA *);
         };
         typedef enum {
             RDPBridgeStatusOK = 0,
@@ -114,10 +139,16 @@ final class ClipboardResponsePairingTests: XCTestCase {
             RDPBridgeStatusBackendUnavailable = 3,
             RDPBridgeStatusInternalError = 4
         } RDPBridgeStatus;
-        // WinPR CRITICAL_SECTION 대역: 재진입·짝 어긋남을 잡는다.
-        typedef struct { int depth; } CRITICAL_SECTION;
-        static void EnterCriticalSection(CRITICAL_SECTION *lock) { assert(lock->depth == 0); lock->depth++; }
-        static void LeaveCriticalSection(CRITICAL_SECTION *lock) { assert(lock->depth == 1); lock->depth--; }
+        // WinPR CRITICAL_SECTION 대역: 진짜 mutex 에 스레드별 깊이를 붙여 재진입·짝 어긋남을 잡는다.
+        // 경합 시나리오(clrace)는 두 스레드가 이 잠금을 다툰다.
+        typedef struct { pthread_mutex_t mutex; } CRITICAL_SECTION;
+        static _Thread_local int lock_depth;
+        static void EnterCriticalSection(CRITICAL_SECTION *lock) { assert(lock_depth == 0); pthread_mutex_lock(&lock->mutex); lock_depth++; }
+        static void LeaveCriticalSection(CRITICAL_SECTION *lock) { assert(lock_depth == 1); lock_depth--; pthread_mutex_unlock(&lock->mutex); }
+        // FreeRDP 호출·Swift 콜백(로그 포함)은 clip_range_lock 밖에서만 불려야 한다(설계 D-G3 잠금 범위).
+        // 예외는 RANGE 송신 하나다(설계 clip-lock D-L3).
+        #define UNLOCKED() assert(lock_depth == 0)
+        #define LOCKED() assert(lock_depth == 1)
         typedef struct { const char *path; const char *fileName; uint64_t size; } RDPBridgeLocalFile;
         typedef struct {
             void (*remoteText)(const uint8_t *, size_t, void *);
@@ -141,10 +172,18 @@ final class ClipboardResponsePairingTests: XCTestCase {
             uint64_t clip_ranges_copy;
             uint32_t clip_ranges[RDP_BRIDGE_CLIP_RANGES];
             size_t clip_range_count;
+            UINT32 clip_lock_next;
+            UINT32 clip_lock_cur;
+            UINT32 clip_ranges_lock;
+            bool clip_stale_answer;
+            uint64_t clip_local_gen;
+            struct { UINT32 id; uint64_t gen; } clip_server_locks[RDP_BRIDGE_CLIP_SERVER_LOCKS];
+            size_t clip_server_lock_count;
             CRITICAL_SECTION clip_range_lock;
         } RDPBridgeSession;
-        #define bridge_log(...) ((void)0)
-        #define bridge_logf(...) ((void)0)
+        // 로그는 Swift 콜백이다: 잠금 밖에서만 불려야 한다.
+        #define bridge_log(...) UNLOCKED()
+        #define bridge_logf(...) UNLOCKED()
 
         // WinPR 대역: 시험 이름은 ASCII 만 쓴다.
         static WCHAR *ConvertUtf8NToWCharAlloc(const char *text, size_t length, size_t *count) {
@@ -176,6 +215,11 @@ final class ClipboardResponsePairingTests: XCTestCase {
 
         \#(try function("bridge_take_waiting_range", prefix: "static bool"))
         \#(try function("bridge_replace_remote_clipboard", prefix: "static void"))
+        \#(try function("bridge_reset_clip_channel", prefix: "static void"))
+        \#(try function("bridge_find_server_lock", prefix: "static size_t"))
+        \#(try function("bridge_drop_server_lock", prefix: "static void"))
+        \#(try function("bridge_cliprdr_server_lock_clipboard_data"))
+        \#(try function("bridge_cliprdr_server_unlock_clipboard_data"))
         \#(try function("bridge_send_client_format_list"))
         \#(try function("bridge_send_file_group_descriptor"))
         \#(try function("bridge_cliprdr_server_format_data_response"))
@@ -188,8 +232,33 @@ final class ClipboardResponsePairingTests: XCTestCase {
         \#(try function("rdp_bridge_request_remote_file_range", prefix: "RDPBridgeStatus"))
 
         static RDPBridgeSession session;
-        // FreeRDP 호출·Swift 콜백은 clip_range_lock 밖에서만 불려야 한다(설계 D-G3 잠금 범위).
-        #define UNLOCKED() assert(session.clip_range_lock.depth == 0)
+        // 와이어 기록: FreeRDP 큐에 들어간 순서(설계 clip-lock INV-L2·L4). 큐 잠금 대역 wire_mutex 아래에서 쓴다.
+        typedef struct { char kind; UINT32 value; BOOL have; } WireEvent;
+        enum { WIRE_MAX = 200000 };
+        static WireEvent wire[WIRE_MAX];
+        static size_t wire_count;
+        static pthread_mutex_t wire_mutex = PTHREAD_MUTEX_INITIALIZER;
+        static void record(char kind, UINT32 value, BOOL have) {
+            pthread_mutex_lock(&wire_mutex);
+            assert(wire_count < WIRE_MAX);
+            wire[wire_count++] = (WireEvent){ kind, value, have };
+            pthread_mutex_unlock(&wire_mutex);
+        }
+        static size_t wire_mark;
+        // 마지막 표시 뒤의 와이어를 "R U1 L2 D49300 F1" 꼴 문자열로 비교한다(R=FLR, F=RANGE 와 clipDataId, F-=id 없음).
+        static void expect_wire(const char *expected) {
+            char text[512] = { 0 };
+            size_t used = 0;
+            for (size_t i = wire_mark; i < wire_count; i++) {
+                const WireEvent *e = &wire[i];
+                if (e->kind == 'R') used += snprintf(text + used, sizeof text - used, "%sR", used ? " " : "");
+                else if (e->kind == 'F' && !e->have) used += snprintf(text + used, sizeof text - used, "%sF-", used ? " " : "");
+                else used += snprintf(text + used, sizeof text - used, "%s%c%u", used ? " " : "", e->kind, e->value);
+            }
+            if (strcmp(text, expected) != 0) { fprintf(stderr, "wire: [%s] expected [%s]\n", text, expected); assert(0); }
+            wire_mark = wire_count;
+        }
+        static UINT lock_result;
         static int texts, lists, contents_calls, requests, data_responses, contents_responses, range_requests;
         static UINT range_request_result;
         static RDPBridgeStatus callback_range_status = (RDPBridgeStatus)-1;
@@ -207,15 +276,25 @@ final class ClipboardResponsePairingTests: XCTestCase {
         static void on_contents(uint32_t s, const uint8_t *p, size_t n, void *c) { UNLOCKED(); contents_calls++; last_stream = s; last_payload = p; last_length = n; }
         static UINT ok_caps(CliprdrClientContext *c, const CLIPRDR_CAPABILITIES *x) { UNLOCKED(); return 0; }
         static UINT ok_list(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST *x) { UNLOCKED(); return 0; }
-        static UINT ok_list_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST_RESPONSE *x) { UNLOCKED(); return 0; }
-        static UINT on_request(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_REQUEST *x) { UNLOCKED(); requests++; return 0; }
+        static UINT ok_list_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_LIST_RESPONSE *x) { UNLOCKED(); record('R', 0, FALSE); return 0; }
+        static UINT on_request(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_REQUEST *x) { UNLOCKED(); requests++; record('D', x->requestedFormatId, FALSE); return 0; }
+        static UINT on_lock(CliprdrClientContext *c, const CLIPRDR_LOCK_CLIPBOARD_DATA *x) { UNLOCKED(); if (lock_result == 0) record('L', x->clipDataId, TRUE); return lock_result; }
+        static UINT on_unlock(CliprdrClientContext *c, const CLIPRDR_UNLOCK_CLIPBOARD_DATA *x) { UNLOCKED(); record('U', x->clipDataId, TRUE); return 0; }
         static UINT on_data_response(CliprdrClientContext *c, const CLIPRDR_FORMAT_DATA_RESPONSE *x) { UNLOCKED(); data_responses++; last_data_flags = x->common.msgFlags; return 0; }
         static UINT on_contents_response(CliprdrClientContext *c, const CLIPRDR_FILE_CONTENTS_RESPONSE *x) { UNLOCKED(); contents_responses++; last_contents_flags = x->common.msgFlags; last_stream = x->streamId; return 0; }
-        static UINT on_range_request(CliprdrClientContext *c, const CLIPRDR_FILE_CONTENTS_REQUEST *x) { UNLOCKED(); range_requests++; assert(x->dwFlags == FILECONTENTS_RANGE); return range_request_result; }
+        // RANGE 는 관문을 통과한 그 잠금 안에서 큐에 들어가야 한다(설계 clip-lock D-L3, C-L3).
+        static UINT on_range_request(CliprdrClientContext *c, const CLIPRDR_FILE_CONTENTS_REQUEST *x) {
+            LOCKED();
+            range_requests++;
+            assert(x->dwFlags == FILECONTENTS_RANGE);
+            if (range_request_result == CHANNEL_RC_OK) record('F', x->clipDataId, x->haveClipDataId);
+            return range_request_result;
+        }
 
         static CliprdrClientContext context;
         static void reset(void) {
             memset(&session, 0, sizeof session);
+            pthread_mutex_init(&session.clip_range_lock.mutex, NULL);
             memset(&context, 0, sizeof context);
             context.custom = &session;
             context.ClientCapabilities = ok_caps;
@@ -225,6 +304,8 @@ final class ClipboardResponsePairingTests: XCTestCase {
             context.ClientFormatDataResponse = on_data_response;
             context.ClientFileContentsResponse = on_contents_response;
             context.ClientFileContentsRequest = on_range_request;
+            context.ClientLockClipboardData = on_lock;
+            context.ClientUnlockClipboardData = on_unlock;
             session.connected = true;
             session.cliprdr = &context;
             session.callbacks.remoteText = on_text;
@@ -280,6 +361,20 @@ final class ClipboardResponsePairingTests: XCTestCase {
             assert(bridge_send_file_group_descriptor(&context, &session) == 0);
             (void)request;
         }
+        static int file_request_lock(UINT32 index, UINT32 flags, UINT64 offset, BOOL have, UINT32 id) {
+            CLIPRDR_FILE_CONTENTS_REQUEST request = { { 8, 0, 24 }, 77, index, flags, (UINT32)offset, (UINT32)(offset >> 32), 16, have, id };
+            const int before = contents_responses;
+            assert(bridge_cliprdr_server_file_contents_request(&context, &request) == 0);
+            return contents_responses - before;
+        }
+        static void server_lock(UINT32 id) {
+            CLIPRDR_LOCK_CLIPBOARD_DATA lock = { { CB_LOCK_CLIPDATA, 0, 4 }, id };
+            assert(bridge_cliprdr_server_lock_clipboard_data(&context, &lock) == 0);
+        }
+        static void server_unlock(UINT32 id) {
+            CLIPRDR_UNLOCK_CLIPBOARD_DATA unlock = { { CB_UNLOCK_CLIPDATA, 0, 4 }, id };
+            assert(bridge_cliprdr_server_unlock_clipboard_data(&context, &unlock) == 0);
+        }
         static int file_request(UINT32 index, UINT32 flags, UINT64 offset) {
             CLIPRDR_FILE_CONTENTS_REQUEST request = { { 8, 0, 24 }, 77, index, flags, (UINT32)offset, (UINT32)(offset >> 32), 16 };
             const int before = contents_responses;
@@ -302,6 +397,12 @@ final class ClipboardResponsePairingTests: XCTestCase {
             const int before = lists;
             fl_files(); reply_descriptor();
             assert(lists == before + 1);
+        }
+
+        static bool race_done;
+        static void *race_sender(void *unused) {
+            for (UINT32 stream = 1; !__atomic_load_n(&race_done, __ATOMIC_SEQ_CST); stream++) (void)range(stream);
+            return NULL;
         }
 
         int main(int argc, char **argv) {
@@ -496,6 +597,154 @@ final class ClipboardResponsePairingTests: XCTestCase {
                 assert(file_request(0, 0, 0) == 1 && last_contents_flags == CB_RESPONSE_FAIL);
                 return 0;
             }
+            if (!strcmp(s, "cl1")) {
+                // C-L1: FLR → Unlock(이전) → Lock(파일일 때) → 서술자 요청(INV-L2), 보유 잠금은 1개 이하(INV-L1).
+                server_caps(CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA);
+                fl_files();
+                expect_wire("R L1 D49300");
+                reply_descriptor();
+                fl_files();
+                expect_wire("R U1 L2 D49300");
+                fl_text();
+                expect_wire("R U2 D13");
+                fl_text();
+                expect_wire("R D13");
+                return 0;
+            }
+            if (!strcmp(s, "cl2")) {
+                // C-L2: 서버가 CAN_LOCK 을 알리지 않으면(또는 Caps 가 없으면) Lock/Unlock 0, RANGE 에 id 없음(INV-L5).
+                deliver_files();
+                expect_wire("R D49300");
+                server_caps(CB_STREAM_FILECLIP_ENABLED);
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                fl_text();
+                expect_wire("R D49300 F- R D13");
+                return 0;
+            }
+            if (!strcmp(s, "cl3")) {
+                // C-L3: 넘긴 목록의 RANGE 는 그 목록의 잠금 id 를 달고, 관문을 통과한 잠금 안에서 큐에 들어간다
+                // (on_range_request 의 LOCKED). FL 이 푼 id 는 다시 나가지 않는다(INV-L3·L4).
+                server_caps(CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA);
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                expect_wire("R L1 D49300 F1");
+                fl_files();
+                assert(range(2) == RDPBridgeStatusNotConnected);
+                reply_descriptor();
+                assert(range(3) == RDPBridgeStatusOK);
+                expect_wire("R U1 L2 D49300 F2");
+                // Lock 송신이 실패하면 그 목록은 잠금 없이 넘어가고 RANGE 에도 id 가 없다.
+                lock_result = 5;
+                deliver_files();
+                assert(range(4) == RDPBridgeStatusOK);
+                expect_wire("R U2 D49300 F-");
+                return 0;
+            }
+            if (!strcmp(s, "cl4")) {
+                // C-L4(R-L2): 잠금 없음, A 를 넘기고 s1 이 나간 상태 → FL(B) → 옛 s1 응답 → D_B 는 넘기지 않는다(P4).
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                fl_files();
+                contents_reply(1, CB_RESPONSE_OK);
+                reply_descriptor();
+                assert(lists == 1);
+                assert(range(2) == RDPBridgeStatusNotConnected && range_requests == 1);
+                return 0;
+            }
+            if (!strcmp(s, "cl5")) {
+                // C-L5(R-L3): FL → 옛 응답 → FL → D 이면 넘긴다(표지는 서버 FL 마다 지운다).
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                fl_files();
+                contents_reply(1, CB_RESPONSE_OK);
+                fl_files();
+                reply_descriptor();
+                reply_descriptor();
+                assert(lists == 2);
+                assert(range(2) == RDPBridgeStatusOK);
+                return 0;
+            }
+            if (!strcmp(s, "cl6")) {
+                // C-L6(R-L4): 잠금이 있으면 C-L4 와 같은 순서여도 넘긴다(P4 는 잠금 없는 목록에만).
+                server_caps(CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA);
+                deliver_files();
+                assert(range(1) == RDPBridgeStatusOK);
+                fl_files();
+                contents_reply(1, CB_RESPONSE_OK);
+                reply_descriptor();
+                assert(lists == 2);
+                assert(range(2) == RDPBridgeStatusOK);
+                expect_wire("R L1 D49300 F1 R U1 L2 D49300 F2");
+                return 0;
+            }
+            if (!strcmp(s, "cl7")) {
+                // C-L7: 새 채널은 이전 채널의 잠금·서버 능력을 Unlock 없이 잊는다(INV-L6). MonitorReady 는 잊지 않는다.
+                server_caps(CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA);
+                deliver_files();
+                monitor_ready();
+                fl_files();
+                expect_wire("R L1 D49300 R U1 L2 D49300");
+                reply_descriptor();
+                bridge_reset_clip_channel(&session);
+                assert(range(1) == RDPBridgeStatusOK);
+                fl_files();
+                expect_wire("F- R D49300");
+                server_caps(CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA);
+                fl_files();
+                expect_wire("R L3 D49300");
+                return 0;
+            }
+            if (!strcmp(s, "cl8")) {
+                // C-L8(R-L6): 서버 잠금은 받은 때의 로컬 제공에 묶인다(INV-L8). 제공이 바뀌면 그 id 는 FAIL.
+                const char *scratch = getenv("PAIRING_SCRATCH");
+                char path[512];
+                snprintf(path, sizeof path, "%s/f.bin", scratch);
+                FILE *f = fopen(path, "wb"); fwrite("abcdef", 1, 6, f); fclose(f);
+                RDPBridgeLocalFile files[] = { { path, "f.bin", 6 } };
+                session.local_files = files;
+                session.local_file_count = 1;
+                assert(bridge_send_client_format_list(&session) == 0);
+                server_lock(7);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 7) == 1 && last_contents_flags == CB_RESPONSE_OK);
+                assert(bridge_send_client_format_list(&session) == 0);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 7) == 1 && last_contents_flags == CB_RESPONSE_FAIL);
+                assert(file_request(0, FILECONTENTS_RANGE, 0) == 1 && last_contents_flags == CB_RESPONSE_OK);
+                server_lock(8);
+                assert(file_request_lock(0, FILECONTENTS_SIZE, 0, TRUE, 8) == 1 && last_contents_flags == CB_RESPONSE_OK);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 9) == 1 && last_contents_flags == CB_RESPONSE_FAIL);
+                server_unlock(8);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 8) == 1 && last_contents_flags == CB_RESPONSE_FAIL);
+                // 표는 100칸: 101번째 잠금이 오면 가장 오래된 것을 잊는다.
+                for (UINT32 id = 1000; id <= 1100; id++) server_lock(id);
+                assert(session.clip_server_lock_count == RDP_BRIDGE_CLIP_SERVER_LOCKS);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 1000) == 1 && last_contents_flags == CB_RESPONSE_FAIL);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 1001) == 1 && last_contents_flags == CB_RESPONSE_OK);
+                assert(file_request_lock(0, FILECONTENTS_RANGE, 0, TRUE, 1100) == 1 && last_contents_flags == CB_RESPONSE_OK);
+                return 0;
+            }
+            if (!strcmp(s, "clrace")) {
+                // 관문~큐 투입 경합(설계 clip-lock D-L3, E3): 한 스레드가 RANGE 를 쉬지 않고 보내는 동안 채널 스레드가
+                // 파일 FL 과 서술자 응답을 되풀이한다. 와이어에서 RANGE 의 id 는 그 순간 보유 중인 단 하나의 잠금이어야 하고,
+                // Unlock 된 id 를 단 RANGE 는 나오지 않아야 한다(INV-L1·L3·L4).
+                server_caps(CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA);
+                deliver_files();
+                pthread_t sender;
+                if (pthread_create(&sender, NULL, race_sender, NULL) != 0) return 3;
+                for (int i = 0; i < 2000; i++) { fl_files(); reply_descriptor(); }
+                __atomic_store_n(&race_done, true, __ATOMIC_SEQ_CST);
+                pthread_join(sender, NULL);
+                UINT32 held = 0;
+                size_t ranges = 0;
+                for (size_t i = 0; i < wire_count; i++) {
+                    const WireEvent *e = &wire[i];
+                    if (e->kind == 'L') { assert(held == 0); held = e->value; }
+                    if (e->kind == 'U') { assert(held == e->value); held = 0; }
+                    if (e->kind == 'F') { assert(e->have && e->value == held && held != 0); ranges++; }
+                }
+                printf("clrace: wire=%zu ranges=%zu\n", wire_count, ranges);
+                return 0;
+            }
             return 2;
         }
         """#
@@ -509,7 +758,7 @@ final class ClipboardResponsePairingTests: XCTestCase {
 
         let compiler = Process()
         compiler.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
-        compiler.arguments = [cFile.path, "-o", executable.path]
+        compiler.arguments = [cFile.path, "-pthread", "-o", executable.path] + extraFlags
         try compiler.run()
         compiler.waitUntilExit()
         XCTAssertEqual(compiler.terminationStatus, 0, file: file, line: line)
