@@ -264,9 +264,9 @@ mod real {
         FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
         OwnedFormatDataResponse,
     };
-    use ironrdp_cliprdr::CliprdrInstance;
+    use ironrdp_cliprdr::{CliprdrInstance, MAX_LOCKED_FILE_LISTS};
     use ironrdp_core::IntoOwned;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use tokio::sync::oneshot;
 
     /// RANGE responses served at once, counted from acceptance until the session handles the frame.
@@ -305,9 +305,11 @@ mod real {
         MalformedText,
         Superseded,
         Oversized,
+        StaleServerList,
+        ReplacedOffer,
     }
 
-    const REFUSALS: [(Refusal, &str); 7] = [
+    const REFUSALS: [(Refusal, &str); 9] = [
         (Refusal::Budget, "Clipboard RANGE failed reason=budget"),
         (
             Refusal::MissingFile,
@@ -333,13 +335,30 @@ mod real {
             Refusal::Oversized,
             "Clipboard remote data dropped reason=oversized",
         ),
+        (
+            Refusal::StaleServerList,
+            "Clipboard remote file list refused reason=stale-server-list",
+        ),
+        (
+            Refusal::ReplacedOffer,
+            "Clipboard RANGE failed reason=replaced-offer",
+        ),
     ];
 
-    /// Failures not yet logged: a count and the longest length per reason.
+    /// Failures not yet logged: a count and the longest length per reason, and the lock counts.
     ///
     /// INVARIANT: Fixed size, so a request or response flood adds no queued work or log record.
     #[derive(Default)]
-    struct Refusals([(u64, u64); REFUSALS.len()]);
+    struct Refusals([(u64, u64); REFUSALS.len()], LockCounts);
+
+    /// Lock events not yet logged, for measuring the lock lifetime.
+    #[derive(Default)]
+    struct LockCounts {
+        /// Outgoing locks CLIPRDR released.
+        released: u64,
+        /// Server file lists that came without a lock although locking was negotiated.
+        lists_without_lock: u64,
+    }
 
     impl Refusals {
         fn record(&mut self, refusal: Refusal, length: u64) {
@@ -472,6 +491,22 @@ mod real {
                     );
                 }
             }
+            let LockCounts {
+                released,
+                lists_without_lock,
+            } = refusals.1;
+            if released != 0 {
+                connection.clip_log(
+                    CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+                    &format!("Clipboard released outgoing locks count={released}"),
+                );
+            }
+            if lists_without_lock != 0 {
+                connection.clip_log(
+                    CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+                    &format!("Clipboard remote file list has no lock count={lists_without_lock}"),
+                );
+            }
         }
     }
 
@@ -514,6 +549,8 @@ mod real {
         dirty_offer: bool,
         negotiated: Option<Capabilities>,
         offer: Offer,
+        /// Counts the offers advertised, so a server lock names the offer it locked.
+        offer_gen: u64,
         advertised: Vec<Arc<LocalFile>>,
         requests: HashSet<u32>,
         /// RANGE responses accepted for the server and not yet handled by the session.
@@ -582,6 +619,7 @@ mod real {
 
         fn advertise(&self, state: &mut State) -> bool {
             state.advertised.clear();
+            state.offer_gen += 1;
             let Offer::Files(files) = &state.offer else {
                 let formats = if matches!(state.offer, Offer::Text(_)) {
                     vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
@@ -709,6 +747,15 @@ mod real {
         channel: Channel,
         ready: bool,
         deferred_paste: Option<ClipboardFormatId>,
+        /// A RANGE answer came after the newest server Format List for a request sent before it:
+        /// the server may still serve the copy before it, so a file list without a lock may be of
+        /// that copy.
+        stale_answer: bool,
+        /// The server's locks of our offers, oldest first: the lock id and the offer generation
+        /// it locked.
+        ///
+        /// INVARIANT: At most `MAX_LOCKED_FILE_LISTS` entries, without duplicate ids.
+        server_locks: VecDeque<(u32, u64)>,
     }
 
     impl CndfCliprdrBackend {
@@ -717,6 +764,8 @@ mod real {
                 channel,
                 ready: false,
                 deferred_paste: None,
+                stale_answer: false,
+                server_locks: VecDeque::new(),
             }
         }
     }
@@ -798,6 +847,12 @@ mod real {
                 | Capabilities::STREAM_FILECLIP_ENABLED
                 | Capabilities::FILECLIP_NO_FILE_PATHS
                 | Capabilities::HUGE_FILE_SUPPORT_ENABLED
+                | Capabilities::CAN_LOCK_CLIPDATA
+        }
+
+        /// The server's previous copy is unlocked by its next Format List, so it holds one lock.
+        fn locks_only_the_newest_remote_copy(&self) -> bool {
+            true
         }
 
         fn on_ready(&mut self) {
@@ -849,6 +904,7 @@ mod real {
         ) -> Option<ClipboardFormatId> {
             let mut state = lock(&self.channel.state);
             self.channel.jobs.replace_clipboard();
+            self.stale_answer = false;
             for stream in state.requests.drain() {
                 self.channel
                     .queue(move |connection| notify_range(connection, stream, None));
@@ -921,12 +977,29 @@ mod real {
             lock(&self.channel.jobs.refusals).record(Refusal::Oversized, declared_length as u64);
         }
 
-        fn on_remote_file_list(&mut self, files: &[FileDescriptor], _: Option<u32>) {
-            let files = files
-                .iter()
-                .map(|file| (remote_name(file), file.file_size.unwrap_or(0)))
-                .collect();
-            self.channel.jobs.offer_remote(Remote::Files(files));
+        /// A list without a lock is refused while an answer of the previous copy has come after
+        /// the newest Format List, since the server may still describe that copy.
+        fn on_remote_file_list(&mut self, files: &[FileDescriptor], lock_id: Option<u32>) {
+            let files = Remote::Files(
+                files
+                    .iter()
+                    .map(|file| (remote_name(file), file.file_size.unwrap_or(0)))
+                    .collect(),
+            );
+            if lock_id.is_none() {
+                let negotiated = lock(&self.channel.state)
+                    .negotiated
+                    .is_some_and(|flags| flags.contains(Capabilities::CAN_LOCK_CLIPDATA));
+                let mut refusals = lock(&self.channel.jobs.refusals);
+                if negotiated {
+                    refusals.1.lists_without_lock += 1;
+                }
+                if self.stale_answer {
+                    refusals.record(Refusal::StaleServerList, files.bytes() as u64);
+                    return;
+                }
+            }
+            self.channel.jobs.offer_remote(files);
         }
 
         // CLIPRDR calls `respond_to_file_contents_request` instead.
@@ -942,6 +1015,18 @@ mod real {
             let stream = request.stream_id;
             let length = request.requested_size;
             let mut state = lock(&self.channel.state);
+            // A server lock holds the offer it locked, which the session no longer serves once the
+            // app offers anything else.
+            if let Some(id) = request.data_id {
+                let offer_gen = state.offer_gen;
+                if !self
+                    .server_locks
+                    .iter()
+                    .any(|&(locked, locked_gen)| locked == id && locked_gen == offer_gen)
+                {
+                    return Some(self.channel.refuse(stream, Refusal::ReplacedOffer, length));
+                }
+            }
             let Some(file) = state.advertised.get(request.index as usize).cloned() else {
                 return Some(self.channel.refuse(stream, Refusal::MissingFile, length));
             };
@@ -989,11 +1074,29 @@ mod real {
                 let data = (!response.is_error()).then(|| response.data().to_vec());
                 self.channel
                     .queue(move |connection| notify_range(connection, stream, data.as_deref()));
+            } else {
+                // Only a RANGE sent before the newest Format List is no longer awaited.
+                self.stale_answer = true;
             }
         }
 
-        fn on_lock(&mut self, _: LockDataId) {}
-        fn on_unlock(&mut self, _: LockDataId) {}
+        fn on_outgoing_locks_cleared(&mut self, clip_data_ids: &[LockDataId]) {
+            lock(&self.channel.jobs.refusals).1.released += clip_data_ids.len() as u64;
+        }
+
+        /// Binds the lock to the offer advertised when it arrives.
+        fn on_lock(&mut self, id: LockDataId) {
+            let offer_gen = lock(&self.channel.state).offer_gen;
+            self.server_locks.retain(|&(locked, _)| locked != id.0);
+            self.server_locks.push_back((id.0, offer_gen));
+            if self.server_locks.len() > MAX_LOCKED_FILE_LISTS {
+                self.server_locks.pop_front();
+            }
+        }
+
+        fn on_unlock(&mut self, id: LockDataId) {
+            self.server_locks.retain(|&(locked, _)| locked != id.0);
+        }
     }
 
     #[cfg(test)]
@@ -1048,7 +1151,7 @@ mod real {
             channel.messages = Some(messages);
             let mut backend = CndfCliprdrBackend::new(channel.clone());
 
-            assert_eq!(backend.client_capabilities().bits(), 0x2e);
+            assert_eq!(backend.client_capabilities().bits(), 0x3e);
             assert_eq!(
                 channel.submit(ClipboardCommand::Range {
                     stream_id: 1,
@@ -2846,6 +2949,276 @@ mod real {
             assert!(lock(&channel.state).ready);
             assert_eq!(submit_status(&channel, 1), CNDF_IRON_NOT_CONNECTED);
             assert_eq!(sent_ranges(&receive), 0);
+        }
+
+        /// A ready CLIPRDR client whose RANGE requests the test forwards itself, on a channel whose
+        /// server announced locking.
+        fn locking_range_client() -> (
+            Channel,
+            CliprdrClient,
+            mpsc::Receiver<Job>,
+            mpsc::Receiver<Message>,
+        ) {
+            let (input, _events) = RdpInputSender::channel(1);
+            let (mut channel, jobs) = test_channel(input);
+            let (messages, receive) = mpsc::channel();
+            channel.messages = Some(messages);
+            let mut cliprdr = CliprdrClient::new(channel.build_cliprdr_backend());
+            process(
+                &mut cliprdr,
+                ClipboardPdu::Capabilities(ChannelCapabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    Capabilities::STREAM_FILECLIP_ENABLED
+                        | Capabilities::USE_LONG_FORMAT_NAMES
+                        | Capabilities::CAN_LOCK_CLIPDATA,
+                )),
+            );
+            ready(&mut cliprdr);
+            (channel, cliprdr, jobs, receive)
+        }
+
+        /// The server answers the RANGE of `stream_id`.
+        fn server_range_answer(cliprdr: &mut CliprdrClient, stream_id: u32) {
+            process(
+                cliprdr,
+                ClipboardPdu::FileContentsResponse(FileContentsResponse::new_data_response(
+                    stream_id,
+                    vec![1],
+                )),
+            );
+        }
+
+        fn unsupported_format() -> ClipboardFormat {
+            ClipboardFormat::new(ClipboardFormatId::new(0xc123))
+                .with_name(ClipboardFormatName::new("PNG"))
+        }
+
+        fn refusal_logs(logs: &[String], prefix: &str) -> usize {
+            logs.iter().filter(|log| log.starts_with(prefix)).count()
+        }
+
+        /// R-L2 (P4): without locks, a file list arriving after an answer the server sent for the
+        /// previous copy is not handed to the app, and RANGEs for it are refused.
+        // oracle: mutant not raising the mark on an answer no request awaits, or handing the list
+        // while it is raised.
+        #[test]
+        fn a_list_without_lock_after_an_answer_of_the_previous_copy_is_refused() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let (channel, mut cliprdr, jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("a.txt", 2));
+            channel.jobs.flush(&connection);
+            submit_range(&channel, &mut cliprdr, &receive, 1);
+
+            // The server copies again and answers the old RANGE before the new list.
+            assert_eq!(
+                kinds(&copy(&mut cliprdr, file_format())),
+                ["FormatListResponse", "FormatDataRequest"]
+            );
+            server_range_answer(&mut cliprdr, 1);
+            answer(&mut cliprdr, file_list("b.txt", 2));
+            assert_eq!(
+                lock(&channel.jobs.refusals).0[Refusal::StaleServerList as usize].0,
+                1
+            );
+            channel.jobs.flush(&connection);
+            while jobs.try_recv().is_ok() {}
+            assert_eq!(submit_status(&channel, 2), CNDF_IRON_NOT_CONNECTED);
+            assert_eq!(sent_ranges(&receive), 0);
+            drop(connection);
+            assert_eq!(delivered.files, [vec![("a.txt".to_owned(), 2)]]);
+            assert_eq!(
+                refusal_logs(
+                    &delivered.logs,
+                    "Clipboard remote file list refused reason=stale-server-list count=1 "
+                ),
+                1,
+                "{:?}",
+                delivered.logs
+            );
+        }
+
+        /// R-L3: an old answer between two Format Lists does not refuse the list of the second.
+        // oracle: mutant not clearing the mark on a Format List.
+        #[test]
+        fn an_old_answer_before_the_newest_format_list_does_not_refuse_its_list() {
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("a.txt", 2));
+            channel.jobs.flush(&connection);
+            submit_range(&channel, &mut cliprdr, &receive, 1);
+            copy(&mut cliprdr, unsupported_format());
+            server_range_answer(&mut cliprdr, 1);
+            remote_file_copy(&mut cliprdr, file_list("c.txt", 2));
+            channel.jobs.flush(&connection);
+            assert_eq!(submit_status(&channel, 2), CNDF_IRON_OK);
+            drop(connection);
+            assert_eq!(
+                delivered.files,
+                [vec![("a.txt".to_owned(), 2)], vec![("c.txt".to_owned(), 2)]]
+            );
+        }
+
+        /// R-L4: a list with a lock is handed in the order R-L2 refuses, and the released lock is
+        /// counted for the log.
+        // oracle: mutant refusing every list while the mark is raised, or not counting released
+        // locks.
+        #[test]
+        fn a_list_with_a_lock_is_handed_after_an_answer_of_the_previous_copy() {
+            let mut delivered = Delivered::default();
+            let mut connection = delivering_connection(&mut delivered);
+            connection.log_level = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
+            let (channel, mut cliprdr, _jobs, receive) = locking_range_client();
+            assert_eq!(
+                kinds(&copy(&mut cliprdr, file_format())),
+                ["FormatListResponse", "LockData", "FormatDataRequest"]
+            );
+            answer(&mut cliprdr, file_list("a.txt", 2));
+            channel.jobs.flush(&connection);
+            submit_range(&channel, &mut cliprdr, &receive, 1);
+            assert_eq!(
+                kinds(&copy(&mut cliprdr, file_format())),
+                [
+                    "FormatListResponse",
+                    "UnlockData",
+                    "LockData",
+                    "FormatDataRequest"
+                ]
+            );
+            server_range_answer(&mut cliprdr, 1);
+            answer(&mut cliprdr, file_list("b.txt", 2));
+            channel.jobs.flush(&connection);
+            assert_eq!(submit_status(&channel, 2), CNDF_IRON_OK);
+            drop(connection);
+            assert_eq!(
+                delivered.files,
+                [vec![("a.txt".to_owned(), 2)], vec![("b.txt".to_owned(), 2)]]
+            );
+            assert_eq!(
+                delivered.logs,
+                ["Clipboard released outgoing locks count=1"]
+            );
+        }
+
+        /// R-L5: an old RANGE still in flight at a Format List does not by itself refuse the list.
+        // oracle: mutant refusing because a RANGE was in flight at the Format List.
+        #[test]
+        fn a_range_in_flight_at_the_format_list_does_not_refuse_the_list() {
+            // The old answer comes before the Format List.
+            let mut delivered = Delivered::default();
+            let connection = delivering_connection(&mut delivered);
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("a.txt", 2));
+            channel.jobs.flush(&connection);
+            submit_range(&channel, &mut cliprdr, &receive, 1);
+            server_range_answer(&mut cliprdr, 1);
+            remote_file_copy(&mut cliprdr, file_list("b.txt", 2));
+            channel.jobs.flush(&connection);
+            // The old answer comes after the list.
+            submit_range(&channel, &mut cliprdr, &receive, 2);
+            remote_file_copy(&mut cliprdr, file_list("c.txt", 2));
+            channel.jobs.flush(&connection);
+            server_range_answer(&mut cliprdr, 2);
+            drop(connection);
+            assert_eq!(delivered.files.len(), 3, "{:?}", delivered.files);
+            assert_eq!(delivered.files[2], [("c.txt".to_owned(), 2)]);
+        }
+
+        fn size_request(stream_id: u32, index: i32, data_id: Option<u32>) -> FileContentsRequest {
+            FileContentsRequest {
+                stream_id,
+                index,
+                flags: FileContentsFlags::SIZE,
+                position: 0,
+                requested_size: 8,
+                data_id,
+            }
+        }
+
+        /// R-L6: a server request naming a lock is answered only while the offer it locked is
+        /// current.
+        // oracle: mutant ignoring the lock a request names, or reading the offer when the request
+        // arrives instead of when the lock did.
+        #[test]
+        fn a_request_under_a_lock_of_a_replaced_offer_fails() {
+            let (_first, first) = sparse_file("lock-offer-1", 4);
+            let (_second, second) = sparse_file("lock-offer-2a", 4);
+            let (_third, third) = sparse_file("lock-offer-2b", 4);
+            let mut offered = Offered::new(vec![first]);
+            let lock_pdu = |id| ironrdp_core::encode_vec(&ClipboardPdu::LockData(LockDataId(id)));
+            assert!(offered
+                .cliprdr
+                .process(&lock_pdu(7).unwrap())
+                .unwrap()
+                .is_empty());
+            assert_eq!(offered.request(size_request(1, 0, Some(7))), [(1, Some(8))]);
+
+            offered
+                .channel
+                .submit(ClipboardCommand::Files(vec![second, third]));
+            offered.hand_offer_to_cliprdr();
+            assert_eq!(offered.request(size_request(2, 0, Some(7))), [(2, None)]);
+            assert_eq!(offered.refused(Refusal::ReplacedOffer), 1);
+            // Index 1 exists only in the current offer.
+            assert_eq!(offered.request(size_request(3, 1, None)), [(3, Some(8))]);
+            assert!(offered
+                .cliprdr
+                .process(&lock_pdu(8).unwrap())
+                .unwrap()
+                .is_empty());
+            assert_eq!(offered.request(size_request(4, 1, Some(8))), [(4, Some(8))]);
+            assert_eq!(offered.refused(Refusal::ReplacedOffer), 1);
+        }
+
+        /// R-L7: the mark and the server locks belong to the CLIPRDR channel.
+        // oracle: mutant keeping them in the state the channels of a session share.
+        #[test]
+        fn a_new_channel_starts_without_the_mark_and_server_locks() {
+            let mut unused = Vec::new();
+            let connection = range_recording_connection(&mut unused);
+            let (channel, mut cliprdr, _jobs, receive) = range_client();
+            remote_file_copy(&mut cliprdr, file_list("a.txt", 2));
+            channel.jobs.flush(&connection);
+            submit_range(&channel, &mut cliprdr, &receive, 1);
+            copy(&mut cliprdr, unsupported_format());
+            server_range_answer(&mut cliprdr, 1);
+            process(&mut cliprdr, ClipboardPdu::LockData(LockDataId(7)));
+            let backend = cliprdr.downcast_backend::<CndfCliprdrBackend>().unwrap();
+            assert!(backend.stale_answer);
+            assert_eq!(backend.server_locks.len(), 1);
+
+            drop(cliprdr);
+            let next = streaming_client(&channel);
+            let backend = next.downcast_backend::<CndfCliprdrBackend>().unwrap();
+            assert!(!backend.stale_answer);
+            assert!(backend.server_locks.is_empty());
+        }
+
+        /// A list without a lock on a channel that negotiated locking is counted for the log: a
+        /// local file copy detached the lock before the list arrived.
+        // oracle: mutant not counting it.
+        #[test]
+        fn a_list_without_lock_under_negotiated_locking_is_logged() {
+            let mut delivered = Delivered::default();
+            let mut connection = delivering_connection(&mut delivered);
+            connection.log_level = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
+            let (channel, mut cliprdr, _jobs, _receive) = locking_range_client();
+            copy(&mut cliprdr, file_format());
+            cliprdr
+                .initiate_file_copy(vec![FileDescriptor::new("local.txt").with_file_size(1)])
+                .unwrap();
+            answer(&mut cliprdr, file_list("a.txt", 2));
+            channel.jobs.flush(&connection);
+            drop(connection);
+            assert_eq!(delivered.files, [vec![("a.txt".to_owned(), 2)]]);
+            assert_eq!(
+                delivered.logs,
+                [
+                    "Clipboard released outgoing locks count=1",
+                    "Clipboard remote file list has no lock count=1"
+                ]
+            );
         }
     }
 }
