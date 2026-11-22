@@ -1,12 +1,14 @@
 #include "FreeRDPBridge.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #if defined(RDP_FREERDP_REAL)
 #include <freerdp/freerdp.h>
@@ -46,6 +48,17 @@
 #define RDP_BRIDGE_CLIP_RANGES 8
 // 서버가 건 잠금(Mac→Windows)을 기억하는 최대 수(설계 D-L5). 넘치면 가장 오래된 것을 잊는다.
 #define RDP_BRIDGE_CLIP_SERVER_LOCKS 100
+// 서버의 RANGE 요청 하나에 읽어 주는 최대 길이(IronRDP MAX_FILE_RANGE_LENGTH 와 같다, Windows 요청 256 KiB 의 64배).
+#define RDP_BRIDGE_MAX_FILE_RANGE_LENGTH (16u * 1024u * 1024u)
+// RANGE 는 경로의 어느 요소든 링크면 열지 않는다(macOS O_NOFOLLOW_ANY). 제품 빌드(macOS)는 반드시 _ANY 여야 한다.
+// O_NOFOLLOW(최종 요소만) 대체는 O_NOFOLLOW_ANY 가 없는 Linux 시험 고정물용이다.
+#if defined(O_NOFOLLOW_ANY)
+#define RDP_BRIDGE_O_NOFOLLOW O_NOFOLLOW_ANY
+#elif defined(__APPLE__)
+#error "FreeRDPBridge RANGE needs O_NOFOLLOW_ANY on Apple platforms"
+#else
+#define RDP_BRIDGE_O_NOFOLLOW O_NOFOLLOW
+#endif
 
 struct RDPBridgeSession {
     RDPBridgeCallbacks callbacks;
@@ -901,29 +914,62 @@ static UINT bridge_cliprdr_server_file_contents_request(
         response_size = sizeof(size_data);
         bridge_logf(session, "Clipboard server requested local file size: index=%u size=%llu.", request->listIndex, (unsigned long long)file_size);
     } else if (want_range) {
-        FILE *handle = fopen(path, "rb");
+        // 길이 규칙은 IronRDP range_length(clipboard.rs:287-294)와 같다: 16 MiB 를 넘는 요청과 광고 크기 너머에서
+        // 시작하는 요청은 FAIL, 그 외에는 광고 크기에서 자른다. Windows 는 남은 바이트가 적어도 256 KiB 를 요청하므로
+        // EOF 를 넘는 요청은 잘라서 OK 다. 읽을 끝이 off_t 로 음수가 되는 위치는 FAIL 이다(off_t 는 64비트).
+        const UINT64 offset = ((UINT64)request->nPositionHigh << 32) | request->nPositionLow;
+        const UINT64 available = (offset <= file_size) ? (file_size - offset) : 0;
+        response_size = (available < request->cbRequested) ? (UINT32)available : request->cbRequested;
+        if ((request->cbRequested > RDP_BRIDGE_MAX_FILE_RANGE_LENGTH) || (offset > file_size) ||
+            (offset > (UINT64)INT64_MAX - response_size)) {
+            free(path);
+            bridge_logf(
+                session,
+                "Clipboard local file request refused reason=invalid-range: index=%u offset=%llu requested=%u.",
+                request->listIndex,
+                (unsigned long long)offset,
+                request->cbRequested);
+            return bridge_send_file_contents_failure(cliprdr, request);
+        }
+        // 링크(최종·중간 요소)는 따라가지 않고, 연 것이 일반 파일일 때만 읽는다.
+        const int fd = open(path, O_RDONLY | O_CLOEXEC | RDP_BRIDGE_O_NOFOLLOW);
         const int open_errno = errno;
         free(path);
         path = NULL;
-        if (handle == NULL) {
+        if (fd < 0) {
             // 로컬 경로는 로그에 남기지 않는다.
             bridge_logf(session, "Clipboard local file open failed reason=source-open: index=%u errno=%d.", request->listIndex, open_errno);
             return bridge_send_file_contents_failure(cliprdr, request);
         }
-        const UINT64 offset = ((UINT64)request->nPositionHigh << 32) | request->nPositionLow;
-        if (fseeko(handle, (off_t)offset, SEEK_SET) != 0) {
-            fclose(handle);
-            bridge_logf(session, "Clipboard local file seek failed: index=%u.", request->listIndex);
+        struct stat source_stat;
+        if ((fstat(fd, &source_stat) != 0) || !S_ISREG(source_stat.st_mode)) {
+            close(fd);
+            bridge_logf(session, "Clipboard local file request refused reason=source-type: index=%u.", request->listIndex);
             return bridge_send_file_contents_failure(cliprdr, request);
         }
-        response_size = request->cbRequested;
-        buffer = (BYTE *)malloc(response_size);
-        if (buffer == NULL) {
-            fclose(handle);
-            return CHANNEL_RC_NO_MEMORY;
+        // 0바이트는 할당하지 않는다(응답 데이터 포인터는 NULL 이 아니게 둔다).
+        buffer = size_data;
+        if (response_size > 0) {
+            buffer = (BYTE *)malloc(response_size);
+            if (buffer == NULL) {
+                close(fd);
+                return CHANNEL_RC_NO_MEMORY;
+            }
+            // 광고 뒤 파일이 줄어 짧게 읽히면 읽은 만큼 OK 로 보낸다(fread 를 쓰던 때와 같다).
+            UINT32 read_total = 0;
+            while (read_total < response_size) {
+                const ssize_t read_now = pread(fd, buffer + read_total, response_size - read_total, (off_t)(offset + read_total));
+                if (read_now > 0) {
+                    read_total += (UINT32)read_now;
+                } else if ((read_now < 0) && (errno == EINTR)) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            response_size = read_total;
         }
-        response_size = (UINT32)fread(buffer, 1, response_size, handle);
-        fclose(handle);
+        close(fd);
         bridge_logf(
             session,
             "Clipboard server requested local file range: index=%u offset=%llu requested=%u sent=%u.",

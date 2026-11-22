@@ -55,6 +55,14 @@ final class ClipboardResponsePairingTests: XCTestCase {
     func testCB6ChannelAndCallerRacingUnderThreadSanitizer() throws {
         try run("cb6", extraFlags: ["-fsanitize=thread", "-g", "-O1"])
     }
+    // A4(staging-package-design): RANGE 는 잠금 안에서 복사한 경로·광고 크기로만 읽고, 링크를 따라가지 않으며 일반 파일만 읽는다.
+    func testRG1RangeLengthMatchesIronRDPRangeLength() throws { try run("rg1") }
+    func testRG1RangeLengthUnderAddressSanitizer() throws {
+        try run("rg1", extraFlags: ["-fsanitize=address", "-g", "-O1"])
+    }
+    func testRG2ConsecutiveWindowsSizedRangesReadTheWholeFile() throws { try run("rg2") }
+    func testRG3OffsetsBelowAndAbove4GiBAndNoNegativeFileOffset() throws { try run("rg3") }
+    func testRG4LinksAndDirectoriesAnswerFail() throws { try run("rg4") }
 
     private func run(_ scenario: String, extraFlags: [String] = [], file: StaticString = #filePath, line: UInt = #line) throws {
         let root = URL(fileURLWithPath: #filePath)
@@ -66,17 +74,26 @@ final class ClipboardResponsePairingTests: XCTestCase {
             let end = try XCTUnwrap(source.range(of: "\n}", range: start.upperBound..<source.endIndex))
             return String(source[start.lowerBound..<end.upperBound])
         }
+        func block(from first: String, through last: String) throws -> String {
+            let start = try XCTUnwrap(source.range(of: first))
+            let end = try XCTUnwrap(source.range(of: last, range: start.upperBound..<source.endIndex))
+            return String(source[start.lowerBound..<end.upperBound])
+        }
 
         let fixture = #"""
         #include <assert.h>
         #include <errno.h>
+        #include <fcntl.h>
+        #include <limits.h>
         #include <pthread.h>
         #include <stdbool.h>
         #include <stdint.h>
         #include <stdio.h>
         #include <stdlib.h>
         #include <string.h>
+        #include <sys/stat.h>
         #include <sys/types.h>
+        #include <unistd.h>
         #define RDP_FREERDP_REAL 1
         #define RDP_BRIDGE_CLIP_RANGES 8
         #define RDP_BRIDGE_CLIP_SERVER_LOCKS 100
@@ -264,7 +281,24 @@ final class ClipboardResponsePairingTests: XCTestCase {
         \#(try function("bridge_cliprdr_monitor_ready"))
         \#(try function("bridge_cliprdr_server_format_list"))
         \#(try function("bridge_send_file_contents_failure"))
+        // RANGE 열기·길이 규칙(제품 코드 그대로). macOS 는 O_NOFOLLOW_ANY 여야 컴파일된다.
+        \#(try block(from: "#define RDP_BRIDGE_MAX_FILE_RANGE_LENGTH", through: "#endif\n"))
+        // RANGE 의 파일 I/O·할당 대역: 잠금 밖에서만 불리는지 보고, 할당 횟수·크기를 센다(A4).
+        static int range_allocs;
+        static size_t range_alloc_max;
+        static void *range_malloc(size_t n) { range_allocs++; if (n > range_alloc_max) range_alloc_max = n; return malloc(n); }
+        static int range_open(const char *p, int flags) { UNLOCKED(); return open(p, flags); }
+        static int range_fstat(int fd, struct stat *st) { UNLOCKED(); return fstat(fd, st); }
+        static ssize_t range_pread(int fd, void *b, size_t n, off_t o) { UNLOCKED(); return pread(fd, b, n, o); }
+        #define malloc range_malloc
+        #define open range_open
+        #define fstat range_fstat
+        #define pread range_pread
         \#(try function("bridge_cliprdr_server_file_contents_request"))
+        #undef malloc
+        #undef open
+        #undef fstat
+        #undef pread
         \#(try function("bridge_cliprdr_server_file_contents_response"))
         \#(try function("rdp_bridge_request_remote_file_range", prefix: "RDPBridgeStatus"))
         \#(try function("rdp_bridge_send_local_text", prefix: "RDPBridgeStatus"))
@@ -308,6 +342,8 @@ final class ClipboardResponsePairingTests: XCTestCase {
         static size_t last_length;
         // 로컬 제공 응답의 내용(C-B*): FileContents 응답 바이트, Format Data 응답 바이트, 보낸 FL 수.
         static BYTE last_contents[16];
+        // RANGE 응답 바이트 전체(A4 시험, 1 MiB 까지).
+        static BYTE range_bytes[1 << 20];
         static UINT32 last_contents_size;
         static BYTE last_data[128];
         static UINT last_data_size;
@@ -343,6 +379,7 @@ final class ClipboardResponsePairingTests: XCTestCase {
             last_contents_size = x->cbRequested;
             memset(last_contents, 0, sizeof last_contents);
             if ((x->requestedData != NULL) && (x->cbRequested <= sizeof last_contents)) memcpy(last_contents, x->requestedData, x->cbRequested);
+            if ((x->requestedData != NULL) && (x->cbRequested <= sizeof range_bytes)) memcpy(range_bytes, x->requestedData, x->cbRequested);
             return 0;
         }
         // RANGE 는 관문을 통과한 그 잠금 안에서 큐에 들어가야 한다(설계 clip-lock D-L3, C-L3).
@@ -430,6 +467,22 @@ final class ClipboardResponsePairingTests: XCTestCase {
             assert(bridge_cliprdr_server_file_contents_request(&context, &request) == 0);
             return contents_responses - before;
         }
+        // 요청 길이를 정하는 RANGE(A4). 부를 때마다 할당 계수를 비운다.
+        static int file_range(UINT32 index, UINT64 offset, UINT32 length) {
+            CLIPRDR_FILE_CONTENTS_REQUEST request = { { 8, 0, 24 }, 77, index, FILECONTENTS_RANGE, (UINT32)offset, (UINT32)(offset >> 32), length };
+            const int before = contents_responses;
+            range_allocs = 0;
+            range_alloc_max = 0;
+            memset(range_bytes, 0, 64);
+            assert(bridge_cliprdr_server_file_contents_request(&context, &request) == 0);
+            return contents_responses - before;
+        }
+        static void expect_range(UINT flags, const void *bytes, UINT32 length) {
+            if (last_contents_flags != flags || last_contents_size != length || (length > 0 && memcmp(range_bytes, bytes, length) != 0)) {
+                fprintf(stderr, "range: flags=%u size=%u expected flags=%u size=%u\n", last_contents_flags, last_contents_size, flags, length);
+                assert(0);
+            }
+        }
         static void server_lock(UINT32 id) {
             CLIPRDR_LOCK_CLIPBOARD_DATA lock = { { CB_LOCK_CLIPDATA, 0, 4 }, id };
             assert(bridge_cliprdr_server_lock_clipboard_data(&context, &lock) == 0);
@@ -467,6 +520,10 @@ final class ClipboardResponsePairingTests: XCTestCase {
         static void write_file(char *path, const char *name, const char *bytes) {
             snprintf(path, 512, "%s/%s", getenv("PAIRING_SCRATCH"), name);
             FILE *f = fopen(path, "wb"); fwrite(bytes, 1, strlen(bytes), f); fclose(f);
+        }
+        static void write_n(char *path, const char *name, const void *bytes, size_t n) {
+            snprintf(path, 512, "%s/%s", getenv("PAIRING_SCRATCH"), name);
+            FILE *f = fopen(path, "wb"); assert(f != NULL); if (n > 0) fwrite(bytes, 1, n, f); fclose(f);
         }
         static void make_files(void) { write_file(path_a, "a.bin", "AAAA"); write_file(path_b, "b.bin", "BBBBB"); write_file(path_c, "c.bin", "CCCC"); }
         static void offer_one(const char *path, const char *name, uint64_t size) {
@@ -513,6 +570,11 @@ final class ClipboardResponsePairingTests: XCTestCase {
 
         int main(int argc, char **argv) {
             const char *s = argc > 1 ? argv[1] : "";
+            // RANGE 는 링크를 따라가지 않는다(O_NOFOLLOW_ANY): 임시 폴더 위의 링크(/var → /private/var)를 풀어 둔다.
+            // 선택 경로 상위의 링크는 staging-p1 이 물리 경로로 고정한다(A4 범위 밖).
+            static char scratch_real[PATH_MAX];
+            const char *scratch_raw = getenv("PAIRING_SCRATCH");
+            if ((scratch_raw != NULL) && (realpath(scratch_raw, scratch_real) != NULL)) setenv("PAIRING_SCRATCH", scratch_real, 1);
             reset();
             if (!strcmp(s, "c1")) {
                 RDPBridgeLocalFile files[] = { { "/x", "M\\", 0 }, { "/x/e", "M\\E\\", 99 }, { "/x/a", "M\\a.txt", 3 } };
@@ -955,6 +1017,123 @@ final class ClipboardResponsePairingTests: XCTestCase {
                 }
                 pthread_join(publisher, NULL);
                 printf("cb6: ok=%zu refused=%zu\n", ok, refused);
+                return 0;
+            }
+            if (!strcmp(s, "rg1")) {
+                // A4 길이 규칙 = IronRDP range_length(clipboard.rs:287-294): 16 MiB 초과·광고 크기 너머 시작은 FAIL,
+                // 그 외에는 min(요청, 광고 크기 - offset). Windows 는 남은 바이트가 적어도 256 KiB 를 요청하므로 잘라서 OK 다.
+                char twenty[512], ten[512], empty[512];
+                write_n(twenty, "twenty.bin", "0123456789abcdefghij", 20);
+                write_n(ten, "ten.bin", "0123456789", 10);
+                write_n(empty, "empty.bin", "", 0);
+                RDPBridgeLocalFile files[] = { { twenty, "twenty.bin", 20 }, { ten, "ten.bin", 6 }, { empty, "empty.bin", 0 } };
+                session.local_files = files;
+                session.local_file_count = 3;
+                assert(file_range(0, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "0123456789abcdefghij", 20);
+                assert(range_allocs == 1 && range_alloc_max == 20);
+                assert(file_range(0, 8, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "89abcdefghij", 12);
+                assert(range_alloc_max == 12);
+                // offset == 광고 크기, 요청 0 은 할당 없이 0바이트 OK. 광고 크기 너머 시작은 FAIL.
+                assert(file_range(0, 20, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "", 0); assert(range_allocs == 0);
+                assert(file_range(0, 0, 0) == 1); expect_range(CB_RESPONSE_OK, "", 0); assert(range_allocs == 0);
+                assert(file_range(0, 21, 1) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0); assert(range_allocs == 0);
+                // 광고 크기(6) 뒤의 바이트는 파일에 있어도 나가지 않는다.
+                assert(file_range(1, 0, 16) == 1); expect_range(CB_RESPONSE_OK, "012345", 6);
+                assert(file_range(1, 4, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "45", 2);
+                assert(file_range(1, 7, 1) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                // 0바이트 파일.
+                assert(file_range(2, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "", 0); assert(range_allocs == 0);
+                assert(file_range(2, 1, 256 * 1024) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                // 16 MiB 까지는 받고, 넘으면 파일이 작아도 FAIL 이며 할당하지 않는다.
+                assert(file_range(0, 0, 16u * 1024 * 1024) == 1); expect_range(CB_RESPONSE_OK, "0123456789abcdefghij", 20);
+                assert(range_alloc_max == 20);
+                assert(file_range(0, 0, 16u * 1024 * 1024 + 1) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0); assert(range_allocs == 0);
+                assert(file_range(0, 0, 0xFFFFFFFFu) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0); assert(range_allocs == 0);
+                return 0;
+            }
+            if (!strcmp(s, "rg2")) {
+                // A4: Explorer 처럼 256 KiB 씩 이어 읽으면 파일 전체가 그대로 나가고, 끝(offset == 크기)은 0바이트 OK 다.
+                enum { SIZE = 600000, CHUNK = 256 * 1024 };
+                static BYTE pattern[SIZE];
+                for (size_t i = 0; i < SIZE; i++) pattern[i] = (BYTE)(i * 7 + i / 251);
+                char path[512];
+                write_n(path, "pattern.bin", pattern, SIZE);
+                RDPBridgeLocalFile files[] = { { path, "pattern.bin", SIZE } };
+                session.local_files = files;
+                session.local_file_count = 1;
+                size_t offset = 0;
+                int chunks = 0;
+                while (offset < SIZE) {
+                    const UINT32 expected = (SIZE - offset < CHUNK) ? (UINT32)(SIZE - offset) : CHUNK;
+                    assert(file_range(0, offset, CHUNK) == 1); expect_range(CB_RESPONSE_OK, pattern + offset, expected);
+                    offset += expected;
+                    chunks++;
+                }
+                assert(chunks == 3);
+                assert(file_range(0, SIZE, CHUNK) == 1); expect_range(CB_RESPONSE_OK, "", 0);
+                return 0;
+            }
+            if (!strcmp(s, "rg3")) {
+                // A4: 4 GiB 아래·위 offset(nPositionHigh), 그리고 off_t 로 바꿀 때 음수가 되는 offset 은 FAIL.
+                char path[512], small[512];
+                snprintf(path, sizeof path, "%s/sparse.bin", getenv("PAIRING_SCRATCH"));
+                const UINT64 size = 0x100000008ull;
+                const int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+                assert(fd >= 0 && ftruncate(fd, (off_t)size) == 0);
+                assert(pwrite(fd, "LOWW", 4, (off_t)0xFFFFFFFCull) == 4 && pwrite(fd, "HIGH", 4, (off_t)0x100000004ull) == 4);
+                close(fd);
+                write_n(small, "small.bin", "0123456789abcdefghij", 20);
+                RDPBridgeLocalFile files[] = { { path, "sparse.bin", size }, { small, "small.bin", UINT64_MAX } };
+                session.local_files = files;
+                session.local_file_count = 2;
+                assert(file_range(0, 0xFFFFFFFCull, 4) == 1); expect_range(CB_RESPONSE_OK, "LOWW", 4);
+                assert(file_range(0, 0xFFFFFFFCull, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "LOWW\0\0\0\0HIGH", 12);
+                assert(file_range(0, 0x100000004ull, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "HIGH", 4);
+                assert(file_range(0, size, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "", 0);
+                assert(file_range(0, size + 1, 1) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                // 광고 크기가 off_t 범위를 넘어도 off_t 로 음수가 되는 위치는 읽지 않는다.
+                assert(file_range(1, 0x8000000000000000ull, 16) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0); assert(range_allocs == 0);
+                assert(file_range(1, 0x7FFFFFFFFFFFFFFCull, 16) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0); assert(range_allocs == 0);
+                assert(file_range(1, 0, 4) == 1); expect_range(CB_RESPONSE_OK, "0123", 4);
+                return 0;
+            }
+            if (!strcmp(s, "rg4")) {
+                // A4: 링크(최종·중간 요소)와 디렉터리는 FAIL 이고 링크 뒤의 바이트는 나가지 않는다. 제품(macOS)은 O_NOFOLLOW_ANY 다.
+                const char *scratch = getenv("PAIRING_SCRATCH");
+                char secret[512], final_link[512], dir[512], inner[512], dir_link[512], via_dir_link[512];
+                write_n(secret, "secret.bin", "SECRET", 6);
+                snprintf(final_link, sizeof final_link, "%s/link.bin", scratch);
+                assert(symlink(secret, final_link) == 0);
+                snprintf(dir, sizeof dir, "%s/realdir", scratch);
+                assert(mkdir(dir, 0700) == 0);
+                write_n(inner, "realdir/inner.bin", "INNER", 5);
+                snprintf(dir_link, sizeof dir_link, "%s/dirlink", scratch);
+                assert(symlink(dir, dir_link) == 0);
+                snprintf(via_dir_link, sizeof via_dir_link, "%s/dirlink/inner.bin", scratch);
+                RDPBridgeLocalFile files[] = {
+                    { secret, "secret.bin", 6 }, { final_link, "link.bin", 6 }, { via_dir_link, "inner.bin", 5 }, { dir, "realdir", 0 }, { inner, "inner.bin", 5 }
+                };
+                session.local_files = files;
+                session.local_file_count = 5;
+                // 대조군: 링크가 없는 경로는 읽힌다.
+                assert(file_range(0, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "SECRET", 6);
+                assert(file_range(4, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_OK, "INNER", 5);
+                // 최종 요소 링크.
+                assert(file_range(1, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                assert(memcmp(range_bytes, "SECRET", 6) != 0);
+                // 디렉터리.
+                assert(file_range(3, 0, 256 * 1024) == 1); expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                // 중간 요소 링크: O_NOFOLLOW_ANY 가 있는 곳(macOS)에서만 막힌다. Linux 고정물은 O_NOFOLLOW 대체다.
+                assert(file_range(2, 0, 256 * 1024) == 1);
+        #if defined(O_NOFOLLOW_ANY)
+                expect_range(CB_RESPONSE_FAIL, NULL, 0);
+                assert(memcmp(range_bytes, "INNER", 5) != 0);
+        #else
+                printf("rg4: O_NOFOLLOW_ANY 없음 - 중간 링크 단언은 macOS 에서만\n");
+        #endif
+        #if defined(__APPLE__)
+                assert(RDP_BRIDGE_O_NOFOLLOW == O_NOFOLLOW_ANY);
+        #endif
                 return 0;
             }
             if (!strcmp(s, "clrace")) {
