@@ -19,6 +19,10 @@
 #   hold <b64 path> <ms> <holdMs>  drop list that file, after ms open it with FileShare.None for holdMs
 #   del <b64 path> <ms>       drop list that file, after ms delete it (logs the exception if it fails)
 #   trunc <b64 path> <ms> <bytes>  drop list that file, after ms set its length to bytes
+# int-13 X-7 verbs (copies made by other apps, not by .NET; the previous window is closed first):
+#   settext2 <b64 a> <ms> <b64 b>  copy a, then b after ms (X-3)
+#   notepad <b64 text>        write the text to C:\i8\x7.txt, open it in Notepad, Ctrl+A, Ctrl+C
+#   excopy <b64 path>         open Explorer with that file selected (/select), Ctrl+C
 # Every clipboard change also logs the owner process; the tree line lists visible dialogs.
 # Every clipboard change, wheel message (WM_MOUSEWHEEL / WM_MOUSEHWHEEL on the form) and command
 # is logged to C:\i8\out\<run>.log (run id from C:\i8\runid.txt). On start it copies
@@ -67,6 +71,7 @@ public static class I8Probe {
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, uint data, IntPtr extra);
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int left, top, right, bottom; }
 
     static StreamWriter log;
@@ -82,6 +87,8 @@ public static class I8Probe {
     static string lastSignature;
     static bool pasteRetried;
     static SoundPlayer player;
+    static Process x7Notepad;
+    static IntPtr x7Explorer;
     static long soundUntil;
 
     public static void Log(string line) {
@@ -132,6 +139,28 @@ public static class I8Probe {
             try { Clipboard.SetFileDropList(list); return; } catch (ExternalException) { System.Threading.Thread.Sleep(20); }
         }
         Log("files-failed");
+    }
+
+    static void Chord(byte vk, byte scan) {
+        keybd_event(0x11, 0x1D, 0, IntPtr.Zero); keybd_event(vk, scan, 0, IntPtr.Zero);
+        keybd_event(vk, scan, 2, IntPtr.Zero); keybd_event(0x11, 0x1D, 2, IntPtr.Zero);
+    }
+
+    // Polls every 100 ms for up to 8 s until find() returns a window, then focuses it and runs keys.
+    static void WhenWindow(string what, Func<IntPtr> find, Action<IntPtr> keys, int tries = 80) {
+        IntPtr h = find();
+        if (h == IntPtr.Zero) {
+            if (tries <= 0) { Log(what + " window missing"); return; }
+            Later(100, delegate { WhenWindow(what, find, keys, tries - 1); });
+            return;
+        }
+        SetForegroundWindow(h);
+        Later(400, delegate { SetForegroundWindow(h); keys(h); Log(what + " copied"); });
+    }
+
+    static void X7Close() {
+        if (x7Notepad != null) { try { if (!x7Notepad.HasExited) x7Notepad.Kill(); } catch (Exception) { } x7Notepad = null; }
+        if (x7Explorer != IntPtr.Zero) { PostMessage(x7Explorer, 0x0010, IntPtr.Zero, IntPtr.Zero); x7Explorer = IntPtr.Zero; }
     }
 
     static string Owner() {
@@ -186,6 +215,33 @@ public static class I8Probe {
             Directory.CreateDirectory(pasteDir);
             Process.Start("explorer.exe", pasteDir);
             pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = false;
+        } else if (verb == "settext2") {
+            string[] a = arg.Split(' ');
+            string second = UnB64(a[2]);
+            Copy(UnB64(a[0])); Log("settext2 first");
+            Later(int.Parse(a[1]), delegate { Copy(second); Log("settext2 second"); });
+        } else if (verb == "notepad") {
+            X7Close();
+            File.WriteAllText(@"C:\i8\x7.txt", UnB64(arg), new UTF8Encoding(false));
+            var p = Process.Start("notepad.exe", @"C:\i8\x7.txt");
+            x7Notepad = p;
+            WhenWindow("notepad", delegate { p.Refresh(); return p.MainWindowHandle; }, delegate (IntPtr h) {
+                RECT r;
+                if (GetWindowRect(h, out r)) {
+                    SetCursorPos(r.left + (r.right - r.left) / 2, r.top + (r.bottom - r.top) / 2);
+                    mouse_event(2, 0, 0, 0, IntPtr.Zero); mouse_event(4, 0, 0, 0, IntPtr.Zero);
+                }
+                System.Threading.Thread.Sleep(150);
+                Chord(0x41, 0x1E); System.Threading.Thread.Sleep(100); Chord(0x43, 0x2E);
+            });
+        } else if (verb == "excopy") {
+            X7Close();
+            string path = UnB64(arg);
+            string leaf = Path.GetFileName(Path.GetDirectoryName(path));
+            Process.Start("explorer.exe", "/select,\"" + path + "\"");
+            WhenWindow("excopy", delegate { return FindWindow("CabinetWClass", leaf); }, delegate (IntPtr h) {
+                x7Explorer = h; Chord(0x43, 0x2E);
+            });
         } else if (verb == "mix") {
             string[] a = arg.Split(' ');
             int ms = int.Parse(a[1]);
