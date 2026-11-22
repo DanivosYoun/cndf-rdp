@@ -1,0 +1,86 @@
+{
+  "case": "b2-1280x800",
+  "codec": "AVC444v2",
+  "thresholds": {
+    "psnrMinDb": 40.0,
+    "cpuRatioMax": 1.2
+  },
+  "engines": {
+    "freerdp": {
+      "engine": "freerdp",
+      "passed": true,
+      "iterations": 5,
+      "cpuWindowMs": [
+        3864.102,
+        3993.489,
+        4120.587,
+        4065.168,
+        3815.624
+      ],
+      "framesInWindow": [
+        97,
+        97,
+        97,
+        97,
+        97
+      ],
+      "framesDumped": 5
+    },
+    "ironrdp": null
+  },
+  "cpuMedianMs": {
+    "freerdp": 3993.489,
+    "ironrdp": null
+  },
+  "freerdpCodecCounts": {
+    "AVC420": 0,
+    "AVC444": 0,
+    "AVC444v2": 495
+  },
+  "ironrdpH264": null,
+  "diagnostics": {
+    "freerdpVsScreenDb": 40.18,
+    "freerdpVsScreenRegions": {
+      "left": {
+        "Y": 45.18,
+        "Cb": 45.63,
+        "Cr": 49.09
+      },
+      "right": {
+        "Y": 44.49,
+        "Cb": 47.8,
+        "Cr": 46.5
+      }
+    },
+    "screenVsReferenceDb": "inf",
+    "freerdpRunToRunDb": [
+      "inf",
+      "inf",
+      "inf",
+      "inf"
+    ]
+  },
+  "checks": {
+    "psnr": {
+      "status": "not-run",
+      "detail": "no IronRDP final frame"
+    },
+    "cpu": {
+      "status": "not-run",
+      "detail": "no IronRDP cpuWindow"
+    },
+    "codec": {
+      "status": "pass",
+      "detail": "AVC444v2=495"
+    },
+    "hardware": {
+      "status": "not-run",
+      "detail": "no IronRDP run"
+    },
+    "failures": {
+      "status": "not-run",
+      "detail": "no IronRDP run"
+    }
+  },
+  "verdict": "incomplete"
+}
