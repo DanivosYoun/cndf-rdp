@@ -80,6 +80,7 @@ public static class I8Probe {
     static IntPtr pasteWindow;
     static long stateSince, lastChange;
     static string lastSignature;
+    static bool pasteRetried;
     static SoundPlayer player;
     static long soundUntil;
 
@@ -184,7 +185,7 @@ public static class I8Probe {
             pasteDir = @"C:\i8\dst\" + arg;
             Directory.CreateDirectory(pasteDir);
             Process.Start("explorer.exe", pasteDir);
-            pasteState = 1; stateSince = clock.ElapsedMilliseconds;
+            pasteState = 1; stateSince = clock.ElapsedMilliseconds; pasteRetried = false;
         } else if (verb == "mix") {
             string[] a = arg.Split(' ');
             int ms = int.Parse(a[1]);
@@ -325,8 +326,13 @@ public static class I8Probe {
             int count; long bytes;
             string sig = Tree(pasteDir, false, out count, out bytes);
             if (sig != lastSignature) { lastSignature = sig; lastChange = now; }
+            // Ctrl+V sometimes does not reach Explorer (nothing appears): send it once more.
+            if (count == 0 && !pasteRetried && now - stateSince > 20000) { pasteRetried = true; Log("paste retry"); pasteState = 3; stateSince = now - 1500; return; }
             if ((count > 0 && now - lastChange > 8000) || now - stateSince > 900000) {
                 string tree = Tree(pasteDir, true, out count, out bytes);
+                // Explorer sets the full length up front and keeps the file open while it copies:
+                // a stable size is not the end of the copy while a file is still locked.
+                if (tree.Contains(":locked") && now - stateSince <= 900000) { lastChange = now; return; }
                 Log("dialogs " + Dialogs());
                 Log("tree " + pasteLeaf + " n=" + count + " bytes=" + bytes + tree);
                 Copy("I8DONE " + pasteLeaf + " n=" + count + " bytes=" + bytes);
