@@ -1,3 +1,4 @@
+import ClipboardBridge
 import AppKit
 import CoreGraphics
 import RDPClientCore
@@ -37,8 +38,8 @@ private final class KeySession: RDPEngineSession {
     func reconnect() throws {}
     func disconnect() throws {}
     var supportsClipboard: Bool { false }
-    func pollLocalClipboard() throws {}
-    func sendLocalFiles(_ urls: [URL]) throws {}
+    func pollLocalClipboard() throws -> ClipboardFileOffer? { nil }
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer { .none }
     func sendLocalText(_ text: String) throws {}
     func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool) throws {}
     var supportsOutputSuppression: Bool { false }

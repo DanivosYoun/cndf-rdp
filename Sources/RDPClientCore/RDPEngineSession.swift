@@ -1,3 +1,4 @@
+import ClipboardBridge
 import CoreGraphics
 import Foundation
 
@@ -25,8 +26,10 @@ public protocol RDPEngineSession: AnyObject {
     /// False when the engine has no clipboard channel; the clipboard calls below then do nothing
     /// (`pollLocalClipboard`) or throw.
     var supportsClipboard: Bool { get }
-    func pollLocalClipboard() throws
-    func sendLocalFiles(_ urls: [URL]) throws
+    @discardableResult
+    func pollLocalClipboard() throws -> ClipboardFileOffer?
+    @discardableResult
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer
     func sendLocalText(_ text: String) throws
 
     func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool) throws

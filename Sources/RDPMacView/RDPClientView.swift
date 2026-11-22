@@ -18,6 +18,7 @@ public final class RDPClientView: NSView {
         didSet { frameTapDidChange?() }
     }
     // Lets the owning RDPConnectionView release output suppression the moment a tap attaches.
+    public var onClipboardItemsOmitted: ((Int) -> Void)?
     var frameTapDidChange: (() -> Void)?
 
     private static let inputSourceFollowLog = OSLog(subsystem: "com.cndf.rdp", category: "input-source-follow")
@@ -340,17 +341,21 @@ public final class RDPClientView: NSView {
     }
 
     public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let urls = fileURLs(from: sender)
+        offerDroppedFiles(fileURLs(from: sender))
+    }
+
+    func offerDroppedFiles(_ urls: [URL]) -> Bool {
         guard !urls.isEmpty else {
             return false
         }
 
         do {
-            try session?.sendLocalFiles(urls)
-            pasteOfferedFilesAfterDrop()
-            return true
+            guard let result = try session?.sendLocalFiles(urls) else { return false }
+            if result.omittedCount > 0 { onClipboardItemsOmitted?(result.omittedCount) }
+            if result.didProvide { pasteOfferedFilesAfterDrop() }
+            return result.didProvide
         } catch {
-            NSLog("[RDP] local file drag failed: \(String(describing: error))")
+            NSLog("[RDP] local file drag failed: \(RDPClipboardDiagnostics.reason(for: error))")
             return false
         }
     }

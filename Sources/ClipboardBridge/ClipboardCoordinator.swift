@@ -11,10 +11,11 @@ public final class ClipboardCoordinator {
         self.lastObservedChangeCount = pasteboard.changeCount
     }
 
-    public func pollLocalPasteboard() throws {
+    @discardableResult
+    public func pollLocalPasteboard() throws -> ClipboardFileOffer? {
         let changeCount = pasteboard.changeCount
         guard changeCount != lastObservedChangeCount else {
-            return
+            return nil
         }
 
         lastObservedChangeCount = changeCount
@@ -26,8 +27,9 @@ public final class ClipboardCoordinator {
         switch payload {
         case .text(let text):
             try remoteSink.sendLocalText(text)
+            return nil
         case .fileURLs(let urls):
-            try remoteSink.sendLocalFiles(urls)
+            return try remoteSink.sendLocalFiles(urls)
         }
     }
 

@@ -3,6 +3,7 @@ import CoreVideo
 import RDPClientCore
 
 public protocol RDPConnectionViewDelegate: AnyObject {
+    func rdpConnectionView(_ view: RDPConnectionView, didOmitClipboardItems count: Int)
     func rdpConnectionView(_ view: RDPConnectionView, didLog message: String)
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool)
     func rdpConnectionView(
@@ -18,6 +19,7 @@ public protocol RDPConnectionViewDelegate: AnyObject {
 }
 
 public extension RDPConnectionViewDelegate {
+    func rdpConnectionView(_ view: RDPConnectionView, didOmitClipboardItems count: Int) {}
     func rdpConnectionView(_ view: RDPConnectionView, didLog message: String) {}
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {}
     func rdpConnectionView(
@@ -212,7 +214,9 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
     public func pollLocalClipboard() throws {
         guard !isShutdown else { return }
-        try session?.pollLocalClipboard()
+        if let result = try session?.pollLocalClipboard(), result.omittedCount > 0 {
+            delegate?.rdpConnectionView(self, didOmitClipboardItems: result.omittedCount)
+        }
     }
 
     public func injectMouse(x: Int32, y: Int32, button: RDPMouseButton?, flags: RDPMouseFlags) {
@@ -261,6 +265,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         clientView.autoresizingMask = [.width, .height]
         clientView.frameTapDidChange = { [weak self] in
             self?.evaluateOutputSuppression()
+        }
+        clientView.onClipboardItemsOmitted = { [weak self] count in
+            guard let self else { return }
+            delegate?.rdpConnectionView(self, didOmitClipboardItems: count)
         }
         addSubview(clientView)
     }
@@ -321,9 +329,9 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self, !self.isShutdown else { return }
             do {
-                try self.session?.pollLocalClipboard()
+                try self.pollLocalClipboard()
             } catch {
-                self.delegate?.rdpConnectionView(self, didLog: "Local clipboard sync failed: \(error)")
+                self.delegate?.rdpConnectionView(self, didLog: "Local clipboard sync failed: \(RDPClipboardDiagnostics.reason(for: error))")
             }
         }
     }

@@ -1,3 +1,4 @@
+import ClipboardBridge
 import AppKit
 import CoreGraphics
 import RDPClientCore
@@ -79,8 +80,9 @@ private final class FollowKeySession: RDPEngineSession {
     func reconnect() throws {}
     func disconnect() throws {}
     var supportsClipboard: Bool { false }
-    func pollLocalClipboard() throws {}
-    func sendLocalFiles(_ urls: [URL]) throws {}
+    func pollLocalClipboard() throws -> ClipboardFileOffer? { nil }
+    var fileOffer: ClipboardFileOffer = .none
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer { fileOffer }
     func sendLocalText(_ text: String) throws {}
     func updateDesktopSize(pointWidth: Double, pointHeight: Double, scale: Double, force: Bool) throws {}
     var supportsOutputSuppression: Bool { false }
@@ -182,6 +184,21 @@ final class RDPClientViewFollowTests: XCTestCase {
         }
         RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         return session.keys
+    }
+
+    func testDropReportsOmissionsAndPastesOnlyWhenFilesWereProvided() {
+        let (view, session, _, _, _, _) = makeFixture(follow: false)
+        var notices: [Int] = []
+        view.onClipboardItemsOmitted = { notices.append($0) }
+        let fixture = [URL(fileURLWithPath: "/tmp/fixture")]
+
+        session.fileOffer = ClipboardFileOffer(providedCount: 0, providedBytes: 0, omittedCount: 2)
+        XCTAssertFalse(view.offerDroppedFiles(fixture))
+        session.fileOffer = ClipboardFileOffer(providedCount: 1, providedBytes: 1, omittedCount: 1)
+        XCTAssertTrue(view.offerDroppedFiles(fixture))
+
+        XCTAssertEqual(notices, [2, 1])
+        XCTAssertEqual(waitForKeys(session, count: 4).map(\.code), [0x1D, 0x2F, 0x2F, 0x1D])
     }
 
     // MARK: I-F4 ordering

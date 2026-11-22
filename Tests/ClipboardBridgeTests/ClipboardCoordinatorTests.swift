@@ -14,6 +14,19 @@ final class ClipboardCoordinatorTests: XCTestCase {
         XCTAssertEqual(sink.sentText, ["hello"])
     }
 
+    func testFileOmissionIsReturnedOncePerPasteboardChange() throws {
+        let urls = [URL(fileURLWithPath: "/tmp/fixture")]
+        let pasteboard = MockPasteboard(payload: .fileURLs(urls))
+        let sink = MockRemoteSink()
+        sink.fileResult = ClipboardFileOffer(providedCount: 0, providedBytes: 0, omittedCount: 1)
+        let coordinator = ClipboardCoordinator(pasteboard: pasteboard, remoteSink: sink)
+
+        pasteboard.bump()
+        XCTAssertEqual(try coordinator.pollLocalPasteboard(), sink.fileResult)
+        XCTAssertNil(try coordinator.pollLocalPasteboard())
+        XCTAssertEqual(sink.sentFiles, [urls])
+    }
+
     func testRemoteTextWritesPasteboardAndSuppressesEcho() throws {
         let pasteboard = MockPasteboard(payload: nil)
         let sink = MockRemoteSink()
@@ -100,12 +113,14 @@ private final class MockPasteboard: PasteboardClient {
 private final class MockRemoteSink: RemoteClipboardSink {
     var sentText: [String] = []
     var sentFiles: [[URL]] = []
+    var fileResult: ClipboardFileOffer = .none
 
     func sendLocalText(_ text: String) throws {
         sentText.append(text)
     }
 
-    func sendLocalFiles(_ urls: [URL]) throws {
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer {
         sentFiles.append(urls)
+        return fileResult
     }
 }

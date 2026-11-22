@@ -402,36 +402,37 @@ public final class IronRDPSession: RDPEngineSession {
         tearDownNativeSession(reportingDisconnect: true)
     }
 
-    public func pollLocalClipboard() throws {
+    @discardableResult
+    public func pollLocalClipboard() throws -> ClipboardFileOffer? {
         try withSessionLock {
             do {
-                try clipboardCoordinator?.pollLocalPasteboard()
+                return try clipboardCoordinator?.pollLocalPasteboard()
             } catch ClipboardBridgeError.noSupportedPasteboardContent {
-                return
+                return nil
             } catch {
-                emitLog("Local clipboard sync failed: \(error)")
+                let message = "Local clipboard sync failed: \(RDPClipboardDiagnostics.reason(for: error))"
+                emitLog(message)
                 throw error
             }
         }
     }
 
-    public func sendLocalFiles(_ urls: [URL]) throws {
-        delegate?.rdpSession(self, didLog: "Local files offered to remote clipboard: \(urls.count).")
+    @discardableResult
+    public func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer {
         do {
-            try withSessionLock {
+            return try withSessionLock {
                 guard let remoteClipboardSink, clipboardCoordinator != nil else { throw Self.clipboardDisconnected }
-                let offeredBytes = try urls.reduce(UInt64(0)) { total, url in
-                    let values = try url.resourceValues(forKeys: [.fileSizeKey])
-                    return total + UInt64(values.fileSize ?? 0)
+                let result = try remoteClipboardSink.sendLocalFiles(urls)
+                guard result.didProvide else { return result }
+                updateStatistics { stats in
+                    stats.localFilesOffered += UInt64(result.providedCount)
+                    stats.localFileBytesOffered += result.providedBytes
                 }
-                try remoteClipboardSink.sendLocalFiles(urls)
-                updateStatistics {
-                    $0.localFilesOffered += UInt64(urls.count)
-                    $0.localFileBytesOffered += offeredBytes
-                }
+                return result
             }
         } catch {
-            emitLog("Local file offer failed: \(error)")
+            let message = "Local file offer failed: \(RDPClipboardDiagnostics.reason(for: error))"
+            emitLog(message)
             throw error
         }
     }
@@ -607,7 +608,7 @@ public final class IronRDPSession: RDPEngineSession {
                 } catch {
                     // The connection's end is the usual cause, so this line does not wait for the
                     // connection, the session, or the delegate (INV-LOG1).
-                    let message = "Remote file materialization failed: \(error)"
+                    let message = "Remote file materialization failed: \(RDPClipboardDiagnostics.reason(for: error))"
                     logFile?.append(message)
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }

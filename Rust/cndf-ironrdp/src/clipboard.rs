@@ -1,6 +1,7 @@
 use super::*;
 
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Clone)]
 pub(super) struct LocalFile {
@@ -191,7 +192,14 @@ fn read_range(file: &LocalFile, offset: u64, length: u32) -> Option<Vec<u8>> {
     if length > MAX_FILE_RANGE_LENGTH || offset.checked_add(u64::from(length))? > file.size {
         return None;
     }
-    let mut source = std::fs::File::open(&file.path).ok()?;
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
+        .open(&file.path)
+        .ok()?;
+    if !source.metadata().ok()?.is_file() {
+        return None;
+    }
     source.seek(SeekFrom::Start(offset)).ok()?;
     let mut bytes = vec![0; length as usize];
     source.read_exact(&mut bytes).ok()?;
@@ -3228,9 +3236,46 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn range_requires_an_unaliased_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("cndf-iron-range-types-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let regular = directory.join("file");
+        std::fs::write(&regular, [7]).unwrap();
+        let file_alias = root.join("file-alias");
+        symlink(&regular, &file_alias).unwrap();
+        let directory_alias = root.join("directory-alias");
+        symlink(&directory, &directory_alias).unwrap();
+
+        let read = |path: &std::path::Path, length| {
+            read_range(&LocalFile {
+                path: path.to_str().unwrap().to_owned(),
+                name: "test".into(),
+                size: 1,
+            }, 0, length)
+        };
+        let cases = [
+            read(&regular, 1), read(&file_alias, 1),
+            read(&directory_alias.join("file"), 1), read(&directory, 0),
+        ];
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(cases, [Some(vec![7]), None, None, None]);
+    }
+
     #[test]
     fn reads_sparse_range_above_four_gib_and_caps_allocations() {
-        let path = std::env::temp_dir().join(format!("cndf-iron-range-{}", std::process::id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("cndf-iron-range-{}", std::process::id()));
         let mut sparse = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

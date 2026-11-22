@@ -765,6 +765,53 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertNil(pasteboard.fileURLs)
     }
 
+    func testMaterializationLogsUseOnlySafeReasons() throws {
+        let marker = "private-name-marker"
+        let path = URL(fileURLWithPath: "/private/" + marker)
+        let failures: [(Error, String)] = [
+            (FileTransferStagingError.unableToCreateRemoteDropFile(path, errno: EACCES), "staging-create errno=\(EACCES)"),
+            (NSError(domain: marker, code: 1, userInfo: [NSLocalizedDescriptionKey: marker]), "unknown")
+        ]
+        for (failure, reason) in failures {
+            for iron in [false, true] {
+                for detached in [false, true] {
+                    try? FileManager.default.removeItem(at: logURL)
+                    let server = RangeServer()
+                    let prefix = "Remote file materialization failed:"
+                    let message = "\(prefix) reason=\(reason)"
+                    if iron {
+                        let (session, recorder, board) = try connectStub(server, logFileURL: logURL)
+                        defer { try? session.disconnect(); board.releaseGlobally() }
+                        let changeCount = board.changeCount
+                        session.materializeRemoteFileList = { _, _, _ in throw failure }
+                        if detached { session.delegate = nil }
+                        sendIronList([("fixture.txt", 3)], to: session)
+                        XCTAssertTrue(waitUntil { self.logLines(containing: prefix) == 1 })
+                        if !detached { XCTAssertTrue(waitUntil { recorder.count(prefix: prefix) == 1 }) }
+                        XCTAssertEqual(recorder.count(prefix: message), detached ? 0 : 1)
+                        XCTAssertEqual(recorder.count(prefix: prefix), detached ? 0 : 1)
+                        XCTAssertEqual(board.changeCount, changeCount)
+                    } else {
+                        let (session, board, _, recorder) = try freeRDPSession(server)
+                        let changeCount = board.changeCount
+                        session.logFile = RDPSessionLogFile(url: logURL, lock: NSLock())
+                        session.materializeRemoteFileList = { _, _, _ in throw failure }
+                        if detached { session.delegate = nil }
+                        sendFreeRDPList([("fixture.txt", 3)], to: session)
+                        XCTAssertTrue(waitUntil { self.logLines(containing: prefix) == 1 })
+                        if !detached { XCTAssertTrue(waitUntil { recorder.count(prefix: prefix) == 1 }) }
+                        XCTAssertEqual(recorder.count(prefix: message), detached ? 0 : 1)
+                        XCTAssertEqual(recorder.count(prefix: prefix), detached ? 0 : 1)
+                        XCTAssertEqual(board.changeCount, changeCount)
+                    }
+                    XCTAssertEqual(logLines(containing: message), 1)
+                    XCTAssertEqual(logLines(containing: marker), 0)
+                    XCTAssertTrue(stagedNames.isEmpty)
+                }
+            }
+        }
+    }
+
     // L-5 (IronRDP): a failure on a live connection is one line in the file, not two.
     func testIronRDPFailureOnALiveConnectionWritesOneLine() throws {
         let server = RangeServer()
@@ -903,7 +950,7 @@ private final class FakePasteboard: PasteboardClient {
 private final class FakeSink: RemoteClipboardSink {
     private(set) var sentText: [String] = []
     func sendLocalText(_ text: String) throws { sentText.append(text) }
-    func sendLocalFiles(_ urls: [URL]) throws {}
+    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer { .none }
 }
 
 /// A CF_FILEGROUPDESCRIPTORW with `FD_FILESIZE` entries.
