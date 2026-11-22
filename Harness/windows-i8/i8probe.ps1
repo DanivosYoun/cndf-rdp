@@ -10,6 +10,16 @@
 #                             Ctrl+V, then wait until the tree is stable for 8 s, log it with
 #                             sizes and SHA-256, and copy "I8DONE <leaf> n=<entries> bytes=<sum>"
 #   sound <seconds>           play a 440 Hz tone that long
+# int-11 verbs (one-shot WinForms timers, so the owner window keeps pumping while waiting):
+#   mix <k> <delayMs> [<dir> <prefix>]  drop list C:\i8\src\gw1A\f00..f39.bin, then after delayMs
+#                             the same names from C:\i8\src\gw1B (same sizes, other bytes), or
+#                             C:\i8\src\<dir>\<prefix>00..39.bin
+#   fileimg <b64 path> <ms>   drop list that path, then Clipboard.SetImage after ms
+#   flip <ft|tf> <k> <ms>     files(small.txt) then text "M4-<k>" after ms, or the reverse
+#   hold <b64 path> <ms> <holdMs>  drop list that file, after ms open it with FileShare.None for holdMs
+#   del <b64 path> <ms>       drop list that file, after ms delete it (logs the exception if it fails)
+#   trunc <b64 path> <ms> <bytes>  drop list that file, after ms set its length to bytes
+# Every clipboard change also logs the owner process; the tree line lists visible dialogs.
 # Every clipboard change, wheel message (WM_MOUSEWHEEL / WM_MOUSEHWHEEL on the form) and command
 # is logged to C:\i8\out\<run>.log (run id from C:\i8\runid.txt). On start it copies
 # "I8READY <run>". A borderless topmost form sits at the origin (600x300 physical pixels). The
@@ -43,6 +53,13 @@ public class I8Form : Form {
 public static class I8Probe {
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder sb, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -101,6 +118,47 @@ public static class I8Probe {
         return ms.ToArray();
     }
 
+    static void Later(int ms, Action action) {
+        var t = new Timer { Interval = Math.Max(1, ms) };
+        t.Tick += delegate { t.Stop(); t.Dispose(); try { action(); } catch (Exception ex) { Log("later error " + ex.GetType().Name + " " + ex.Message); } };
+        t.Start();
+    }
+
+    static void SetFiles(IEnumerable<string> paths) {
+        var list = new StringCollection();
+        foreach (string p in paths) list.Add(p);
+        for (int i = 0; i < 10; i++) {
+            try { Clipboard.SetFileDropList(list); return; } catch (ExternalException) { System.Threading.Thread.Sleep(20); }
+        }
+        Log("files-failed");
+    }
+
+    static string Owner() {
+        IntPtr h = GetClipboardOwner();
+        if (h == IntPtr.Zero) return "none";
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        string name = "?";
+        try { name = Process.GetProcessById((int)pid).ProcessName; } catch (Exception) { }
+        return pid + ":" + name;
+    }
+
+    static string Dialogs() {
+        var found = new List<string>();
+        EnumWindows(delegate (IntPtr h, IntPtr l) {
+            if (!IsWindowVisible(h)) return true;
+            var cls = new StringBuilder(256); GetClassName(h, cls, 256);
+            if (cls.ToString() == "#32770") { var t = new StringBuilder(256); GetWindowText(h, t, 256); found.Add(B64(t.ToString())); }
+            return true;
+        }, IntPtr.Zero);
+        return found.Count == 0 ? "none" : string.Join(",", found);
+    }
+
+    static List<string> Set40(string dir, string prefix = "f") {
+        var l = new List<string>();
+        for (int i = 0; i < 40; i++) l.Add(dir + "\\" + prefix + i.ToString("00") + ".bin");
+        return l;
+    }
+
     static void Command(string text) {
         string[] f = text.Split(new[] { ' ' }, 3);
         string verb = f.Length > 1 ? f[1] : "";
@@ -127,6 +185,69 @@ public static class I8Probe {
             Directory.CreateDirectory(pasteDir);
             Process.Start("explorer.exe", pasteDir);
             pasteState = 1; stateSince = clock.ElapsedMilliseconds;
+        } else if (verb == "mix") {
+            string[] a = arg.Split(' ');
+            int ms = int.Parse(a[1]);
+            SetFiles(Set40(@"C:\i8\src\gw1A"));
+            Log("mix " + a[0] + " A set");
+            // Optional third/fourth argument: another B folder and file prefix (other names).
+            string dirB = a.Length > 3 ? @"C:\i8\src\" + a[2] : @"C:\i8\src\gw1B", prefixB = a.Length > 3 ? a[3] : "f";
+            Later(ms, delegate { SetFiles(Set40(dirB, prefixB)); Log("mix " + a[0] + " B set after=" + ms + " dir=" + dirB); });
+        } else if (verb == "fileimg") {
+            string[] a = arg.Split(' ');
+            SetFiles(new[] { UnB64(a[0]) });
+            Log("fileimg files set");
+            Later(int.Parse(a[1]), delegate {
+                var bmp = new Bitmap(64, 64);
+                using (var g = Graphics.FromImage(bmp)) g.Clear(Color.OrangeRed);
+                Clipboard.SetImage(bmp);
+                Log("fileimg image set");
+            });
+        } else if (verb == "flip") {
+            string[] a = arg.Split(' ');
+            string t = "M4-" + a[1];
+            int ms = int.Parse(a[2]);
+            if (a[0] == "ft") {
+                SetFiles(new[] { @"C:\i8\src\multi\small.txt" }); Log("flip ft files");
+                Later(ms, delegate { Copy(t); Log("flip ft text " + t); });
+            } else {
+                Copy(t); Log("flip tf text " + t);
+                Later(ms, delegate { SetFiles(new[] { @"C:\i8\src\multi\small.txt" }); Log("flip tf files"); });
+            }
+        } else if (verb == "hold") {
+            string[] a = arg.Split(' ');
+            string path = UnB64(a[0]);
+            SetFiles(new[] { path });
+            Log("hold files set");
+            int hold = int.Parse(a[2]);
+            Later(int.Parse(a[1]), delegate {
+                try {
+                    var held = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                    Log("hold opened");
+                    Later(hold, delegate { held.Close(); Log("hold closed"); });
+                } catch (Exception ex) { Log("hold failed " + ex.GetType().Name + " " + B64(ex.Message)); }
+            });
+        } else if (verb == "del") {
+            string[] a = arg.Split(' ');
+            string path = UnB64(a[0]);
+            SetFiles(new[] { path });
+            Log("del files set");
+            Later(int.Parse(a[1]), delegate {
+                try { File.Delete(path); Log("del ok exists=" + File.Exists(path)); }
+                catch (Exception ex) { Log("del failed " + ex.GetType().Name + " " + B64(ex.Message)); }
+            });
+        } else if (verb == "trunc") {
+            string[] a = arg.Split(' ');
+            string path = UnB64(a[0]);
+            SetFiles(new[] { path });
+            Log("trunc files set");
+            long bytes = long.Parse(a[2]);
+            Later(int.Parse(a[1]), delegate {
+                try {
+                    using (var cut = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) cut.SetLength(bytes);
+                    Log("trunc ok len=" + new FileInfo(path).Length);
+                } catch (Exception ex) { Log("trunc failed " + ex.GetType().Name + " " + B64(ex.Message)); }
+            });
         } else if (verb == "sound") {
             int seconds = int.Parse(arg);
             player = new SoundPlayer(new MemoryStream(Tone(2)));
@@ -164,6 +285,7 @@ public static class I8Probe {
         uint seq = GetClipboardSequenceNumber();
         if (seq != lastSeq) {
             lastSeq = seq;
+            Log("seq " + seq + " owner=" + Owner());
             try {
                 IDataObject d = Clipboard.GetDataObject();
                 string formats = d == null ? "" : string.Join(",", d.GetFormats(false));
@@ -205,6 +327,7 @@ public static class I8Probe {
             if (sig != lastSignature) { lastSignature = sig; lastChange = now; }
             if ((count > 0 && now - lastChange > 8000) || now - stateSince > 900000) {
                 string tree = Tree(pasteDir, true, out count, out bytes);
+                Log("dialogs " + Dialogs());
                 Log("tree " + pasteLeaf + " n=" + count + " bytes=" + bytes + tree);
                 Copy("I8DONE " + pasteLeaf + " n=" + count + " bytes=" + bytes);
                 pasteState = 0;

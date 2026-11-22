@@ -143,7 +143,9 @@ run() {
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/results/${name}.scenario.json" "${MAC}:${I8_MAC_DIR}/scenarios/${name}.json"
   log "run ${name} engine=${engine}"
   if [[ -n "${CUT_AFTER:-}" ]]; then
-    ( sleep "${CUT_AFTER}"; kill "$(cat "${WORK}/tunnel.pid")" 2>/dev/null; echo "cut $(date '+%H:%M:%S')" >> "${WORK}/results/${name}.cut.txt" ) &
+    # CUT_RESTORE=<s>: bring the tunnel back that many seconds after the cut (reconnect rows).
+    ( sleep "${CUT_AFTER}"; kill "$(cat "${WORK}/tunnel.pid")" 2>/dev/null; echo "cut $(date '+%H:%M:%S.%3N')" >> "${WORK}/results/${name}.cut.txt"
+      if [[ -n "${CUT_RESTORE:-}" ]]; then sleep "${CUT_RESTORE}"; tunnel_up; echo "restored $(date '+%H:%M:%S.%3N')" >> "${WORK}/results/${name}.cut.txt"; fi ) &
     cut_pid=$!
   fi
   set +e
@@ -152,7 +154,8 @@ run() {
       --out \$M/results/${name}.json --engine ${engine} --trust-suite cndf.rdp-engine-harness.i8-${I8_BATCH} --work-dir \$M/work" \
     > "${WORK}/results/${name}.stdout.log" 2> "${WORK}/results/${name}.stderr.log"
   set -e
-  if [[ -n "${cut_pid}" ]]; then kill "${cut_pid}" 2>/dev/null || true; wait "${cut_pid}" 2>/dev/null || true; rm -f "${WORK}/tunnel.pid"; tunnel_up; fi
+  # tunnel_up starts a new tunnel only when the recorded PID is gone, so a restored one is kept.
+  if [[ -n "${cut_pid}" ]]; then kill "${cut_pid}" 2>/dev/null || true; wait "${cut_pid}" 2>/dev/null || true; tunnel_up; fi
   rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${I8_MAC_DIR}/results/${name}.json" "${WORK}/results/" 2>/dev/null || true
   rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${I8_MAC_DIR}/work/${name}-1.session.log" "${WORK}/results/" 2>/dev/null || true
   mac "cd \$HOME/${I8_MAC_DIR}/tmp/${name} && find . -print0 | xargs -0 stat -f '%z %N' ; cd .. && rm -rf ${name}" > "${WORK}/results/${name}.staging.txt" 2>&1 || true
