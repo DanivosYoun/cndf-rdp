@@ -331,15 +331,17 @@ class TestCanLockOffScratch(unittest.TestCase):
             self.assertNotIn("CB_CAN_LOCK_CLIPDATA", c_after)
             self.assertIn("CB_USE_LONG_FORMAT_NAMES", c_after)
 
-    def test_refuses_int12_repo_where_can_lock_is_absent(self):
-        # Running against this int-12-based harness branch (no CAN_LOCK yet) must fail fast.
+    def test_recognizes_the_int13_repo_where_can_lock_is_advertised(self):
+        # This harness branch is int-13 (CAN_LOCK advertised by both engines): the dry run must
+        # find exactly the two advertisements it would strip.
         proc = subprocess.run(
             [sys.executable, CAN_LOCK_OFF, "--src", REPO_ROOT, "--dry-run"],
             capture_output=True,
             text=True,
         )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("refusing to proceed", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("-                | Capabilities::CAN_LOCK_CLIPDATA", proc.stdout)
+        self.assertIn("-                           CB_CAN_LOCK_CLIPDATA |", proc.stdout)
 
 
 class TestI8ProbeScript(unittest.TestCase):
