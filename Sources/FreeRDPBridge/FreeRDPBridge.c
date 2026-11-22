@@ -1,11 +1,14 @@
 #include "FreeRDPBridge.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #if defined(RDP_FREERDP_REAL)
 #include <freerdp/freerdp.h>
@@ -45,6 +48,17 @@
 #define RDP_BRIDGE_CLIP_RANGES 8
 // 서버가 건 잠금(Mac→Windows)을 기억하는 최대 수(설계 D-L5). 넘치면 가장 오래된 것을 잊는다.
 #define RDP_BRIDGE_CLIP_SERVER_LOCKS 100
+// 서버의 RANGE 요청 하나에 읽어 주는 최대 길이(IronRDP MAX_FILE_RANGE_LENGTH 와 같다, Windows 요청 256 KiB 의 64배).
+#define RDP_BRIDGE_MAX_FILE_RANGE_LENGTH (16u * 1024u * 1024u)
+// RANGE 는 경로의 어느 요소든 링크면 열지 않는다(macOS O_NOFOLLOW_ANY). 제품 빌드(macOS)는 반드시 _ANY 여야 한다.
+// O_NOFOLLOW(최종 요소만) 대체는 O_NOFOLLOW_ANY 가 없는 Linux 시험 고정물용이다.
+#if defined(O_NOFOLLOW_ANY)
+#define RDP_BRIDGE_O_NOFOLLOW O_NOFOLLOW_ANY
+#elif defined(__APPLE__)
+#error "FreeRDPBridge RANGE needs O_NOFOLLOW_ANY on Apple platforms"
+#else
+#define RDP_BRIDGE_O_NOFOLLOW O_NOFOLLOW
+#endif
 
 struct RDPBridgeSession {
     RDPBridgeCallbacks callbacks;
@@ -65,6 +79,10 @@ struct RDPBridgeSession {
     DispClientContext *disp;
     pcDispCaps prev_disp_caps;
     CliprdrClientContext *cliprdr;
+    // 로컬 제공(설계 clip-lock-boundary D-B2, INV-L9·L10): 아래 네 값과 clip_local_gen 다섯 값을 한 단위로 보고
+    // clip_range_lock 아래에서만 읽고 쓴다. 바꾸는 곳은 bridge_publish_local_offer 하나(교체와 세대 상승을 한
+    // 임계 구역에서)이고, 해제는 거기서 떼어 낸 옛 제공과 이벤트 스레드 join 뒤의 bridge_disconnect 뿐이다.
+    // 채널 스레드는 잠금 안에서 필요한 사본을 만들고, 잠금 밖에서는 이 포인터를 따라가지 않는다.
     char *local_text;
     size_t local_text_length;
     RDPBridgeLocalFile *local_files;
@@ -93,6 +111,7 @@ struct RDPBridgeSession {
     // 다음 서버 FL 에서 푼다). clip_ranges_lock: 앱에 넘긴 목록의 잠금, RANGE 의 clipDataId.
     // clip_stale_answer: 최신 서버 FL 뒤에 기다리지 않던 RANGE 응답이 왔다(P4 의심 표지).
     // clip_server_locks: 서버가 건 잠금과 그때의 로컬 제공 세대 clip_local_gen(FIFO).
+    // clip_local_gen 은 로컬 제공(local_text 위 주석)의 일부다: 제공 교체·MonitorReady 광고마다 오른다.
     UINT32 clip_lock_next;
     UINT32 clip_lock_cur;
     UINT32 clip_ranges_lock;
@@ -282,20 +301,17 @@ static BOOL bridge_desktop_resize(rdpContext *context) {
     return gdi_resize(context->gdi, width, height);
 }
 
-static void bridge_clear_local_files(RDPBridgeSession *session) {
-    if (session == NULL) {
-        return;
+// 로컬 제공에서 떼어 낸 파일 배열을 해제한다. 잠금 밖에서 부른다(설계 D-B2).
+static void bridge_free_local_files(RDPBridgeLocalFile *files, size_t count) {
+    for (size_t index = 0; index < count; index++) {
+        free((void *)files[index].path);
+        free((void *)files[index].fileName);
     }
-    for (size_t index = 0; index < session->local_file_count; index++) {
-        free((void *)session->local_files[index].path);
-        free((void *)session->local_files[index].fileName);
-    }
-    free(session->local_files);
-    session->local_files = NULL;
-    session->local_file_count = 0;
+    free(files);
 }
 
-static UINT bridge_send_client_format_list(RDPBridgeSession *session) {
+// Format List 송신부: 로컬 제공을 읽지 않고, 잠금 안에서 읽어 둔 형식(텍스트 유무, 파일 수)을 받는다.
+static UINT bridge_send_local_format_list(RDPBridgeSession *session, bool has_text, size_t file_count) {
     if ((session == NULL) || (session->cliprdr == NULL)) {
         return CHANNEL_RC_OK;
     }
@@ -303,11 +319,11 @@ static UINT bridge_send_client_format_list(RDPBridgeSession *session) {
     CLIPRDR_FORMAT formats[3] = { 0 };
     UINT32 count = 0;
 
-    if (session->local_text != NULL) {
+    if (has_text) {
         formats[count].formatId = CF_UNICODETEXT;
         count++;
     }
-    if (session->local_file_count > 0) {
+    if (file_count > 0) {
         formats[count].formatId = RDP_BRIDGE_FORMAT_FILEGROUPDESCRIPTORW;
         formats[count].formatName = "FileGroupDescriptorW";
         count++;
@@ -320,29 +336,66 @@ static UINT bridge_send_client_format_list(RDPBridgeSession *session) {
     list.common.msgType = CB_FORMAT_LIST;
     list.numFormats = count;
     list.formats = formats;
-    // 새 로컬 제공: 이전 제공에 걸린 서버 잠금으로 온 요청은 FAIL 로 답한다(설계 D-L5, INV-L8).
-    EnterCriticalSection(&session->clip_range_lock);
-    session->clip_local_gen++;
-    LeaveCriticalSection(&session->clip_range_lock);
     bridge_logf(
         session,
         "Clipboard local formats advertised: text=%s files=%zu.",
-        session->local_text != NULL ? "yes" : "no",
-        session->local_file_count);
+        has_text ? "yes" : "no",
+        file_count);
     return session->cliprdr->ClientFormatList(session->cliprdr, &list);
+}
+
+// MonitorReady 의 광고: 지금 제공을 다시 알린다. 세대 상승과 형식 읽기를 한 임계 구역에서 한다.
+// 새 광고이므로 이전에 걸린 서버 잠금으로 온 요청은 FAIL 로 답한다(설계 D-L5, INV-L8).
+static UINT bridge_send_client_format_list(RDPBridgeSession *session) {
+    if ((session == NULL) || (session->cliprdr == NULL)) {
+        return CHANNEL_RC_OK;
+    }
+    EnterCriticalSection(&session->clip_range_lock);
+    session->clip_local_gen++;
+    const bool has_text = session->local_text != NULL;
+    const size_t file_count = session->local_file_count;
+    LeaveCriticalSection(&session->clip_range_lock);
+    return bridge_send_local_format_list(session, has_text, file_count);
+}
+
+// 로컬 제공을 바꾸는 유일한 곳(설계 D-B2, INV-L9·L11). 호출자가 잠금 밖에서 완성한 새 제공(소유권을 넘긴다)을
+// 한 임계 구역에서 옛 제공과 바꾸고 세대를 올린다. 옛 제공 해제·FL 송신·로그는 잠금 밖에서 한다.
+static UINT bridge_publish_local_offer(
+    RDPBridgeSession *session,
+    char *text,
+    size_t text_length,
+    RDPBridgeLocalFile *files,
+    size_t file_count) {
+    EnterCriticalSection(&session->clip_range_lock);
+    char *old_text = session->local_text;
+    RDPBridgeLocalFile *old_files = session->local_files;
+    const size_t old_file_count = session->local_file_count;
+    session->local_text = text;
+    session->local_text_length = text_length;
+    session->local_files = files;
+    session->local_file_count = file_count;
+    session->clip_local_gen++;
+    const bool has_text = session->local_text != NULL;
+    const size_t advertised_files = session->local_file_count;
+    LeaveCriticalSection(&session->clip_range_lock);
+    free(old_text);
+    bridge_free_local_files(old_files, old_file_count);
+    return bridge_send_local_format_list(session, has_text, advertised_files);
 }
 
 static UINT bridge_send_file_group_descriptor(
     CliprdrClientContext *cliprdr,
     RDPBridgeSession *session) {
-    FILEDESCRIPTORW *descriptors = (FILEDESCRIPTORW *)calloc(
-        session->local_file_count,
-        sizeof(FILEDESCRIPTORW));
+    // 서술자 배열은 잠금 안에서 다 채운다(이름 변환 포함, CPU 작업만). 직렬화·응답·로그는 잠금 밖이다(설계 D-B2, INV-L10).
+    EnterCriticalSection(&session->clip_range_lock);
+    const size_t file_count = session->local_file_count;
+    FILEDESCRIPTORW *descriptors = (FILEDESCRIPTORW *)calloc(file_count, sizeof(FILEDESCRIPTORW));
     if (descriptors == NULL) {
+        LeaveCriticalSection(&session->clip_range_lock);
         return CHANNEL_RC_NO_MEMORY;
     }
 
-    for (size_t index = 0; index < session->local_file_count; index++) {
+    for (size_t index = 0; index < file_count; index++) {
         // 이름 끝의 백슬래시는 디렉터리 표지다(설계 D-1, INV-D2). 표지는 떼고 DIRECTORY·크기 0 으로 쓴다.
         const char *file_name = session->local_files[index].fileName;
         const size_t name_length = (file_name != NULL) ? strlen(file_name) : 0;
@@ -364,6 +417,7 @@ static UINT bridge_send_file_group_descriptor(
             free(name);
         }
     }
+    LeaveCriticalSection(&session->clip_range_lock);
 
     BYTE *data = NULL;
     UINT32 data_length = 0;
@@ -372,7 +426,7 @@ static UINT bridge_send_file_group_descriptor(
     UINT status = cliprdr_serialize_file_list_ex(
         CB_STREAM_FILECLIP_ENABLED | (session->server_clip_flags & CB_HUGE_FILE_SUPPORT_ENABLED),
         descriptors,
-        (UINT32)session->local_file_count,
+        (UINT32)file_count,
         &data,
         &data_length);
     free(descriptors);
@@ -392,7 +446,7 @@ static UINT bridge_send_file_group_descriptor(
     response.common.dataLen = data_length;
     response.requestedFormatData = data;
     status = cliprdr->ClientFormatDataResponse(cliprdr, &response);
-    bridge_logf(session, "Clipboard sent local file descriptor list: files=%zu bytes=%u.", session->local_file_count, data_length);
+    bridge_logf(session, "Clipboard sent local file descriptor list: files=%zu bytes=%u.", file_count, data_length);
     free(data);
     return status;
 }
@@ -410,7 +464,29 @@ static UINT bridge_cliprdr_server_format_data_request(
         return bridge_send_file_group_descriptor(cliprdr, session);
     }
 
-    if ((request->requestedFormatId != CF_UNICODETEXT) || (session->local_text == NULL)) {
+    // 텍스트는 잠금 안에서 UTF-8 바이트를 복사하고, 변환·응답은 잠금 밖에서 한다(설계 D-B2, INV-L10).
+    char *text = NULL;
+    size_t text_length = 0;
+    bool copy_failed = false;
+    if (request->requestedFormatId == CF_UNICODETEXT) {
+        EnterCriticalSection(&session->clip_range_lock);
+        if (session->local_text != NULL) {
+            text_length = session->local_text_length;
+            text = (char *)malloc(text_length + 1);
+            if (text != NULL) {
+                memcpy(text, session->local_text, text_length);
+                text[text_length] = '\0';
+            } else {
+                copy_failed = true;
+            }
+        }
+        LeaveCriticalSection(&session->clip_range_lock);
+    }
+    if (copy_failed) {
+        return CHANNEL_RC_NO_MEMORY;
+    }
+
+    if ((request->requestedFormatId != CF_UNICODETEXT) || (text == NULL)) {
         bridge_logf(session, "Clipboard server requested unsupported local format: id=%u.", request->requestedFormatId);
         CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
         response.common.msgType = CB_FORMAT_DATA_RESPONSE;
@@ -420,7 +496,8 @@ static UINT bridge_cliprdr_server_format_data_request(
     }
 
     size_t wchar_count = 0;
-    WCHAR *wide = ConvertUtf8NToWCharAlloc(session->local_text, session->local_text_length, &wchar_count);
+    WCHAR *wide = ConvertUtf8NToWCharAlloc(text, text_length, &wchar_count);
+    free(text);
     if (wide == NULL) {
         return CHANNEL_RC_NO_MEMORY;
     }
@@ -431,7 +508,7 @@ static UINT bridge_cliprdr_server_format_data_request(
     response.common.dataLen = (UINT32)((wchar_count + 1) * sizeof(WCHAR));
     response.requestedFormatData = (const BYTE *)wide;
     UINT status = cliprdr->ClientFormatDataResponse(cliprdr, &response);
-    bridge_logf(session, "Clipboard sent local text: utf8Bytes=%zu utf16Bytes=%u.", session->local_text_length, response.common.dataLen);
+    bridge_logf(session, "Clipboard sent local text: utf8Bytes=%zu utf16Bytes=%u.", text_length, response.common.dataLen);
     free(wide);
     return status;
 }
@@ -789,54 +866,110 @@ static UINT bridge_cliprdr_server_file_contents_request(
     }
 
     RDPBridgeSession *session = (RDPBridgeSession *)cliprdr->custom;
+    const bool want_size = (request->dwFlags & FILECONTENTS_SIZE) != 0;
+    const bool want_range = !want_size && ((request->dwFlags & FILECONTENTS_RANGE) != 0);
+    // 세대 검사·색인 검사·대상 선택(RANGE 면 경로 사본, SIZE 면 크기)을 한 임계 구역에서 한다(설계 D-B2, INV-L8′·L10).
     // 잠금 id 를 단 요청은 그 잠금이 지금 제공에 걸린 것일 때만 답한다(설계 D-L5, INV-L8). 모르는 id 도 FAIL.
+    // 로그·파일 I/O 는 잠금 밖에서 하고, 잠금 밖에서는 session->local_files 를 만지지 않는다.
+    bool current = true;
+    bool in_range = false;
+    bool copy_failed = false;
+    char *path = NULL;
+    UINT64 file_size = 0;
+    EnterCriticalSection(&session->clip_range_lock);
     if (request->haveClipDataId) {
-        EnterCriticalSection(&session->clip_range_lock);
-        const size_t index = bridge_find_server_lock(session, request->clipDataId);
-        const bool current = (index < session->clip_server_lock_count) &&
-                             (session->clip_server_locks[index].gen == session->clip_local_gen);
-        LeaveCriticalSection(&session->clip_range_lock);
-        if (!current) {
-            bridge_logf(session, "Clipboard local file request refused reason=replaced-offer: id=%u.", request->clipDataId);
-            return bridge_send_file_contents_failure(cliprdr, request);
+        const size_t lock_index = bridge_find_server_lock(session, request->clipDataId);
+        current = (lock_index < session->clip_server_lock_count) &&
+                  (session->clip_server_locks[lock_index].gen == session->clip_local_gen);
+    }
+    const size_t file_count = session->local_file_count;
+    if (current && (request->listIndex < file_count)) {
+        in_range = true;
+        file_size = session->local_files[request->listIndex].size;
+        if (want_range) {
+            path = strdup(session->local_files[request->listIndex].path);
+            copy_failed = (path == NULL);
         }
     }
-    if (request->listIndex >= session->local_file_count) {
-        bridge_logf(session, "Clipboard local file request rejected: listIndex=%u count=%zu.", request->listIndex, session->local_file_count);
+    LeaveCriticalSection(&session->clip_range_lock);
+    if (!current) {
+        bridge_logf(session, "Clipboard local file request refused reason=replaced-offer: id=%u.", request->clipDataId);
         return bridge_send_file_contents_failure(cliprdr, request);
     }
+    if (!in_range) {
+        bridge_logf(session, "Clipboard local file request rejected: listIndex=%u count=%zu.", request->listIndex, file_count);
+        return bridge_send_file_contents_failure(cliprdr, request);
+    }
+    if (copy_failed) {
+        return CHANNEL_RC_NO_MEMORY;
+    }
 
-    const RDPBridgeLocalFile *file = &session->local_files[request->listIndex];
     BYTE size_data[8] = { 0 };
     BYTE *buffer = NULL;
     UINT32 response_size = 0;
 
-    if (request->dwFlags & FILECONTENTS_SIZE) {
-        UINT64 size = file->size;
-        memcpy(size_data, &size, sizeof(size));
+    if (want_size) {
+        memcpy(size_data, &file_size, sizeof(file_size));
         buffer = size_data;
         response_size = sizeof(size_data);
-        bridge_logf(session, "Clipboard server requested local file size: index=%u size=%llu.", request->listIndex, (unsigned long long)file->size);
-    } else if (request->dwFlags & FILECONTENTS_RANGE) {
-        FILE *handle = fopen(file->path, "rb");
-        if (handle == NULL) {
-            bridge_logf(session, "Clipboard local file open failed: %s.", file->path);
-            return bridge_send_file_contents_failure(cliprdr, request);
-        }
+        bridge_logf(session, "Clipboard server requested local file size: index=%u size=%llu.", request->listIndex, (unsigned long long)file_size);
+    } else if (want_range) {
+        // 길이 규칙은 IronRDP range_length(clipboard.rs:287-294)와 같다: 16 MiB 를 넘는 요청과 광고 크기 너머에서
+        // 시작하는 요청은 FAIL, 그 외에는 광고 크기에서 자른다. Windows 는 남은 바이트가 적어도 256 KiB 를 요청하므로
+        // EOF 를 넘는 요청은 잘라서 OK 다. 읽을 끝이 off_t 로 음수가 되는 위치는 FAIL 이다(off_t 는 64비트).
         const UINT64 offset = ((UINT64)request->nPositionHigh << 32) | request->nPositionLow;
-        if (fseeko(handle, (off_t)offset, SEEK_SET) != 0) {
-            fclose(handle);
-            bridge_logf(session, "Clipboard local file seek failed: index=%u.", request->listIndex);
+        const UINT64 available = (offset <= file_size) ? (file_size - offset) : 0;
+        response_size = (available < request->cbRequested) ? (UINT32)available : request->cbRequested;
+        if ((request->cbRequested > RDP_BRIDGE_MAX_FILE_RANGE_LENGTH) || (offset > file_size) ||
+            (offset > (UINT64)INT64_MAX - response_size)) {
+            free(path);
+            bridge_logf(
+                session,
+                "Clipboard local file request refused reason=invalid-range: index=%u offset=%llu requested=%u.",
+                request->listIndex,
+                (unsigned long long)offset,
+                request->cbRequested);
             return bridge_send_file_contents_failure(cliprdr, request);
         }
-        response_size = request->cbRequested;
-        buffer = (BYTE *)malloc(response_size);
-        if (buffer == NULL) {
-            fclose(handle);
-            return CHANNEL_RC_NO_MEMORY;
+        // 링크(최종·중간 요소)는 따라가지 않고, 연 것이 일반 파일일 때만 읽는다.
+        const int fd = open(path, O_RDONLY | O_CLOEXEC | RDP_BRIDGE_O_NOFOLLOW);
+        const int open_errno = errno;
+        free(path);
+        path = NULL;
+        if (fd < 0) {
+            // 로컬 경로는 로그에 남기지 않는다.
+            bridge_logf(session, "Clipboard local file open failed reason=source-open: index=%u errno=%d.", request->listIndex, open_errno);
+            return bridge_send_file_contents_failure(cliprdr, request);
         }
-        response_size = (UINT32)fread(buffer, 1, response_size, handle);
-        fclose(handle);
+        struct stat source_stat;
+        if ((fstat(fd, &source_stat) != 0) || !S_ISREG(source_stat.st_mode)) {
+            close(fd);
+            bridge_logf(session, "Clipboard local file request refused reason=source-type: index=%u.", request->listIndex);
+            return bridge_send_file_contents_failure(cliprdr, request);
+        }
+        // 0바이트는 할당하지 않는다(응답 데이터 포인터는 NULL 이 아니게 둔다).
+        buffer = size_data;
+        if (response_size > 0) {
+            buffer = (BYTE *)malloc(response_size);
+            if (buffer == NULL) {
+                close(fd);
+                return CHANNEL_RC_NO_MEMORY;
+            }
+            // 광고 뒤 파일이 줄어 짧게 읽히면 읽은 만큼 OK 로 보낸다(fread 를 쓰던 때와 같다).
+            UINT32 read_total = 0;
+            while (read_total < response_size) {
+                const ssize_t read_now = pread(fd, buffer + read_total, response_size - read_total, (off_t)(offset + read_total));
+                if (read_now > 0) {
+                    read_total += (UINT32)read_now;
+                } else if ((read_now < 0) && (errno == EINTR)) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            response_size = read_total;
+        }
+        close(fd);
         bridge_logf(
             session,
             "Clipboard server requested local file range: index=%u offset=%llu requested=%u sent=%u.",
@@ -2184,7 +2317,9 @@ static RDPBridgeStatus bridge_disconnect(RDPBridgeSession *session, DWORD wait_t
     free(session->local_text);
     session->local_text = NULL;
     session->local_text_length = 0;
-    bridge_clear_local_files(session);
+    bridge_free_local_files(session->local_files, session->local_file_count);
+    session->local_files = NULL;
+    session->local_file_count = 0;
     bridge_free_retry_options(session);
     session->disp = NULL;
     session->prev_disp_caps = NULL;
@@ -2210,20 +2345,18 @@ RDPBridgeStatus rdp_bridge_send_local_text(RDPBridgeSession *session, const uint
     if (session->cliprdr == NULL) {
         return RDPBridgeStatusNotConnected;
     }
-    bridge_clear_local_files(session);
-    free(session->local_text);
-    session->local_text = NULL;
-    session->local_text_length = length;
+    // 새 제공은 잠금 밖에서 다 만든 뒤 한 번에 바꾼다. 만들다 실패하면 옛 제공·세대·FL 은 그대로다(INV-L11).
+    char *text = NULL;
     if (length > 0) {
-        session->local_text = (char *)malloc(length + 1);
-        if (session->local_text == NULL) {
+        text = (char *)malloc(length + 1);
+        if (text == NULL) {
             return RDPBridgeStatusInternalError;
         }
-        memcpy(session->local_text, utf8, length);
-        session->local_text[length] = '\0';
+        memcpy(text, utf8, length);
+        text[length] = '\0';
     }
 
-    if (bridge_send_client_format_list(session) != CHANNEL_RC_OK) {
+    if (bridge_publish_local_offer(session, text, length, NULL, 0) != CHANNEL_RC_OK) {
         return RDPBridgeStatusInternalError;
     }
     return RDPBridgeStatusOK;
@@ -2270,33 +2403,31 @@ RDPBridgeStatus rdp_bridge_send_local_files(
     if (session->cliprdr == NULL) {
         return RDPBridgeStatusNotConnected;
     }
-    free(session->local_text);
-    session->local_text = NULL;
-    session->local_text_length = 0;
-    bridge_clear_local_files(session);
+    // 새 제공은 잠금 밖에서 다 만든 뒤 한 번에 바꾼다. 만들다 실패하면 만든 것만 버리고 옛 제공·세대·FL 은
+    // 그대로다(INV-L11).
+    RDPBridgeLocalFile *copies = NULL;
     if (count > 0) {
-        session->local_files = (RDPBridgeLocalFile *)calloc(count, sizeof(RDPBridgeLocalFile));
-        if (session->local_files == NULL) {
+        copies = (RDPBridgeLocalFile *)calloc(count, sizeof(RDPBridgeLocalFile));
+        if (copies == NULL) {
             return RDPBridgeStatusInternalError;
         }
-        session->local_file_count = count;
 
         for (size_t index = 0; index < count; index++) {
             if ((files[index].path == NULL) || (files[index].fileName == NULL)) {
-                bridge_clear_local_files(session);
+                bridge_free_local_files(copies, count);
                 return RDPBridgeStatusInvalidArgument;
             }
-            session->local_files[index].path = strdup(files[index].path);
-            session->local_files[index].fileName = strdup(files[index].fileName);
-            session->local_files[index].size = files[index].size;
-            if ((session->local_files[index].path == NULL) || (session->local_files[index].fileName == NULL)) {
-                bridge_clear_local_files(session);
+            copies[index].path = strdup(files[index].path);
+            copies[index].fileName = strdup(files[index].fileName);
+            copies[index].size = files[index].size;
+            if ((copies[index].path == NULL) || (copies[index].fileName == NULL)) {
+                bridge_free_local_files(copies, count);
                 return RDPBridgeStatusInternalError;
             }
         }
     }
 
-    if (bridge_send_client_format_list(session) != CHANNEL_RC_OK) {
+    if (bridge_publish_local_offer(session, NULL, 0, copies, count) != CHANNEL_RC_OK) {
         return RDPBridgeStatusInternalError;
     }
     return RDPBridgeStatusOK;
