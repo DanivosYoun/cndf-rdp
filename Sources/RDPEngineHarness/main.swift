@@ -146,7 +146,7 @@ private final class HarnessDelegate: RDPConnectionViewDelegate {
         lock.withLock {
             displayControlReady = updateDisplayControlReady(displayControlReady, forLogMessage: message)
         }
-        fputs("[RDP] \(message)\n", stderr)
+        fputs("\(wallStamp()) [RDP] \(message)\n", stderr)
     }
 
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {
@@ -301,11 +301,91 @@ private final class FrameProbe {
     }
 }
 
+/// Wall clock with milliseconds (KST) for stderr lines: the session log has whole seconds only.
+func wallStamp() -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
+    formatter.dateFormat = "HH:mm:ss.SSS"
+    return formatter.string(from: Date())
+}
+
+/// The remote-paste staging root the product writes to (FileTransferStaging's default).
+private let stagingRootURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("rdp-mac-file-staging", isDirectory: true)
+
+private func stagingTopLevel() -> Set<String> {
+    Set((try? FileManager.default.contentsOfDirectory(atPath: stagingRootURL.path)) ?? [])
+}
+
+/// Entries this iteration added under the staging root (top level) and their recursive byte sum.
+private func stagingNew(since baseline: Set<String>) -> (names: [String], bytes: UInt64) {
+    let names = stagingTopLevel().subtracting(baseline).sorted()
+    var bytes: UInt64 = 0
+    for name in names {
+        let url = stagingRootURL.appendingPathComponent(name)
+        let paths = [url.path] + ((FileManager.default.subpaths(atPath: url.path) ?? []).map { url.path + "/" + $0 })
+        for path in paths {
+            if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber,
+               (try? FileManager.default.attributesOfItem(atPath: path))?[.type] as? FileAttributeType == .typeRegular {
+                bytes += size.uint64Value
+            }
+        }
+    }
+    return (names, bytes)
+}
+
+private func openDescriptorCount() -> Int {
+    ((try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd")) ?? []).count
+}
+
+private func boardSummary(_ pasteboard: NSPasteboard) -> String {
+    let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    let text = pasteboard.string(forType: .string).map { String($0.prefix(40)) } ?? ""
+    return "change=\(pasteboard.changeCount) files=\(urls.count) text=\(text.debugDescription)"
+}
+
 private func drainRunLoop(_ duration: TimeInterval) {
     let deadline = Date().addingTimeInterval(duration)
     while Date() < deadline {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.005))
     }
+}
+
+/// Name, size and SHA-256 of a pasteboard file URL; a directory gets its recursive entry list.
+private func describeLocalFile(_ url: URL) -> [String: String] {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+        return ["name": url.lastPathComponent, "missing": "true"]
+    }
+    if isDirectory.boolValue {
+        let entries = (FileManager.default.subpaths(atPath: url.path) ?? []).sorted()
+        // Files inside get size and SHA-256 (small trees only; the hashes judge folder copies).
+        let files = entries.compactMap { entry -> String? in
+            let child = url.appendingPathComponent(entry)
+            var childIsDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: child.path, isDirectory: &childIsDirectory),
+                  !childIsDirectory.boolValue else { return nil }
+            let described = describeLocalFile(child)
+            return "\(entry):\(described["bytes"] ?? "?"):\(described["sha256"] ?? "?")"
+        }
+        return ["name": url.lastPathComponent, "directory": entries.joined(separator: "|"), "files": files.joined(separator: "|")]
+    }
+    guard let handle = try? FileHandle(forReadingFrom: url) else {
+        return ["name": url.lastPathComponent, "unreadable": "true"]
+    }
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    var bytes: UInt64 = 0
+    // Drain each chunk: on the main thread without a pool the chunks pile up until the step ends.
+    while autoreleasepool(invoking: {
+        guard let chunk = try? handle.read(upToCount: 8 << 20), !chunk.isEmpty else { return false }
+        hasher.update(data: chunk)
+        bytes += UInt64(chunk.count)
+        return true
+    }) {}
+    let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    return ["name": url.lastPathComponent, "bytes": String(bytes), "sha256": digest]
 }
 
 /// Runs the loop until `condition` holds or `timeout` passes. Returns whether it held.
@@ -379,6 +459,7 @@ private func runIteration(
     workDirectory: URL
 ) -> IterationResult {
     var result = IterationResult(iteration: iteration)
+    let stagingBaseline = stagingTopLevel()
     let password = run.passwordEnv.flatMap { ProcessInfo.processInfo.environment[$0] }
     let logURL = workDirectory.appendingPathComponent("\(run.id)-\(iteration).session.log")
     try? FileManager.default.removeItem(at: logURL)
@@ -547,6 +628,11 @@ private func runIteration(
             result.displayControlReady = delegate.isDisplayControlReady
             result.connectedAfterResize = view.isConnected && delegate.disconnectReason == nil
             result.steps.append("resize:\(Int(width))x\(Int(height))")
+            result.resizeLog.append(
+                "req=\(result.requestedResizeFrameSize!.map(String.init).joined(separator: "x")) "
+                    + "got=\(lastFrameSize.map { $0.map(String.init).joined(separator: "x") } ?? "none") "
+                    + "connected=\(result.connectedAfterResize!)"
+            )
         case "scroll":
             let deltas = step.scrollDeltas ?? []
             let deltasX = step.scrollDeltasX ?? []
@@ -646,6 +732,56 @@ private func runIteration(
             result.audioWavesReceived = waves
             result.steps.append("audioExpectWaves:\(ok ? "ok" : "failed")")
             aborted = !ok
+        case "clipboardSetLocalFiles":
+            guard let pasteboard, let paths = step.paths, !paths.isEmpty else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            pasteboard.clearContents()
+            var ok = pasteboard.writeObjects(paths.map { URL(fileURLWithPath: $0) as NSURL })
+            do { try view.pollLocalClipboard() } catch { ok = false }
+            result.steps.append("\(step.op):\(ok ? "ok" : "failed")")
+            aborted = !ok
+        case "clipboardExpectLocalFiles":
+            guard let pasteboard else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            let wanted = step.count ?? 1
+            var urls: [URL] = []
+            let waitStart = CACurrentMediaTime()
+            let fdBefore = openDescriptorCount()
+            var fdMax = fdBefore
+            let ok = waitUntil(step.timeout ?? 10) {
+                fdMax = max(fdMax, openDescriptorCount())
+                urls = pasteboard.readObjects(
+                    forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]
+                ) as? [URL] ?? []
+                return urls.count >= wanted
+            }
+            for url in urls { result.localFiles.append(describeLocalFile(url)) }
+            result.steps.append(
+                "\(step.op):\(ok ? "ok" : "failed") n=\(urls.count) waitMs=\(Int(milliseconds(CACurrentMediaTime() - waitStart))) fdBefore=\(fdBefore) fdMax=\(fdMax)"
+            )
+            fputs("\(wallStamp()) [FILES] \(ok ? "ok" : "failed") n=\(urls.count)\n", stderr)
+            aborted = !ok
+        case "clipboardWaitLocalPrefix":
+            guard let pasteboard, let prefix = step.prefix else {
+                result.steps.append("\(step.op):failed")
+                aborted = true
+                continue
+            }
+            var text = ""
+            let waitStart = CACurrentMediaTime()
+            let ok = waitUntil(step.timeout ?? 10) {
+                text = pasteboard.string(forType: .string) ?? ""
+                return text.hasPrefix(prefix)
+            }
+            if ok { result.localTexts.append(String(text.prefix(4000))) }
+            result.steps.append("\(step.op):\(ok ? "ok" : "failed") waitMs=\(Int(milliseconds(CACurrentMediaTime() - waitStart)))")
+            aborted = !ok
         case "keys", "sharedKeys":
             var shared: RDPSharedInputSession?
             if step.op == "sharedKeys" {
@@ -665,6 +801,55 @@ private func runIteration(
             }
             drainRunLoop(step.seconds ?? 0.5)
             result.steps.append("\(step.op):\(unknown.isEmpty ? "ok" : "unknown " + unknown.joined(separator: ","))")
+        case "watch":
+            // Staging and board timeline on stderr (ms wall clock), one line per change.
+            let deadline = Date().addingTimeInterval(step.seconds ?? 10)
+            var last = ""
+            while Date() < deadline {
+                let staged = stagingNew(since: stagingBaseline)
+                let line = "n=\(staged.names.count) bytes=\(staged.bytes) " + (pasteboard.map(boardSummary) ?? "")
+                if line != last { fputs("\(wallStamp()) [WATCH] \(line)\n", stderr); last = line }
+                drainRunLoop(0.05)
+            }
+            result.steps.append("watch:\(step.seconds ?? 10)s")
+        case "stagingWait":
+            // Waits until this iteration's staging entries are gone; ms from the step start.
+            let waitStart = CACurrentMediaTime()
+            let ok = waitUntil(step.timeout ?? 2) { stagingNew(since: stagingBaseline).names.isEmpty }
+            let staged = stagingNew(since: stagingBaseline)
+            fputs("\(wallStamp()) [STAGING] wait \(ok ? "empty" : "left") n=\(staged.names.count) bytes=\(staged.bytes)\n", stderr)
+            result.steps.append("stagingWait:\(ok ? "ok" : "failed") ms=\(Int(milliseconds(CACurrentMediaTime() - waitStart))) n=\(staged.names.count) bytes=\(staged.bytes)")
+        case "waitDisconnected":
+            let waitStart = CACurrentMediaTime()
+            let ok = waitUntil(step.timeout ?? 30) { delegate.disconnectReason != nil }
+            fputs("\(wallStamp()) [HARNESS] disconnected=\(ok)\n", stderr)
+            result.steps.append("waitDisconnected:\(ok ? "ok" : "failed") ms=\(Int(milliseconds(CACurrentMediaTime() - waitStart))) reason=\(delegate.disconnectReason.map(disconnectName) ?? "nil")")
+        case "reconnect":
+            // A new session on the same view, as the app's reconnect does.
+            let rises = delegate.connectRises
+            let ok: Bool
+            do {
+                try view.connect(options)
+                ok = waitUntil(step.timeout ?? 60) { delegate.connectRises > rises && view.isConnected }
+            } catch {
+                ok = false
+            }
+            fputs("\(wallStamp()) [HARNESS] reconnected=\(ok)\n", stderr)
+            result.steps.append("reconnect:\(ok ? "ok" : "failed")")
+            if !ok { aborted = true }
+        case "clipboardSnapshotLocal":
+            // Records the board (files with hashes, or text) under a label, without waiting.
+            guard let pasteboard else { result.steps.append("\(step.op):failed"); continue }
+            let label = step.prefix ?? "snap"
+            let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            for url in urls {
+                var entry = describeLocalFile(url)
+                entry["snap"] = label
+                result.localFiles.append(entry)
+            }
+            if urls.isEmpty { result.localTexts.append("\(label): " + String((pasteboard.string(forType: .string) ?? "<none>").prefix(400))) }
+            fputs("\(wallStamp()) [SNAP] \(label) \(boardSummary(pasteboard))\n", stderr)
+            result.steps.append("\(step.op):\(label) n=\(urls.count)")
         case "shutdown":
             result.disconnectBeforeShutdown = delegate.disconnectReason.map(disconnectName)
             if let statistics = view.statistics {
@@ -700,6 +885,11 @@ private func runIteration(
         window.close()
         drainRunLoop(1.0)
     }
+
+    // What this iteration left in the shared staging root; then remove only those entries.
+    let leftover = stagingNew(since: stagingBaseline)
+    result.steps.append("stagingEnd:n=\(leftover.names.count) bytes=\(leftover.bytes) names=\(leftover.names.joined(separator: "|"))")
+    for name in leftover.names { try? FileManager.default.removeItem(at: stagingRootURL.appendingPathComponent(name)) }
 
     sampler.stop()
     let endCPU = processCPUMilliseconds()
@@ -741,6 +931,22 @@ enum ResizeFrameSizeCheckStatus: String, Equatable {
     case notApplicable = "N/A"
 }
 
+/// One resize step logs `req=<w>x<h> got=<w>x<h>|none`. The structured fields keep
+/// only the last step, so a matching final pair used to hide an earlier mismatch.
+private func resizeLogDiffersFromRequest(_ lines: [String]) -> Bool {
+    for line in lines {
+        var fields: [String: String] = [:]
+        for token in line.split(separator: " ") {
+            let parts = token.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            fields[String(parts[0])] = String(parts[1])
+        }
+        guard let req = fields["req"], let got = fields["got"] else { continue }
+        if req != got { return true }
+    }
+    return false
+}
+
 func evaluateResizeFrameSize(
     _ iteration: IterationResult,
     against expect: HarnessExpectation?
@@ -755,6 +961,9 @@ func evaluateResizeFrameSize(
             return (.fail, "\(prefix) resize: Display Control did not open")
         }
         return (.notApplicable, nil)
+    }
+    if resizeLogDiffersFromRequest(iteration.resizeLog) {
+        return (.fail, "\(prefix) resize: logged frame size differs from the request")
     }
     if let requested = iteration.requestedResizeFrameSize {
         if iteration.resizeFrameSize != requested {
