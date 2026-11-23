@@ -30,7 +30,9 @@ pub(super) fn start_workers(
     let deliver_thread = thread::Builder::new()
         .name(format!("cndf-iron-{}-deliver", connection.generation))
         .spawn(move || {
-            delivery.worker(|| deliver(&delivery, updates, minimum, &delivery_repeats))
+            delivery.worker(|| {
+                deliver(&delivery, updates, minimum, &delivery_repeats, Instant::now)
+            })
         })?;
     let (clip_jobs, clip) = if options.channels.clipboard {
         let (jobs, worker) = clipboard::ClipWork::spawn(Arc::clone(&connection))?;
@@ -687,21 +689,26 @@ fn logon_failure(
     (autologon_sent && errors::rejects_logon(info)).then_some(errors::LOGON_REJECTED)
 }
 
+/// Publishes only completed frames: a completed frame goes out before the next frame's first
+/// tile is composed, merged at most with queued frame ends of its size within the batch window.
+/// `now` is the clock, read once per received item.
 fn deliver(
     connection: &Connection,
     mut updates: async_channel::Receiver<Output>,
     minimum: CNDFIronLogLevel,
     repeats: &Mutex<Repeats>,
+    mut now: impl FnMut() -> Instant,
 ) {
     let mut frame = Frame::default();
     let mut pending = None;
     while let Some(update) = pending.take().or_else(|| updates.blocking_recv()) {
+        let now = now();
         match update {
             Output::Rdp(RdpOutputEvent::DesktopUpdate(update)) => {
                 if frame.changes_size(&update) {
-                    frame.publish(connection, false);
+                    frame.resize();
                 }
-                let bytes = match frame.compose(update) {
+                let bytes = match frame.compose(update, now) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         connection.stop.store(true, Ordering::Release);
@@ -714,25 +721,28 @@ fn deliver(
                 statistics.updates_received += 1;
                 statistics.dirty_bytes_composed += bytes;
             }
+            // A completed frame was published before this item; an unfinished one is dropped.
             other => match other {
                 Output::Failure(failure) => {
-                    frame.publish(connection, false);
                     Logs::flush(connection, minimum, repeats);
                     report_failure(connection, failure);
                 }
                 Output::Rdp(event) => {
                     if matches!(event, RdpOutputEvent::Terminated(_)) {
-                        frame.publish(connection, false);
                         Logs::flush(connection, minimum, repeats);
                     }
                     deliver_event(connection, event, minimum);
                 }
-                Output::Redeliver => frame.publish(connection, true),
+                Output::Redeliver => frame.redeliver(connection),
             },
         }
         pending = updates.try_recv().ok();
-        let backlog = matches!(pending, Some(Output::Rdp(RdpOutputEvent::DesktopUpdate(_))));
-        if frame.ready(backlog) {
+        let merges = matches!(
+            &pending,
+            Some(Output::Rdp(RdpOutputEvent::DesktopUpdate(next)))
+                if next.ends_frame() && !frame.changes_size(next)
+        );
+        if frame.ready(merges, now) {
             frame.publish(connection, false);
         }
     }
@@ -1152,22 +1162,41 @@ mod tests {
         disconnects: Vec<(CNDFIronDisconnectKind, u32)>,
         ended: bool,
         frames_before_end: usize,
+        frames: Vec<Captured>,
+    }
+
+    /// A published frame as the host saw it during the callback.
+    #[derive(Debug, PartialEq)]
+    struct Captured {
+        pixels: Vec<u32>,
+        dirty: (u32, u32, u32, u32),
+        sequence: u64,
     }
 
     extern "C" fn host_frame(
         _: u64,
-        _: *const u8,
-        _: u32,
-        _: u32,
-        _: u32,
-        _: CNDFIronRect,
-        _: u64,
+        pixels: *const u8,
+        width: u32,
+        height: u32,
+        stride: u32,
+        dirty: CNDFIronRect,
+        sequence: u64,
         context: *mut c_void,
     ) {
         let host = unsafe { &mut *context.cast::<Host>() };
         if !host.ended {
             host.frames_before_end += 1;
         }
+        assert_eq!(stride, width * 4);
+        let bytes = unsafe { std::slice::from_raw_parts(pixels, (stride * height) as usize) };
+        host.frames.push(Captured {
+            pixels: bytes
+                .chunks_exact(4)
+                .map(|bgra| u32::from_le_bytes(bgra.try_into().unwrap()))
+                .collect(),
+            dirty: (dirty.x, dirty.y, dirty.width, dirty.height),
+            sequence,
+        });
     }
 
     extern "C" fn host_log(
@@ -1282,6 +1311,229 @@ mod tests {
         Output::Rdp(RdpOutputEvent::DesktopUpdate(update.with_frame_end()))
     }
 
+    /// A one-row tile of a `width` wide desktop holding `pixels` from column `x`.
+    fn row(width: u16, x: u16, pixels: &[u32]) -> Output {
+        let update = ironrdp_client::rdp::DesktopUpdate::new(
+            pixels.to_vec(),
+            std::num::NonZeroU16::new(width).unwrap(),
+            std::num::NonZeroU16::new(1).unwrap(),
+            ironrdp_pdu::geometry::InclusiveRectangle {
+                left: x,
+                right: x + pixels.len() as u16 - 1,
+                top: 0,
+                bottom: 0,
+            },
+        )
+        .unwrap();
+        Output::Rdp(RdpOutputEvent::DesktopUpdate(update))
+    }
+
+    /// Opaque test pixels told apart by `n`.
+    fn px(n: &[u32]) -> Vec<u32> {
+        n.iter().map(|n| 0xff00_0000 | n).collect()
+    }
+
+    fn pointer() -> Output {
+        Output::Rdp(RdpOutputEvent::PointerDefault)
+    }
+
+    fn terminated() -> Output {
+        Output::Rdp(RdpOutputEvent::Terminated(Ok(
+            ironrdp_session::GracefulDisconnectReason::ServerInitiated,
+        )))
+    }
+
+    fn fake_clock() -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now)
+    }
+
+    /// Queues every item, each with the millisecond it is received at, closes the channel, and
+    /// runs `deliver` to the end.
+    fn run_queued(host: &mut Host, items: Vec<(u64, Output)>) -> Arc<Connection> {
+        let connection = framed_connection(host);
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let (output, updates) = async_channel::channel(items.len() + 1);
+        let mut times = Vec::new();
+        for (ms, item) in items {
+            times.push(ms);
+            assert!(output.try_send(item).is_ok());
+        }
+        drop(output);
+        let mut times = times.into_iter();
+        let base = fake_clock();
+        deliver(
+            &connection,
+            updates,
+            CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+            &repeats,
+            || base + Duration::from_millis(times.next().unwrap()),
+        );
+        assert_eq!(times.next(), None, "the clock is read once per item");
+        connection
+    }
+
+    fn frames(host: &Host) -> Vec<Vec<u32>> {
+        host.frames.iter().map(|frame| frame.pixels.clone()).collect()
+    }
+
+    // Design frame-boundary, first falsification point: A ends, B's first tile is queued, a
+    // pointer event follows, then B's last tile. int-17 published [B1, A2] (4278190083,
+    // 4278190082) once the pointer event emptied the backlog.
+    #[test]
+    fn completed_frame_goes_out_before_the_next_frames_first_tile() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (1, row(2, 0, &px(&[3]))),
+                (2, pointer()),
+                (3, marked(row(2, 1, &px(&[4])))),
+            ],
+        );
+        assert_eq!(
+            host.frames,
+            [
+                Captured { pixels: px(&[1, 2]), dirty: (0, 0, 2, 1), sequence: 1 },
+                Captured { pixels: px(&[3, 4]), dirty: (0, 0, 2, 1), sequence: 2 },
+            ]
+        );
+    }
+
+    // The same order with the queue running empty after B's first tile instead of a pointer.
+    #[test]
+    fn empty_queue_after_the_next_frames_first_tile_publishes_nothing_unfinished() {
+        let mut host = Host::default();
+        let connection = framed_connection(&mut host);
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let (output, updates) = async_channel::channel(4);
+        output.try_send(marked(row(2, 0, &px(&[1, 2])))).unwrap();
+        output.try_send(row(2, 0, &px(&[3]))).unwrap();
+        let base = fake_clock();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, || base)
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lock(&connection.statistics).updates_received != 2 {
+                assert!(Instant::now() < deadline, "the first two updates are not composed");
+                std::thread::yield_now();
+            }
+            // Let the delivery thread decide on the empty queue and block on it.
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(lock(&connection.statistics).frames_delivered, 1);
+            output.blocking_send(marked(row(2, 1, &px(&[4])))).unwrap();
+            drop(output);
+        });
+        assert_eq!(frames(&host), [px(&[1, 2]), px(&[3, 4])]);
+    }
+
+    // A frame's tiles spread past the batch window are still published only at its end.
+    #[test]
+    fn unfinished_frame_is_not_published_when_the_window_passes() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(3, 0, &px(&[1, 2, 3])))),
+                (1, row(3, 0, &px(&[4]))),
+                (20, row(3, 1, &px(&[5]))),
+                (40, marked(row(3, 2, &px(&[6])))),
+            ],
+        );
+        assert_eq!(frames(&host), [px(&[1, 2, 3]), px(&[4, 5, 6])]);
+    }
+
+    // Multi-region frames queued back to back are each published whole.
+    #[test]
+    fn queued_multi_region_frames_are_each_published() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (1, row(2, 0, &px(&[3]))),
+                (2, marked(row(2, 1, &px(&[4])))),
+                (3, row(2, 0, &px(&[5]))),
+                (4, marked(row(2, 1, &px(&[6])))),
+            ],
+        );
+        assert_eq!(frames(&host), [px(&[1, 2]), px(&[3, 4]), px(&[5, 6])]);
+    }
+
+    // A missing frame end delays the screen to the next frame end, not forever.
+    #[test]
+    fn a_frame_without_its_end_is_published_with_the_next_end() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (1, pointer()),
+                (2, row(2, 0, &px(&[3]))),
+                (3, pointer()),
+                (30, row(2, 1, &px(&[4]))),
+                (31, marked(row(2, 0, &px(&[5])))),
+            ],
+        );
+        assert_eq!(frames(&host), [px(&[1, 2]), px(&[5, 4])]);
+    }
+
+    /// Single-update frames of one size queued at `ms` after a baseline frame.
+    fn merged_at(ms: u64) -> Vec<Vec<u32>> {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (ms, marked(row(2, 0, &px(&[3])))),
+                (ms, marked(row(2, 1, &px(&[4])))),
+            ],
+        );
+        frames(&host)
+    }
+
+    #[test]
+    fn queued_frame_ends_merge_only_within_the_batch_window() {
+        assert_eq!(merged_at(15), [px(&[3, 4])]);
+        assert_eq!(merged_at(16), [px(&[3, 2]), px(&[3, 4])]);
+        assert_eq!(merged_at(17), [px(&[3, 2]), px(&[3, 4])]);
+    }
+
+    // The window runs from the oldest unpublished change, not from the last publish.
+    #[test]
+    fn merge_window_starts_at_the_oldest_unpublished_change() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (0, pointer()),
+                (30, marked(row(2, 0, &px(&[3])))),
+                (31, marked(row(2, 1, &px(&[4])))),
+                (32, marked(row(2, 0, &px(&[5])))),
+            ],
+        );
+        assert_eq!(frames(&host), [px(&[1, 2]), px(&[5, 4])]);
+    }
+
+    // A steady backlog of frame ends is published once per window, and the rest once the
+    // queue drains.
+    #[test]
+    fn steady_backlog_publishes_once_per_window() {
+        let mut host = Host::default();
+        let mut items = vec![(0, marked(row(2, 0, &px(&[1, 2]))))];
+        for k in 1..=40u16 {
+            items.push((k.into(), marked(row(2, k % 2, &px(&[10 + u32::from(k)])))));
+        }
+        run_queued(&mut host, items);
+        assert_eq!(
+            frames(&host),
+            [px(&[26, 25]), px(&[42, 43]), px(&[50, 49])]
+        );
+    }
+
     // Finding m4-cpu shadow 194 vs 97: the first tile of a server frame arriving more than
     // 16 ms after the last publish was published alone, so each frame was published twice.
     #[test]
@@ -1293,17 +1545,19 @@ mod tests {
         let (output, updates) = async_channel::channel(usize::from(TILES) + 1);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats)
+                deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now)
             });
             output
-                .blocking_send(marked(tile(TILES, 0, TILES.into())))
+                .blocking_send(marked(row(TILES, 0, &px(&vec![1; TILES.into()]))))
                 .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
             while lock(&connection.statistics).frames_delivered != 1 {
+                assert!(Instant::now() < deadline, "a lone completed frame is held");
                 std::thread::yield_now();
             }
             std::thread::sleep(Duration::from_millis(20));
             for x in 0..TILES {
-                let update = tile(TILES, x, 1);
+                let update = row(TILES, x, &px(&[2 + u32::from(x)]));
                 let update = if x == TILES - 1 { marked(update) } else { update };
                 output.blocking_send(update).unwrap();
             }
@@ -1311,29 +1565,216 @@ mod tests {
         });
         assert_eq!(lock(&connection.statistics).frames_delivered, 2);
         assert_eq!(lock(&connection.statistics).updates_received, 261);
+        let second: Vec<u32> = (0..u32::from(TILES)).map(|x| 2 + x).collect();
+        assert_eq!(frames(&host), [px(&vec![1; TILES.into()]), px(&second)]);
+    }
+
+    // A tile is composed, and its update with its share of the budget dropped, before the
+    // frame's end is even sent.
+    #[test]
+    fn tiles_are_composed_without_waiting_for_the_frame_end() {
+        let mut host = Host::default();
+        let connection = framed_connection(&mut host);
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let (output, updates) = async_channel::channel(4);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now)
+            });
+            output.blocking_send(marked(row(2, 0, &px(&[1, 2])))).unwrap();
+            output.blocking_send(row(2, 0, &px(&[3]))).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lock(&connection.statistics).dirty_bytes_composed != 12 {
+                assert!(Instant::now() < deadline, "the first tile waits for the frame end");
+                std::thread::yield_now();
+            }
+            output.blocking_send(marked(row(2, 1, &px(&[4])))).unwrap();
+            drop(output);
+        });
+        assert_eq!(frames(&host), [px(&[1, 2]), px(&[3, 4])]);
     }
 
     #[test]
-    fn terminated_publishes_an_unfinished_batch_once() {
+    fn completed_frame_goes_out_before_a_resize() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (1, marked(row(3, 0, &px(&[3, 4, 5])))),
+            ],
+        );
+        assert_eq!(frames(&host), [px(&[1, 2]), px(&[3, 4, 5])]);
+    }
+
+    // An unfinished frame of the old size is dropped, a tile of the new size and its end
+    // apply to nothing, and the new size's full update becomes the frame.
+    #[test]
+    fn resize_drops_an_unfinished_frame_and_waits_for_a_full_update() {
+        for full in [false, true] {
+            let mut host = Host::default();
+            let mut items = vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (0, pointer()),
+                (1, row(2, 0, &px(&[3]))),
+                (2, marked(row(3, 1, &px(&[9])))),
+                (3, pointer()),
+                (4, marked(row(2, 1, &px(&[8])))),
+            ];
+            if full {
+                items.push((5, marked(row(3, 0, &px(&[4, 5, 6])))));
+            }
+            run_queued(&mut host, items);
+            let expected = if full {
+                vec![px(&[1, 2]), px(&[4, 5, 6])]
+            } else {
+                vec![px(&[1, 2])]
+            };
+            assert_eq!(frames(&host), expected, "full={full}");
+        }
+    }
+
+    #[test]
+    fn redelivery_of_a_published_frame_is_immediate_and_full() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (0, pointer()),
+                (1, marked(row(2, 1, &px(&[3])))),
+                (2, Output::Redeliver),
+            ],
+        );
+        assert_eq!(
+            host.frames,
+            [
+                Captured { pixels: px(&[1, 2]), dirty: (0, 0, 2, 1), sequence: 1 },
+                Captured { pixels: px(&[1, 3]), dirty: (1, 0, 1, 1), sequence: 2 },
+                Captured { pixels: px(&[1, 3]), dirty: (0, 0, 2, 1), sequence: 3 },
+            ]
+        );
+    }
+
+    // Requests during an unfinished frame become one full publish at its end.
+    #[test]
+    fn redelivery_while_composing_waits_for_the_frame_end() {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(3, 0, &px(&[1, 2, 3])))),
+                (0, pointer()),
+                (1, row(3, 0, &px(&[4]))),
+                (2, Output::Redeliver),
+                (3, Output::Redeliver),
+                (4, marked(row(3, 1, &px(&[5])))),
+                (5, pointer()),
+                (6, marked(row(3, 2, &px(&[6])))),
+            ],
+        );
+        assert_eq!(
+            host.frames,
+            [
+                Captured { pixels: px(&[1, 2, 3]), dirty: (0, 0, 3, 1), sequence: 1 },
+                Captured { pixels: px(&[4, 5, 3]), dirty: (0, 0, 3, 1), sequence: 2 },
+                Captured { pixels: px(&[4, 5, 6]), dirty: (2, 0, 1, 1), sequence: 3 },
+            ]
+        );
+    }
+
+    /// An unfinished frame, with a redelivery pending, then `end`.
+    fn ended_while_composing(end: Output) -> Host {
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (0, pointer()),
+                (1, row(2, 0, &px(&[3]))),
+                (2, Output::Redeliver),
+                (3, end),
+                (4, pointer()),
+            ],
+        );
+        host
+    }
+
+    /// A completed frame, then `end`.
+    fn ended_after_a_frame(end: Option<Output>) -> Host {
+        let mut host = Host::default();
+        let mut items = vec![(0, marked(row(2, 0, &px(&[1, 2]))))];
+        items.extend(end.map(|end| (1, end)));
+        run_queued(&mut host, items);
+        host
+    }
+
+    #[test]
+    fn session_end_publishes_only_a_completed_frame_and_before_the_end() {
+        for (name, end) in [
+            ("terminated", Some(terminated())),
+            ("failure", Some(Output::Failure(errors::PANIC))),
+            ("eof", None),
+        ] {
+            let host = ended_after_a_frame(end);
+            assert_eq!(frames(&host), [px(&[1, 2])], "{name}");
+            assert_eq!(host.frames_before_end, 1, "{name}");
+        }
+        for (name, end) in [
+            ("terminated", terminated()),
+            ("failure", Output::Failure(errors::PANIC)),
+        ] {
+            let host = ended_while_composing(end);
+            assert_eq!(frames(&host), [px(&[1, 2])], "{name}");
+            assert!(host.ended, "{name}");
+        }
+        // The channel closing ends an unfinished frame the same way.
+        let mut host = Host::default();
+        run_queued(
+            &mut host,
+            vec![
+                (0, marked(row(2, 0, &px(&[1, 2])))),
+                (0, pointer()),
+                (1, row(2, 0, &px(&[3]))),
+                (2, Output::Redeliver),
+            ],
+        );
+        assert_eq!(frames(&host), [px(&[1, 2])]);
+    }
+
+    #[test]
+    fn terminated_drops_an_unfinished_batch() {
         let mut host = Host::default();
         let connection = framed_connection(&mut host);
         let repeats = Arc::<Mutex<Repeats>>::default();
         let (output, updates) = async_channel::channel(4);
         output.try_send(tile(2, 0, 2)).unwrap();
-        output
-            .try_send(Output::Rdp(RdpOutputEvent::Terminated(Ok(
-                ironrdp_session::GracefulDisconnectReason::ServerInitiated,
-            ))))
-            .unwrap();
+        output.try_send(terminated()).unwrap();
         drop(output);
-        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now);
 
-        assert_eq!(host.frames_before_end, 1);
-        assert_eq!(lock(&connection.statistics).frames_delivered, 1);
+        assert_eq!(host.frames_before_end, 0);
+        assert_eq!(lock(&connection.statistics).frames_delivered, 0);
         assert_eq!(
             host.disconnects,
             [(CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER, 0)]
         );
+    }
+
+    // After destroy closed the callback gate nothing is published, a completed frame included.
+    #[test]
+    fn closed_gate_publishes_nothing() {
+        let mut host = Host::default();
+        let connection = framed_connection(&mut host);
+        connection.callbacks.closed.store(true, Ordering::Release);
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let (output, updates) = async_channel::channel(4);
+        output.try_send(marked(row(2, 0, &px(&[1, 2])))).unwrap();
+        output.try_send(Output::Redeliver).unwrap();
+        drop(output);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now);
+        assert!(host.frames.is_empty());
+        assert_eq!(lock(&connection.statistics).frames_delivered, 0);
     }
 
     #[derive(Debug)]
@@ -1446,7 +1887,7 @@ mod tests {
             ))))
             .unwrap();
         drop(output);
-        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now);
 
         assert_eq!(host.logs, ["fast_path repeated count=2"]);
         assert_eq!(
@@ -1466,7 +1907,7 @@ mod tests {
         let (output, updates) = async_channel::channel(4);
         output.try_send(Output::Failure(errors::PANIC)).unwrap();
         drop(output);
-        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now);
 
         assert_eq!(host.logs, ["fast_path repeated count=2"]);
         assert_eq!(host.failures.len(), 1);

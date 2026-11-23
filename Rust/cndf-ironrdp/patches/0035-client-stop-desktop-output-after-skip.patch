@@ -1,0 +1,98 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 0d9c9f9..61f12f4 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -4947,6 +4947,9 @@ async fn active_session(
+     let mut suppress_output_support = connection_result.suppress_output_support;
+     let window_support_level = connection_result.window_support_level;
+     let mut desktop_update_extent = None;
++    // A graceful close skipped a desktop update: the embedder's framebuffer lacks it, so no
++    // later update of this session may end a frame on top of it.
++    let mut desktop_updates_skipped = false;
+ 
+     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
+     let activation_factory = connection_result.activation_factory;
+@@ -5894,7 +5897,7 @@ async fn active_session(
+                     let height = NonZeroU16::new(image.height())
+                         .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?;
+                     if desktop_update_enabled {
+-                        if desktop_damage_delivered {
++                        if desktop_damage_delivered || desktop_updates_skipped {
+                             continue;
+                         }
+                         desktop_damage_delivered = true;
+@@ -5918,7 +5921,10 @@ async fn active_session(
+                             .await
+                             {
+                                 DesktopUpdateRoom::Reserved(permit) => permit,
+-                                DesktopUpdateRoom::Skip => continue,
++                                DesktopUpdateRoom::Skip => {
++                                    desktop_updates_skipped = true;
++                                    continue;
++                                }
+                                 DesktopUpdateRoom::Closed => {
+                                     return Ok(RdpControlFlow::TerminatedGracefully(
+                                         GracefulDisconnectReason::UserInitiated,
+@@ -5956,7 +5962,10 @@ async fn active_session(
+                                 .await
+                                 {
+                                     DesktopUpdateRoom::Reserved(permit) => permit,
+-                                    DesktopUpdateRoom::Skip => continue,
++                                    DesktopUpdateRoom::Skip => {
++                                        desktop_updates_skipped = true;
++                                        break;
++                                    }
+                                     DesktopUpdateRoom::Closed => {
+                                         return Ok(RdpControlFlow::TerminatedGracefully(
+                                             GracefulDisconnectReason::UserInitiated,
+diff --git a/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs b/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
+index 3a6b2ca..8c2137b 100644
+--- a/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
++++ b/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
+@@ -534,3 +534,46 @@ fn budget_follows_a_desktop_resize() {
+         let _ = tokio::time::timeout(Duration::from_secs(5), session.client).await;
+     });
+ }
++
++/// A graceful close with the budget spent skips a desktop update. From then on the session sends
++/// no desktop update, even once the consumer resumes, so no later frame end can mark a
++/// framebuffer that lacks the skipped one; the shutdown still completes and every permit returns.
++#[test]
++fn graceful_skip_ends_desktop_updates_for_the_session() {
++    run_local(|| async {
++        let (probe_tx, probe_rx) = oneshot::channel();
++        let mut session = start(1024, 1024, vec![Step::Frame; 60], 128, Some(probe_tx)).await;
++        let probe = probe_rx.await.unwrap();
++        let base = CURRENT.load(Ordering::Relaxed);
++        session.stall(60, base).await;
++        let queued = probe.__test_desktop_update_bytes_in_flight();
++        assert!(queued > 24 * MIB, "{queued} bytes queued: the budget is not spent");
++        session.input.request_graceful_close();
++        // The session loop takes the request and skips while nothing is consumed.
++        tokio::time::sleep(Duration::from_millis(1)).await;
++        let mut received = 0;
++        let mut updates = 0;
++        tokio::time::timeout(Duration::from_secs(10), async {
++            loop {
++                match session.output.recv().await.expect("the client is running") {
++                    RdpOutputEvent::DesktopUpdate(update) => {
++                        received += update.buffer().len() * 4;
++                        updates += 1;
++                    }
++                    RdpOutputEvent::Terminated(_) => return,
++                    _ => {}
++                }
++            }
++        })
++        .await
++        .expect("the session terminates");
++        println!("queued={} received={} updates={updates}", mib(queued), mib(received));
++        assert_eq!(received, queued, "desktop updates were sent after one was skipped");
++        tokio::time::timeout(Duration::from_secs(5), &mut session.client)
++            .await
++            .expect("the client ends")
++            .unwrap();
++        assert_eq!(probe.__test_desktop_update_bytes_in_flight(), 0, "a permit was not returned");
++        session.server.abort();
++    });
++}
