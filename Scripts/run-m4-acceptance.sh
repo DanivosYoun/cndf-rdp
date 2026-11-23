@@ -199,8 +199,9 @@ login_count() {
     ok) pattern='Received sys login status for harness : logged in' ;;
     refused) pattern='User does not exist, or could not be authenticated' ;;
   esac
-  docker exec "$(name b3)" sh -c "cat /var/log/xrdp.log /var/log/xrdp-sesman.log 2>/dev/null | grep -cF '${pattern}'" \
-    2>/dev/null || echo 0
+  local count
+  count="$(docker exec "$(name b3)" sh -c "cat /var/log/xrdp.log /var/log/xrdp-sesman.log 2>/dev/null | grep -cF '${pattern}' || true" 2>/dev/null)"
+  echo "${count:-0}"
 }
 
 # Hands each new B3 login result to the next iteration of run $1 ($2 iterations): writes
