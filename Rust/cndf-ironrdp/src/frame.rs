@@ -7,8 +7,20 @@ use std::time::{Duration, Instant};
 #[cfg(not(target_endian = "little"))]
 compile_error!("the frame hands its pixel words to the host as BGRA bytes");
 
-/// How long a backlog may hold back a completed frame.
+/// How long a completed frame may wait to be merged with the next queued frame end.
 const BATCH: Duration = Duration::from_millis(16);
+
+/// What the pixels hold beyond what was last published.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum State {
+    /// Nothing unpublished.
+    #[default]
+    Clean,
+    /// Tiles of a frame whose end has not been composed yet.
+    Composing,
+    /// A whole frame, not published yet.
+    Complete,
+}
 
 #[derive(Default)]
 pub(super) struct Frame {
@@ -20,8 +32,9 @@ pub(super) struct Frame {
     sequence: u64,
     /// When the oldest change not yet published was composed.
     since: Option<Instant>,
-    /// Whether the server data composed since the last publish ended a frame.
-    complete: bool,
+    state: State,
+    /// A redelivery asked for while a frame was composing: the next publish is full.
+    redeliver: bool,
 }
 
 impl Frame {
@@ -30,12 +43,26 @@ impl Frame {
             || self.height != u32::from(update.height().get())
     }
 
-    pub fn compose(&mut self, update: DesktopUpdate) -> Result<u64, DesktopFramebufferError> {
+    /// Drops an unfinished frame of the old size; a new size starts from a full update.
+    pub fn resize(&mut self) {
+        if self.state == State::Composing {
+            *self = Frame {
+                sequence: self.sequence,
+                redeliver: self.redeliver,
+                ..Frame::default()
+            };
+        }
+    }
+
+    pub fn compose(
+        &mut self,
+        update: DesktopUpdate,
+        now: Instant,
+    ) -> Result<u64, DesktopFramebufferError> {
         let width = u32::from(update.width().get());
         let height = u32::from(update.height().get());
         let len = desktop_pixel_count(width, height)? as usize;
-        self.complete |= update.ends_frame();
-        self.since.get_or_insert_with(Instant::now);
+        let ends = update.ends_frame();
         let region = update.region();
         let dirty = CNDFIronRect {
             x: region.left.into(),
@@ -52,9 +79,11 @@ impl Frame {
             self.width = width;
             self.height = height;
             self.dirty = Some(dirty);
+            self.composed(ends, now);
             return Ok(len as u64 * 4);
         }
         if self.changes_size(&update) {
+            // Without a frame of its size the tile, and its end, apply to nothing.
             return Ok(0);
         }
         for (row, source) in update
@@ -78,18 +107,41 @@ impl Frame {
                 height: (other.y + other.height).max(dirty.y + dirty.height) - y,
             }
         }));
+        self.composed(ends, now);
         Ok(update.buffer().len() as u64 * 4)
     }
 
-    /// Whether the composed changes should be published now: once the server data ended a
-    /// frame, and with a backlog only after the oldest unpublished change waited for `BATCH`.
-    pub fn ready(&self, backlog: bool) -> bool {
-        self.complete && (!backlog || self.since.is_some_and(|since| since.elapsed() >= BATCH))
+    fn composed(&mut self, ends: bool, now: Instant) {
+        self.since.get_or_insert(now);
+        self.state = if ends {
+            State::Complete
+        } else {
+            State::Composing
+        };
+    }
+
+    /// Whether a completed frame should be published now rather than merged with the next
+    /// queued update, which only a frame end of the same size within `BATCH` of the oldest
+    /// unpublished change may be.
+    pub fn ready(&self, merges: bool, now: Instant) -> bool {
+        self.state == State::Complete
+            && !(merges && self.since.is_some_and(|since| now - since < BATCH))
+    }
+
+    /// Republishes a published frame in full now; an unfinished one is published in full
+    /// once complete.
+    pub fn redeliver(&mut self, connection: &Connection) {
+        if self.state == State::Composing || self.pixels.is_empty() {
+            self.redeliver = true;
+        } else {
+            self.publish(connection, true);
+        }
     }
 
     pub fn publish(&mut self, connection: &Connection, full: bool) {
         self.since = None;
-        self.complete = false;
+        self.state = State::Clean;
+        let full = full || std::mem::take(&mut self.redeliver);
         let dirty = self.dirty.take();
         let dirty = if full && !self.pixels.is_empty() {
             Some(CNDFIronRect {
@@ -207,7 +259,7 @@ mod tests {
         .unwrap();
         let mut frame = Frame::default();
         assert_eq!(
-            frame.compose(update),
+            frame.compose(update, Instant::now()),
             Err(DesktopFramebufferError::Dimensions)
         );
         assert_eq!(frame.pixels.capacity(), 0);
@@ -218,19 +270,31 @@ mod tests {
         pixels.iter().flat_map(|pixel| pixel.to_le_bytes()).collect()
     }
 
+    fn at(ms: u64) -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_millis(ms)
+    }
+
+    /// What `publish` leaves, without a connection.
+    fn published(frame: &mut Frame) {
+        frame.dirty = None;
+        frame.since = None;
+        frame.state = State::Clean;
+    }
+
     #[test]
     fn full_update_becomes_the_frame_without_copy() {
         let mut frame = Frame::default();
         let update = update(2, 0, vec![0xff112233, 0xffaabbcc]);
         let pointer = update.buffer().as_ptr();
-        assert_eq!(frame.compose(update), Ok(8));
+        assert_eq!(frame.compose(update, at(0)), Ok(8));
         assert_eq!(frame.pixels.as_ptr(), pointer);
     }
 
     #[test]
     fn full_update_frame_is_opaque_bgra() {
         let mut frame = Frame::default();
-        assert_eq!(frame.compose(update(1, 0, vec![0xff112233])), Ok(4));
+        assert_eq!(frame.compose(update(1, 0, vec![0xff112233]), at(0)), Ok(4));
         assert_eq!(bytes(&frame.pixels), [0x33, 0x22, 0x11, 0xff]);
     }
 
@@ -238,11 +302,11 @@ mod tests {
     fn partial_update_after_adoption_keeps_other_pixels() {
         let mut frame = Frame::default();
         assert_eq!(
-            frame.compose(update(2, 0, vec![0xff112233, 0xffaabbcc])),
+            frame.compose(update(2, 0, vec![0xff112233, 0xffaabbcc]), at(0)),
             Ok(8)
         );
-        frame.dirty = None;
-        assert_eq!(frame.compose(update(2, 1, vec![0x00123456])), Ok(4));
+        published(&mut frame);
+        assert_eq!(frame.compose(update(2, 1, vec![0x00123456]), at(0)), Ok(4));
         assert_eq!(
             bytes(&frame.pixels),
             [0x33, 0x22, 0x11, 255, 0x56, 0x34, 0x12, 255]
@@ -254,13 +318,13 @@ mod tests {
     #[test]
     fn new_extent_requires_full_update() {
         let mut frame = Frame::default();
-        assert_eq!(frame.compose(update(2, 0, vec![0xff00_0000; 2])), Ok(8));
-        frame.dirty = None;
-        assert_eq!(frame.compose(update(3, 1, vec![0xff00_0000])), Ok(0));
+        assert_eq!(frame.compose(update(2, 0, vec![0xff00_0000; 2]), at(0)), Ok(8));
+        published(&mut frame);
+        assert_eq!(frame.compose(update(3, 1, vec![0xff00_0000]), at(0)), Ok(0));
         assert_eq!(frame.width, 2);
         assert_eq!(frame.pixels.len(), 2);
         assert!(frame.dirty.is_none());
-        assert_eq!(frame.compose(update(3, 0, vec![0xff00_0000; 3])), Ok(12));
+        assert_eq!(frame.compose(update(3, 0, vec![0xff00_0000; 3]), at(0)), Ok(12));
         assert_eq!(frame.width, 3);
         assert_eq!(bytes(&frame.pixels), [0, 0, 0, 255].repeat(3));
     }
@@ -272,40 +336,55 @@ mod tests {
     #[test]
     fn frame_is_ready_only_at_frame_end() {
         let mut frame = Frame::default();
-        frame.compose(update(3, 0, vec![0xff00_0000; 3])).unwrap();
-        frame.compose(update(3, 1, vec![0xff00_0000])).unwrap();
-        let first = frame.ready(false);
-        frame.compose(update(3, 2, vec![0xff00_0000])).unwrap();
-        let second = frame.ready(false);
-        frame.compose(marked(update(3, 0, vec![0xff00_0000]))).unwrap();
-        assert_eq!((first, second, frame.ready(false)), (false, false, true));
+        frame.compose(update(3, 0, vec![0xff00_0000; 3]), at(0)).unwrap();
+        frame.compose(update(3, 1, vec![0xff00_0000]), at(0)).unwrap();
+        let first = frame.ready(false, at(0));
+        frame.compose(update(3, 2, vec![0xff00_0000]), at(0)).unwrap();
+        let second = frame.ready(false, at(0));
+        frame.compose(marked(update(3, 0, vec![0xff00_0000])), at(0)).unwrap();
+        assert_eq!((first, second, frame.ready(false, at(0))), (false, false, true));
     }
 
+    // Design frame-boundary: the end of an update dropped for its size completes no frame.
     #[test]
-    fn ignored_update_still_ends_the_frame() {
+    fn ignored_update_does_not_end_the_frame() {
         let mut frame = Frame::default();
-        frame.compose(update(2, 0, vec![0xff00_0000; 2])).unwrap();
-        assert_eq!(frame.compose(marked(update(3, 1, vec![0]))), Ok(0));
-        assert!(frame.ready(false));
+        frame.compose(update(2, 0, vec![0xff00_0000; 2]), at(0)).unwrap();
+        assert_eq!(frame.compose(marked(update(3, 1, vec![0])), at(0)), Ok(0));
+        assert!(!frame.ready(false, at(0)));
+        published(&mut frame);
+        assert_eq!(frame.compose(marked(update(3, 1, vec![0])), at(0)), Ok(0));
+        assert!(!frame.ready(false, at(0)));
+        assert_eq!(frame.since, None);
+    }
+
+    // A frame end keeps no state past its publish: the next frame's first tile is unfinished.
+    #[test]
+    fn publish_ends_the_completed_state() {
+        let mut frame = Frame::default();
+        frame.compose(marked(update(2, 0, vec![0xff00_0000; 2])), at(0)).unwrap();
+        published(&mut frame);
+        frame.compose(update(2, 0, vec![0xff00_0000]), at(1)).unwrap();
+        assert!(!frame.ready(false, at(1)));
+        assert!(!frame.ready(false, at(100)));
     }
 
     #[test]
     fn stale_publish_time_does_not_split_a_frame() {
         // A frame just published has neither a pending change nor an end.
         let mut frame = Frame::default();
-        std::thread::sleep(Duration::from_millis(20));
-        frame.compose(update(2, 0, vec![0xff00_0000; 2])).unwrap();
-        assert!(!frame.ready(true));
-        assert!(!frame.ready(false));
+        frame.compose(update(2, 0, vec![0xff00_0000; 2]), at(20)).unwrap();
+        assert!(!frame.ready(true, at(40)));
+        assert!(!frame.ready(false, at(40)));
     }
 
     #[test]
-    fn backlog_coalesces_until_batch_limit() {
+    fn merge_window_is_measured_from_the_oldest_change() {
         let mut frame = Frame::default();
-        frame.compose(marked(update(2, 0, vec![0xff00_0000; 2]))).unwrap();
-        assert!(!frame.ready(true));
-        assert!(frame.ready(false));
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(frame.ready(true));
+        frame.compose(marked(update(2, 0, vec![0xff00_0000; 2])), at(10)).unwrap();
+        frame.compose(marked(update(2, 0, vec![0xff00_0000])), at(20)).unwrap();
+        assert!(!frame.ready(true, at(25)));
+        assert!(frame.ready(true, at(26)));
+        assert!(frame.ready(false, at(11)));
     }
 }
