@@ -348,6 +348,9 @@ fn run(
 
     #[cfg(feature = "legacy-tls")]
     let legacy_trust = Arc::clone(&trust);
+    // Client Info logs on with the password only on a TLS-only connection (patch 0033).
+    let autologon = !options.username.is_empty() && !options.password.is_empty();
+    let autologon_sent = Arc::new(AtomicBool::new(false));
     let desktop_scale = options.scale.clamp(100, 500);
     let mut builder = ConfigBuilder::new()
         .with_destination(Destination::from_parts(&options.host, options.port))
@@ -372,6 +375,7 @@ fn run(
         })
         .with_username(options.username)
         .with_password(options.password.as_str())
+        .with_autologon(autologon)
         .with_desktop_width(options.width as u16)
         .with_desktop_height(options.height as u16)
         .with_desktop_scale_factor(desktop_scale)
@@ -384,7 +388,12 @@ fn run(
         .with_server_pointer(true)
         .with_pointer_software_rendering(false)
         .with_graphics_pipeline(options.graphics)
-        .with_h264_decoder(options.graphics.then(crate::h264::factory).flatten())
+        .with_h264_decoder(
+            options
+                .graphics
+                .then(|| crate::h264::factory(Arc::clone(&connection.h264)))
+                .flatten(),
+        )
         .with_certificate_validation(ironrdp_tls::CertificateValidation::Strict)
         .with_certificate_chain_validation_callback(trust);
     builder = with_keyboard(builder, options.keyboard);
@@ -397,9 +406,11 @@ fn run(
         return;
     };
     let audio_statistics = Arc::clone(&connection.statistics);
-    let config = config.with_audio_wave_observer(Arc::new(move || {
-        lock(&audio_statistics).audio_waves_received += 1;
-    }));
+    let config = config
+        .with_audio_wave_observer(Arc::new(move || {
+            lock(&audio_statistics).audio_waves_received += 1;
+        }))
+        .with_tls_only_autologon(Arc::clone(&autologon_sent));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
@@ -450,6 +461,7 @@ fn run(
                 &commands,
                 output,
                 &rejected,
+                &autologon_sent,
                 minimum,
                 retry_config,
                 false,
@@ -471,6 +483,7 @@ fn run(
                     &commands,
                     output,
                     &rejected,
+                    &autologon_sent,
                     minimum,
                     None,
                     true,
@@ -505,6 +518,7 @@ async fn run_attempt(
     commands: &Receiver<Command>,
     output: &async_channel::Sender<Output>,
     rejected: &AtomicBool,
+    autologon_sent: &AtomicBool,
     minimum: CNDFIronLogLevel,
     retry_config: Option<Config>,
     legacy: bool,
@@ -541,6 +555,7 @@ async fn run_attempt(
             receiver,
             output,
             rejected,
+            autologon_sent,
             minimum,
             retry_config,
             legacy,
@@ -564,6 +579,7 @@ async fn forward(
     mut receiver: OutputEventReceiver,
     output: &async_channel::Sender<Output>,
     rejected: &AtomicBool,
+    autologon_sent: &AtomicBool,
     minimum: CNDFIronLogLevel,
     mut retry_config: Option<Config>,
     legacy: bool,
@@ -597,6 +613,19 @@ async fn forward(
                         // The modern handshake succeeded. Release its unused retry configuration.
                         retry_config = None;
                         Output::Rdp(RdpOutputEvent::Connected)
+                    }
+                    RdpOutputEvent::LogonError(info) => {
+                        let failure = logon_failure(autologon_sent.load(Ordering::Acquire), &info);
+                        log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &format!(
+                            "Server logon notification type=0x{:08x} data=0x{:08x} credentials={}",
+                            info.error_type.as_u32(),
+                            info.error_data.to_u32(),
+                            if failure.is_some() { "rejected" } else { "unchanged" },
+                        ));
+                        let Some(failure) = failure else { continue };
+                        // The rejection ends the generation: one failure, no further events.
+                        let _ = output.send(Output::Failure(failure)).await;
+                        return None;
                     }
                     RdpOutputEvent::AutoReconnecting { response, .. } => {
                         let _ = response.send(AutoReconnectDecision::Stop);
@@ -647,6 +676,15 @@ async fn forward(
         }
     }
     None
+}
+
+/// The failure a server Logon Error notification ends the session with: only an explicit
+/// credential rejection of a Client Info logon (TLS-only autologon) is one.
+fn logon_failure(
+    autologon_sent: bool,
+    info: &ironrdp_pdu::rdp::session_info::LogonErrorsInfo,
+) -> Option<Failure> {
+    (autologon_sent && errors::rejects_logon(info)).then_some(errors::LOGON_REJECTED)
 }
 
 fn deliver(
@@ -703,20 +741,35 @@ fn deliver(
     connection.connected.store(false, Ordering::Release);
 }
 
-fn report_failure(connection: &Connection, Failure(kind, code, stage, message): Failure) {
+fn report_failure(connection: &Connection, failure: Failure) {
     connection.connected.store(false, Ordering::Release);
-    connection
-        .callbacks
-        .failure(connection.generation, kind, code, stage, message);
+    connection.end(|table| failure_callback(connection, table, failure));
+}
+
+fn failure_callback(
+    connection: &Connection,
+    table: CNDFIronCallbacks,
+    Failure(kind, code, stage, message): Failure,
+) {
+    crate::failure_callback(table, connection.generation, kind, code, stage, message);
 }
 
 fn report_disconnect(connection: &Connection, kind: CNDFIronDisconnectKind, code: u32) {
     connection.connected.store(false, Ordering::Release);
-    connection.callbacks.invoke(|table| {
-        if let Some(callback) = table.disconnect {
-            callback(connection.generation, kind, code, table.context);
-        }
+    connection.end(|table| {
+        disconnect_callback(connection, table, kind, code)
     });
+}
+
+fn disconnect_callback(
+    connection: &Connection,
+    table: CNDFIronCallbacks,
+    kind: CNDFIronDisconnectKind,
+    code: u32,
+) {
+    if let Some(callback) = table.disconnect {
+        callback(connection.generation, kind, code, table.context);
+    }
 }
 
 fn report_active_framebuffer_failure(
@@ -731,12 +784,16 @@ fn report_active_framebuffer_failure(
 
 fn report_active_failure(connection: &Connection, failure: Failure) {
     let code = failure.1;
-    report_failure(connection, failure);
-    report_disconnect(
-        connection,
-        CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_ERROR,
-        code,
-    );
+    connection.connected.store(false, Ordering::Release);
+    connection.end(|table| {
+        failure_callback(connection, table, failure);
+        disconnect_callback(
+            connection,
+            table,
+            CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_ERROR,
+            code,
+        );
+    });
 }
 
 fn deliver_event(connection: &Connection, event: RdpOutputEvent, minimum: CNDFIronLogLevel) {
@@ -909,6 +966,7 @@ mod tests {
                 closed: AtomicBool::new(false),
             }),
             statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
+            h264: Arc::default(),
         };
         let error = ironrdp_pdu::PduError::new(
             "graphics update",
@@ -955,6 +1013,7 @@ mod tests {
                 closed: AtomicBool::new(false),
             }),
             statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
+            h264: Arc::default(),
         })
     }
 
@@ -1163,6 +1222,7 @@ mod tests {
             log_level: CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
             callbacks,
             statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
+            h264: Arc::default(),
         })
     }
 
@@ -1308,6 +1368,165 @@ mod tests {
 
         assert_eq!(host.logs, ["fast_path repeated count=2"]);
         assert_eq!(host.failures.len(), 1);
+    }
+
+    // Design iron-autologon-log: a generation whose decoders made 3 pictures on one hardware
+    // session, and the summary its end logs.
+    fn decoded(connection: &Connection) {
+        connection.h264.session(Some(true));
+        for _ in 0..3 {
+            connection.h264.picture();
+        }
+    }
+
+    const SUMMARY: &str = "H.264 summary pictures=3 failures=0 idr_waits=0 sessions=1 hardware=yes";
+
+    fn summaries(host: &Host) -> Vec<&str> {
+        host.logs
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.starts_with("H.264 summary"))
+            .collect()
+    }
+
+    // The host ends the generation at the failure or disconnect (Host drops later logs), so the
+    // summary must come first.
+    #[test]
+    fn every_remote_end_logs_the_h264_summary_before_ending_the_generation() {
+        type End = fn(&Arc<Connection>);
+        let ends: [(&str, End); 6] = [
+            ("server", |connection| {
+                deliver_event(
+                    connection,
+                    RdpOutputEvent::Terminated(Ok(
+                        ironrdp_session::GracefulDisconnectReason::ServerInitiated,
+                    )),
+                    CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+                )
+            }),
+            ("failure", |connection| report_failure(connection, errors::PANIC)),
+            ("logon rejected", |connection| {
+                report_failure(connection, errors::LOGON_REJECTED)
+            }),
+            ("active failure", |connection| {
+                report_active_failure(connection, errors::CHANNEL_MESSAGE_LIMIT)
+            }),
+            ("framebuffer", |connection| {
+                report_active_framebuffer_failure(
+                    connection,
+                    ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError::Allocation,
+                )
+            }),
+            ("worker panic", |connection| {
+                connection.worker(|| panic!("synthetic private panic payload"))
+            }),
+        ];
+        for (name, end) in ends {
+            let mut host = Host::default();
+            let connection = host_connection(host_callbacks(&mut host));
+            decoded(&connection);
+            end(&connection);
+            assert!(host.ended, "{name}");
+            assert_eq!(summaries(&host), [SUMMARY], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_generation_without_h264_logs_no_summary() {
+        let mut host = Host::default();
+        let connection = host_connection(host_callbacks(&mut host));
+        report_failure(&connection, errors::PANIC);
+        assert!(summaries(&host).is_empty());
+    }
+
+    fn session_with_run(host: &mut Host) -> (*mut CNDFIronSession, Arc<Connection>) {
+        let table = host_table(host);
+        let session = unsafe { cndf_iron_session_create(&table) };
+        let owner = unsafe { &*session };
+        let connection = host_connection(Arc::clone(&owner.callbacks));
+        let (commands, _) = mpsc::sync_channel(1);
+        lock(&owner.state).run = Some(Run {
+            flush_logs: log_flush(&connection, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &Arc::default()),
+            connection: Arc::clone(&connection),
+            commands,
+            threads: Vec::new(),
+        });
+        (session, connection)
+    }
+
+    #[test]
+    fn destroy_logs_the_h264_summary_before_closing_the_gate() {
+        let mut host = Host::default();
+        let (session, connection) = session_with_run(&mut host);
+        decoded(&connection);
+
+        unsafe { cndf_iron_session_destroy(session, 1000) };
+
+        assert_eq!(summaries(&host), [SUMMARY]);
+        assert!(host.disconnects.is_empty());
+        // A decode or a remote end after destroy reaches nothing.
+        connection.h264.picture();
+        report_disconnect(&connection, CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER, 0);
+        assert!(host.disconnects.is_empty());
+        assert_eq!(host.logs.len(), 1);
+    }
+
+    #[test]
+    fn a_local_and_a_remote_end_racing_log_one_summary_first() {
+        for _ in 0..200 {
+            let mut host = Box::new(Host::default());
+            let (session, connection) = session_with_run(&mut host);
+            decoded(&connection);
+            let remote = {
+                let connection = Arc::clone(&connection);
+                thread::spawn(move || {
+                    report_disconnect(
+                        &connection,
+                        CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER,
+                        0,
+                    )
+                })
+            };
+            unsafe { cndf_iron_session_destroy(session, 1000) };
+            remote.join().unwrap();
+            // Whichever end won, the summary went out once and before any disconnect.
+            assert_eq!(summaries(&host), [SUMMARY]);
+            assert!(host.disconnects.len() <= 1);
+        }
+    }
+
+    // Design iron-autologon-log: only an explicit credential rejection of a Client Info logon
+    // becomes an authentication failure.
+    #[test]
+    fn logon_errors_fail_the_session_only_after_a_client_info_logon() {
+        use ironrdp_pdu::rdp::session_info::{
+            LogonErrorNotificationData::*, LogonErrorNotificationDataErrorCode::*,
+            LogonErrorNotificationType::*, LogonErrorsInfo,
+        };
+        let rejected = LogonErrorsInfo {
+            error_type: NtStatus(0xC000006D),
+            error_data: ErrorCode(FailedBadPassword),
+        };
+        assert_eq!(
+            logon_failure(true, &rejected),
+            Some(Failure(
+                CNDFIronFailureKind::CNDF_IRON_FAILURE_AUTHENTICATION,
+                0x4952000F,
+                CNDFIronStage::CNDF_IRON_STAGE_AUTHENTICATION,
+                "Server logon rejected the credentials",
+            ))
+        );
+        assert_eq!(logon_failure(false, &rejected), None);
+        let warning = LogonErrorsInfo {
+            error_type: NtStatus(0xC000006D),
+            error_data: ErrorCode(Warning),
+        };
+        let session = LogonErrorsInfo {
+            error_type: SessionContinue,
+            error_data: SessionId(0),
+        };
+        assert_eq!(logon_failure(true, &warning), None);
+        assert_eq!(logon_failure(true, &session), None);
     }
 
     // Finding log-repeat-flush-dropped-on-teardown, local end: destroy closed the callback gate

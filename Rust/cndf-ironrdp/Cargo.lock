@@ -371,6 +371,7 @@ dependencies = [
  "smallvec",
  "tokio",
  "tokio-openssl",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "zeroize",

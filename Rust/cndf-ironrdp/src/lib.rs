@@ -22,6 +22,8 @@ use engine::start_workers;
 compile_error!("Enable engine or stub");
 #[cfg(feature = "stub")]
 mod stub;
+#[cfg(all(test, feature = "engine", not(feature = "stub")))]
+mod autologon_tests;
 
 pub use abi::*;
 pub use clipboard::*;
@@ -88,6 +90,7 @@ impl Callbacks {
         Some(operation(self.table))
     }
 
+    #[cfg(feature = "stub")]
     fn failure(
         &self,
         generation: u64,
@@ -96,19 +99,28 @@ impl Callbacks {
         stage: CNDFIronStage,
         message: &str,
     ) {
-        self.invoke(|table| {
-            if let Some(callback) = table.failure {
-                callback(
-                    generation,
-                    kind,
-                    code,
-                    stage,
-                    message.as_ptr(),
-                    message.len(),
-                    table.context,
-                );
-            }
-        });
+        self.invoke(|table| failure_callback(table, generation, kind, code, stage, message));
+    }
+}
+
+fn failure_callback(
+    table: CNDFIronCallbacks,
+    generation: u64,
+    kind: CNDFIronFailureKind,
+    code: u32,
+    stage: CNDFIronStage,
+    message: &str,
+) {
+    if let Some(callback) = table.failure {
+        callback(
+            generation,
+            kind,
+            code,
+            stage,
+            message.as_ptr(),
+            message.len(),
+            table.context,
+        );
     }
 }
 
@@ -126,6 +138,9 @@ struct Connection {
     clipboard: Mutex<Option<clipboard::Channel>>,
     callbacks: Arc<Callbacks>,
     statistics: Arc<Mutex<CNDFIronStatistics>>,
+    /// This generation's H.264 decode totals, summarized once when it ends.
+    #[cfg(not(feature = "stub"))]
+    h264: Arc<h264::Totals>,
 }
 
 impl Connection {
@@ -133,14 +148,47 @@ impl Connection {
         if catch_worker(operation).is_err() {
             self.connected.store(false, Ordering::Release);
             self.stop.store(true, Ordering::Release);
-            self.callbacks.failure(
-                self.generation,
-                CNDFIronFailureKind::CNDF_IRON_FAILURE_ENGINE,
-                0x49520001,
-                CNDFIronStage::CNDF_IRON_STAGE_UNKNOWN,
-                "IronRDP worker panicked",
-            );
+            self.end(|table| {
+                failure_callback(
+                    table,
+                    self.generation,
+                    CNDFIronFailureKind::CNDF_IRON_FAILURE_ENGINE,
+                    0x49520001,
+                    CNDFIronStage::CNDF_IRON_STAGE_UNKNOWN,
+                    "IronRDP worker panicked",
+                )
+            });
         }
+    }
+
+    /// Ends the generation with the callback gate held: its H.264 summary goes out first, then
+    /// `end` runs the failure or disconnect callbacks. After destroy closed the gate, destroy
+    /// logs the summary instead.
+    fn end(&self, end: impl FnOnce(CNDFIronCallbacks)) {
+        self.callbacks.invoke(|table| {
+            self.log_summary(table);
+            end(table);
+        });
+    }
+
+    /// Seals the generation's H.264 totals; the first call logs their summary.
+    /// Call with the callback gate held.
+    fn log_summary(&self, table: CNDFIronCallbacks) {
+        #[cfg(not(feature = "stub"))]
+        if let Some(summary) = self.h264.seal() {
+            let level = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
+            if let (Some(callback), true) = (table.log, level as u32 >= self.log_level as u32) {
+                callback(
+                    self.generation,
+                    level,
+                    summary.as_ptr(),
+                    summary.len(),
+                    table.context,
+                );
+            }
+        }
+        #[cfg(feature = "stub")]
+        let _ = table;
     }
 }
 
@@ -333,7 +381,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=15b4a03ff552 patches=31\0"
+            " ironrdp=15b4a03ff552 patches=32\0"
         );
         version.as_ptr().cast()
     })
@@ -511,6 +559,8 @@ pub unsafe extern "C" fn cndf_iron_connect(
             log_level: options.log_level,
             callbacks: Arc::clone(&session.callbacks),
             statistics: Arc::clone(&session.statistics),
+            #[cfg(not(feature = "stub"))]
+            h264: Arc::default(),
         });
         let (commands, incoming) = mpsc::sync_channel(128);
         let (start, ready) = mpsc::channel();
@@ -698,17 +748,23 @@ pub unsafe extern "C" fn cndf_iron_session_destroy(
         let deadline = Instant::now() + Duration::from_millis(join_timeout_ms.into());
         // The gate drops every later callback, so log the run's pending repeat counts first.
         // The state lock is released before calling back into the host.
-        let flush_logs = lock(&session_ref.state)
+        let run = lock(&session_ref.state)
             .run
             .as_ref()
-            .map(|run| Arc::clone(&run.flush_logs));
-        if let Some(flush_logs) = flush_logs {
+            .map(|run| (Arc::clone(&run.flush_logs), Arc::clone(&run.connection)));
+        if let Some((flush_logs, _)) = &run {
             flush_logs();
         }
         session_ref.callbacks.closed.store(true, Ordering::Release);
         cndf_iron_disconnect(session);
         // Swift resolves any outstanding certificate decision before calling destroy.
-        drop(lock(&session_ref.callbacks.gate));
+        // Once in-flight callbacks have finished, the summary is the generation's last line.
+        {
+            let _gate = lock(&session_ref.callbacks.gate);
+            if let Some((_, connection)) = &run {
+                connection.log_summary(session_ref.callbacks.table);
+            }
+        }
         let mut state = lock(&session_ref.state);
         if let Some(run) = state.run.as_ref() {
             while run.threads.iter().any(|thread| !thread.is_finished()) {
@@ -813,6 +869,8 @@ mod tests {
             log_level: CNDFIronLogLevel::CNDF_IRON_LOG_OFF,
             callbacks: Arc::clone(&owner.callbacks),
             statistics: Arc::clone(&owner.statistics),
+            #[cfg(not(feature = "stub"))]
+            h264: Arc::default(),
         });
         let worker = Arc::clone(&connection);
         let wait = Arc::clone(&release);
