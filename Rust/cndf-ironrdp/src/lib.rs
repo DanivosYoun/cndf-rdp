@@ -90,19 +90,6 @@ impl Callbacks {
         Some(operation(self.table))
     }
 
-    /// Runs `operation` with the gate held unless it is closed; `close` closes it in the same
-    /// hold, so no callback runs between the two.
-    fn ending(&self, close: bool, operation: impl FnOnce(CNDFIronCallbacks)) {
-        let _gate = lock(&self.gate);
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        operation(self.table);
-        if close {
-            self.closed.store(true, Ordering::Release);
-        }
-    }
-
     #[cfg(feature = "stub")]
     fn failure(
         &self,
@@ -161,7 +148,7 @@ impl Connection {
         if catch_worker(operation).is_err() {
             self.connected.store(false, Ordering::Release);
             self.stop.store(true, Ordering::Release);
-            self.end(false, |table| {
+            self.end(|table| {
                 failure_callback(
                     table,
                     self.generation,
@@ -175,25 +162,33 @@ impl Connection {
     }
 
     /// Ends the generation with the callback gate held: its H.264 summary goes out first, then
-    /// `end` runs the failure or disconnect callbacks, or `close` closes the gate for destroy.
-    /// The first end seals the totals, so the summary is logged once.
-    fn end(&self, close: bool, end: impl FnOnce(CNDFIronCallbacks)) {
-        self.callbacks.ending(close, |table| {
-            #[cfg(not(feature = "stub"))]
-            if let Some(summary) = self.h264.seal() {
-                let level = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
-                if let (Some(callback), true) = (table.log, level as u32 >= self.log_level as u32) {
-                    callback(
-                        self.generation,
-                        level,
-                        summary.as_ptr(),
-                        summary.len(),
-                        table.context,
-                    );
-                }
-            }
+    /// `end` runs the failure or disconnect callbacks. After destroy closed the gate, destroy
+    /// logs the summary instead.
+    fn end(&self, end: impl FnOnce(CNDFIronCallbacks)) {
+        self.callbacks.invoke(|table| {
+            self.log_summary(table);
             end(table);
         });
+    }
+
+    /// Seals the generation's H.264 totals; the first call logs their summary.
+    /// Call with the callback gate held.
+    fn log_summary(&self, table: CNDFIronCallbacks) {
+        #[cfg(not(feature = "stub"))]
+        if let Some(summary) = self.h264.seal() {
+            let level = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
+            if let (Some(callback), true) = (table.log, level as u32 >= self.log_level as u32) {
+                callback(
+                    self.generation,
+                    level,
+                    summary.as_ptr(),
+                    summary.len(),
+                    table.context,
+                );
+            }
+        }
+        #[cfg(feature = "stub")]
+        let _ = table;
     }
 }
 
@@ -751,8 +746,8 @@ pub unsafe extern "C" fn cndf_iron_session_destroy(
             return;
         };
         let deadline = Instant::now() + Duration::from_millis(join_timeout_ms.into());
-        // The gate drops every later callback, so log the run's pending repeat counts and its
-        // H.264 summary first. The state lock is released before calling back into the host.
+        // The gate drops every later callback, so log the run's pending repeat counts first.
+        // The state lock is released before calling back into the host.
         let run = lock(&session_ref.state)
             .run
             .as_ref()
@@ -760,12 +755,16 @@ pub unsafe extern "C" fn cndf_iron_session_destroy(
         if let Some((flush_logs, _)) = &run {
             flush_logs();
         }
-        // Swift resolves any outstanding certificate decision before calling destroy.
-        match &run {
-            Some((_, connection)) => connection.end(true, |_| {}),
-            None => session_ref.callbacks.ending(true, |_| {}),
-        }
+        session_ref.callbacks.closed.store(true, Ordering::Release);
         cndf_iron_disconnect(session);
+        // Swift resolves any outstanding certificate decision before calling destroy.
+        // Once in-flight callbacks have finished, the summary is the generation's last line.
+        {
+            let _gate = lock(&session_ref.callbacks.gate);
+            if let Some((_, connection)) = &run {
+                connection.log_summary(session_ref.callbacks.table);
+            }
+        }
         let mut state = lock(&session_ref.state);
         if let Some(run) = state.run.as_ref() {
             while run.threads.iter().any(|thread| !thread.is_finished()) {

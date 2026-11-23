@@ -743,7 +743,7 @@ fn deliver(
 
 fn report_failure(connection: &Connection, failure: Failure) {
     connection.connected.store(false, Ordering::Release);
-    connection.end(false, |table| failure_callback(connection, table, failure));
+    connection.end(|table| failure_callback(connection, table, failure));
 }
 
 fn failure_callback(
@@ -756,7 +756,7 @@ fn failure_callback(
 
 fn report_disconnect(connection: &Connection, kind: CNDFIronDisconnectKind, code: u32) {
     connection.connected.store(false, Ordering::Release);
-    connection.end(false, |table| {
+    connection.end(|table| {
         disconnect_callback(connection, table, kind, code)
     });
 }
@@ -785,7 +785,7 @@ fn report_active_framebuffer_failure(
 fn report_active_failure(connection: &Connection, failure: Failure) {
     let code = failure.1;
     connection.connected.store(false, Ordering::Release);
-    connection.end(false, |table| {
+    connection.end(|table| {
         failure_callback(connection, table, failure);
         disconnect_callback(
             connection,
