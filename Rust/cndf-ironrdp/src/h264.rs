@@ -28,18 +28,99 @@ const MAX_PARAMETER_SET: usize = 4096;
 const SPS_IDS: usize = 32;
 const PPS_IDS: usize = 256;
 
-/// Creates the decoders of one connection, all sharing its pixel budget, or `None` where
-/// VideoToolbox is unavailable.
-pub(super) fn factory() -> Option<H264DecoderFactory> {
+/// Creates the decoders of one connection, all sharing its pixel budget and adding to its
+/// `totals`, or `None` where VideoToolbox is unavailable.
+pub(super) fn factory(totals: Arc<Totals>) -> Option<H264DecoderFactory> {
     #[cfg(target_os = "macos")]
     {
         let budget = PixelBudget::new(CONNECTION_PIXEL_BUDGET);
         Some(H264DecoderFactory::new(move || {
-            Some(Box::new(vt::VtDecoder::new(budget.clone(), vt::probe_once)))
+            let decoder = vt::VtDecoder::new(budget.clone(), vt::probe_once);
+            Some(Box::new(decoder.with_totals(Arc::clone(&totals))))
         }))
     }
     #[cfg(not(target_os = "macos"))]
-    None
+    {
+        let _ = totals;
+        None
+    }
+}
+
+/// What the decoders of one connection generation did (design iron-autologon-log). The
+/// generation's end seals it and logs its summary once; a decode ending later changes nothing.
+#[derive(Default)]
+pub(super) struct Totals(Mutex<Tally>);
+
+#[derive(Default, Clone, Copy)]
+struct Tally {
+    /// Decoded pictures, not frames delivered to the host.
+    pictures: u64,
+    /// Decode errors other than waiting for an IDR picture.
+    failures: u64,
+    idr_waits: u64,
+    /// Created VideoToolbox sessions, by what VideoToolbox reported about them.
+    hardware: u64,
+    software: u64,
+    unknown: u64,
+    sealed: bool,
+}
+
+impl Totals {
+    fn add(&self, change: impl FnOnce(&mut Tally)) {
+        let mut tally = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !tally.sealed {
+            change(&mut tally);
+        }
+    }
+
+    pub(super) fn picture(&self) {
+        self.add(|tally| tally.pictures += 1);
+    }
+
+    pub(super) fn failure(&self) {
+        self.add(|tally| tally.failures += 1);
+    }
+
+    pub(super) fn idr_wait(&self) {
+        self.add(|tally| tally.idr_waits += 1);
+    }
+
+    pub(super) fn session(&self, hardware: Option<bool>) {
+        self.add(|tally| match hardware {
+            Some(true) => tally.hardware += 1,
+            Some(false) => tally.software += 1,
+            None => tally.unknown += 1,
+        });
+    }
+
+    /// Seals the totals. The first call returns the summary line, if any decode was attempted.
+    pub(super) fn seal(&self) -> Option<String> {
+        let tally = {
+            let mut tally = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if tally.sealed {
+                return None;
+            }
+            tally.sealed = true;
+            *tally
+        };
+        if tally.pictures + tally.failures + tally.idr_waits == 0 {
+            return None;
+        }
+        let sessions = tally.hardware + tally.software + tally.unknown;
+        let hardware = if tally.unknown != 0 || sessions == 0 {
+            "unknown"
+        } else if tally.software == 0 {
+            "yes"
+        } else if tally.hardware == 0 {
+            "no"
+        } else {
+            "mixed"
+        };
+        Some(format!(
+            "H.264 summary pictures={} failures={} idr_waits={} sessions={sessions} hardware={hardware}",
+            tally.pictures, tally.failures, tally.idr_waits,
+        ))
+    }
 }
 
 /// Pixels the live VideoToolbox sessions of one connection hold (H5).
@@ -326,8 +407,10 @@ mod vt {
     use tracing::{debug, info};
 
     use super::{
-        AccessUnit, ParameterSets, PixelBudget, H264_LOG_TARGET, MAX_PICTURE_PIXELS, MAX_SIDE,
+        AccessUnit, ParameterSets, PixelBudget, Totals, H264_LOG_TARGET, MAX_PICTURE_PIXELS,
+        MAX_SIDE,
     };
+    use std::sync::Arc;
 
     type OSStatus = i32;
     type Ref = *const c_void;
@@ -875,8 +958,9 @@ mod vt {
         /// Set until an IDR picture decodes after creation, a failure or a reset (H3).
         needs_idr: bool,
         sample: Vec<u8>,
-        hardware: Option<bool>,
         quiet: bool,
+        /// The connection generation's totals this decoder adds to.
+        totals: Option<Arc<Totals>>,
         pub(super) stats: Stats,
     }
 
@@ -894,9 +978,21 @@ mod vt {
                 session: None,
                 needs_idr: true,
                 sample: Vec::new(),
-                hardware: None,
                 quiet: false,
+                totals: None,
                 stats: Stats::default(),
+            }
+        }
+
+        /// Adds this decoder's results to `totals`.
+        pub(super) fn with_totals(mut self, totals: Arc<Totals>) -> Self {
+            self.totals = Some(totals);
+            self
+        }
+
+        fn total(&self, add: impl FnOnce(&Totals)) {
+            if let Some(totals) = &self.totals {
+                add(totals);
             }
         }
 
@@ -937,7 +1033,7 @@ mod vt {
                     }
                     let session = Session::new(format, &self.budget)?;
                     self.stats.sessions += 1;
-                    self.hardware = session.hardware;
+                    self.total(|totals| totals.session(session.hardware));
                     if !self.quiet {
                         info!(
                             target: H264_LOG_TARGET,
@@ -1020,15 +1116,18 @@ mod vt {
             match self.decode_picture(data) {
                 Ok(picture) => {
                     self.stats.pictures += 1;
+                    self.total(Totals::picture);
                     Ok(picture)
                 }
                 Err(Failure::WaitingForIdr) => {
                     self.stats.idr_waits += 1;
+                    self.total(Totals::idr_wait);
                     Err(DecoderError::msg("waiting for an IDR picture"))
                 }
                 // The graphics pipeline already logs dropped updates at a bounded rate.
                 Err(Failure::Other(message)) => {
                     self.stats.failures += 1;
+                    self.total(Totals::failure);
                     self.end_stream();
                     debug!(target: H264_LOG_TARGET, "H.264 decode failed: {message}");
                     Err(DecoderError::msg(message))
@@ -1050,25 +1149,10 @@ mod vt {
         }
     }
 
+    // The connection generation summarizes the totals when it ends (`Connection::end`).
     impl Drop for VtDecoder {
         fn drop(&mut self) {
             self.session = None;
-            let stats = self.stats;
-            if !self.quiet && stats.decodes + stats.idr_waits + stats.failures != 0 {
-                info!(
-                    target: H264_LOG_TARGET,
-                    "H.264 summary pictures={} failures={} idr_waits={} sessions={} hardware={}",
-                    stats.pictures,
-                    stats.failures,
-                    stats.idr_waits,
-                    stats.sessions,
-                    match self.hardware {
-                        Some(true) => "yes",
-                        Some(false) => "no",
-                        None => "unknown",
-                    },
-                );
-            }
         }
     }
 }
@@ -1256,9 +1340,71 @@ mod tests {
         assert!(!budget.reserve(u64::MAX));
     }
 
+    // Design iron-autologon-log: what one generation's summary counts.
+    #[test]
+    fn totals_summarize_decode_results_once() {
+        let totals = Totals::default();
+        totals.idr_wait();
+        totals.session(Some(true));
+        totals.picture();
+        totals.picture();
+        totals.failure();
+        totals.session(Some(true));
+        totals.picture();
+        assert_eq!(
+            totals.seal().as_deref(),
+            Some("H.264 summary pictures=3 failures=1 idr_waits=1 sessions=2 hardware=yes")
+        );
+        // A decode ending after the seal changes nothing, and the summary is not repeated.
+        totals.picture();
+        totals.failure();
+        assert_eq!(totals.seal(), None);
+    }
+
+    #[test]
+    fn totals_without_a_decode_attempt_have_no_summary() {
+        assert_eq!(Totals::default().seal(), None);
+        // A session alone is not a decode attempt.
+        let totals = Totals::default();
+        totals.session(Some(true));
+        assert_eq!(totals.seal(), None);
+    }
+
+    #[test]
+    fn totals_summarize_attempts_without_pictures() {
+        let totals = Totals::default();
+        totals.idr_wait();
+        totals.idr_wait();
+        assert_eq!(
+            totals.seal().as_deref(),
+            Some("H.264 summary pictures=0 failures=0 idr_waits=2 sessions=0 hardware=unknown")
+        );
+    }
+
+    #[test]
+    fn totals_report_hardware_only_when_every_session_is_hardware() {
+        let cases: [(&[Option<bool>], &str); 6] = [
+            (&[Some(true), Some(true)], "sessions=2 hardware=yes"),
+            (&[Some(false)], "sessions=1 hardware=no"),
+            (&[Some(true), Some(false)], "sessions=2 hardware=mixed"),
+            (&[Some(true), None], "sessions=2 hardware=unknown"),
+            (&[None], "sessions=1 hardware=unknown"),
+            (&[], "sessions=0 hardware=unknown"),
+        ];
+        for (sessions, expected) in cases {
+            let totals = Totals::default();
+            for &hardware in sessions {
+                totals.session(hardware);
+            }
+            totals.picture();
+            let summary = totals.seal().unwrap();
+            assert!(summary.ends_with(expected), "{summary} vs {expected}");
+        }
+    }
+
     #[test]
     fn the_factory_exists_only_with_videotoolbox() {
-        assert_eq!(factory().is_some(), cfg!(target_os = "macos"));
+        assert_eq!(factory(Arc::default()).is_some(), cfg!(target_os = "macos"));
     }
 }
 
@@ -1557,6 +1703,48 @@ mod vt_tests {
     /// Mean RGB PSNR of the recombined pairs against the source, measured with ffmpeg-equal
     /// views less a margin.
     const PAIRED_PSNR: f64 = 28.3;
+
+    // Design iron-autologon-log: every decoder of a generation adds to its totals, through
+    // several surfaces, a reset, IDR waits and a decode error; another generation's stay apart.
+    #[test]
+    fn factory_decoders_add_to_their_generation_totals() {
+        let _serial = serial();
+        let units = access_units(&read("avc420-pc.h264"));
+        let totals = Arc::new(Totals::default());
+        let other = Arc::new(Totals::default());
+        let factory = factory(Arc::clone(&totals)).unwrap();
+        let _other_factory = factory_for_other_generation(&other);
+        let mut first = factory.create().unwrap();
+        let mut second = factory.create().unwrap();
+        // First surface: a P before any IDR waits, then the whole stream decodes.
+        assert!(first.decode_yuv420(&units[1]).is_err());
+        for unit in &units {
+            first.decode_yuv420(unit).unwrap();
+        }
+        // Second surface: one decode error, a wait for the next IDR, then a reset and the IDR.
+        second.decode_yuv420(&units[0]).unwrap();
+        assert!(second
+            .decode_yuv420(&[&units[1][..], &[0, 0, 0, 1, 0x74, 0x80]].concat())
+            .is_err());
+        assert!(second.decode_yuv420(&units[2]).is_err());
+        second.reset();
+        second.decode_yuv420(&units[0]).unwrap();
+        // Dropping decoders (surface deletion) summarizes nothing.
+        drop(first);
+        drop(second);
+        let pictures = units.len() + 2;
+        assert_eq!(
+            totals.seal(),
+            Some(format!(
+                "H.264 summary pictures={pictures} failures=1 idr_waits=2 sessions=3 hardware=yes"
+            ))
+        );
+        assert_eq!(other.seal(), None);
+    }
+
+    fn factory_for_other_generation(totals: &Arc<Totals>) -> ironrdp_client::h264::H264DecoderFactory {
+        factory(Arc::clone(totals)).unwrap()
+    }
 
     // T4: no picture and no session before an IDR, after a failure or after a reset.
     #[test]
