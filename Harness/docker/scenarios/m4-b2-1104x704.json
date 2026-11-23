@@ -1,0 +1,30 @@
+{
+  "name": "m4-b2-1104x704",
+  "runs": [
+    {
+      "id": "m4-b2-1104x704",
+      "host": "127.0.0.1",
+      "port": 33901,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B2_PASS",
+      "repeat": 5,
+      "graphicsMode": "auto",
+      "networkAutoDetect": true,
+      "window": { "width": 1104, "height": 704 },
+      "steps": [
+        { "op": "connect" },
+        { "op": "waitConnected", "timeout": 30 },
+        { "op": "waitFirstFrame", "timeout": 30 },
+        { "op": "idle", "seconds": 3 },
+        { "op": "cpuWindow", "seconds": 9, "scanCode": 30 },
+        { "op": "dumpFrame", "seconds": 2, "timeout": 15, "scanCode": 48 },
+        { "op": "shutdown" }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true,
+        "maxShutdownMs": 1000
+      }
+    }
+  ]
+}

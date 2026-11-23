@@ -20,6 +20,39 @@ final class IterationEvaluationTests: XCTestCase {
         XCTAssertTrue(evaluate(iteration, against: expected).isEmpty)
     }
 
+    /// The last resize can match while an earlier step does not. i8 compat runs
+    /// logged got≠req and still stored resizeFrameSizeCheck=pass, because only
+    /// the final pair was compared.
+    func testResizeFailsWhenAnEarlierLoggedFrameDiffersFromItsRequest() {
+        var iteration = IterationResult(iteration: 1)
+        iteration.connectRises = 1
+        iteration.connectedAfterResize = true
+        iteration.displayControlReady = true
+        iteration.requestedResizeFrameSize = [1920, 1080]
+        iteration.resizeFrameSize = [1920, 1080]
+        iteration.resizeLog = [
+            "req=1600x900 got=1920x1080 connected=true",
+            "req=1920x1080 got=1920x1080 connected=true",
+        ]
+        let expected = HarnessExpectation(resizeKeepsSession: true)
+
+        XCTAssertEqual(evaluateResizeFrameSize(iteration, against: expected).status, .fail)
+        XCTAssertFalse(evaluate(iteration, against: expected).isEmpty)
+
+        iteration.resizeLog = [
+            "req=1600x900 got=1600x900 connected=true",
+            "req=1920x1080 got=none connected=true",
+        ]
+        XCTAssertEqual(evaluateResizeFrameSize(iteration, against: expected).status, .fail)
+
+        iteration.resizeLog = [
+            "req=1600x900 got=1600x900 connected=true",
+            "req=1920x1080 got=1920x1080 connected=true",
+        ]
+        XCTAssertEqual(evaluateResizeFrameSize(iteration, against: expected).status, .pass)
+        XCTAssertTrue(evaluate(iteration, against: expected).isEmpty)
+    }
+
     func testResizeIsNotApplicableWithoutDisplayControl() {
         var iteration = IterationResult(iteration: 1)
         iteration.connectRises = 1
@@ -94,6 +127,15 @@ final class IterationEvaluationTests: XCTestCase {
         XCTAssertEqual(evaluate(iteration, against: nil), [
             "iteration 1: clipboardExpectLocal:failed"
         ])
+    }
+
+    // Design iron-autologon-log: a login the server did not confirm fails the iteration.
+    func testUnconfirmedLoginFailsTheIteration() {
+        var iteration = IterationResult(iteration: 1)
+        iteration.steps = ["connect:ok", "waitConnected:ok", "waitFirstFrame:ok", "waitLogin:refused:failed", "cpuWindow:skipped"]
+        XCTAssertEqual(evaluate(iteration, against: nil), ["iteration 1: waitLogin:refused:failed"])
+        iteration.steps[3] = "waitLogin:ok:ok"
+        XCTAssertEqual(evaluate(iteration, against: nil), [])
     }
 
     func testUnexpectedDisconnectFailsBeforeShutdown() {
