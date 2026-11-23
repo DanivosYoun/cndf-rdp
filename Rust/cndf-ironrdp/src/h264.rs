@@ -271,34 +271,30 @@ fn parameter_set(nal: &[u8]) -> Result<Vec<u8>, String> {
     Ok(nal.to_vec())
 }
 
-/// Splits an Annex B byte stream into NAL units without their start codes.
+/// Splits an Annex B byte stream into NAL units without their start codes, one at a time,
+/// so a unit is checked before the rest of the input is searched.
 fn annex_b_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
+    let mut next = after_start_code(data, 0);
+    core::iter::from_fn(move || loop {
+        let start = next?;
+        next = after_start_code(data, start);
+        let mut end = next.map_or(data.len(), |after| after - 3);
+        // Zero bytes before a start code belong to it (a 4-byte start code or trailing_zero_8bits).
+        while end > start && data[end - 1] == 0 {
+            end -= 1;
         }
-    }
-    let ends: Vec<usize> = starts
-        .iter()
-        .skip(1)
-        .map(|&next| next - 3)
-        .chain(core::iter::once(data.len()))
-        .collect();
-    starts
-        .into_iter()
-        .zip(ends)
-        .filter_map(move |(start, mut end)| {
-            // Zero bytes before a start code belong to it (a 4-byte start code or trailing_zero_8bits).
-            while end > start && data[end - 1] == 0 {
-                end -= 1;
-            }
-            (end > start).then(|| &data[start..end])
-        })
+        if end > start {
+            return Some(&data[start..end]);
+        }
+    })
+}
+
+/// The position after the first start code at or after `from`.
+fn after_start_code(data: &[u8], from: usize) -> Option<usize> {
+    data.get(from..)?
+        .windows(3)
+        .position(|window| window == [0, 0, 1])
+        .map(|at| from + at + 3)
 }
 
 /// Reads the Exp-Golomb fields at the start of a NAL unit's payload.
@@ -949,6 +945,10 @@ mod vt {
         }
     }
 
+    /// Capacity the access unit copy keeps between decodes, as upstream
+    /// `MAX_DECOMPRESSED_BUFFER_CAPACITY` keeps for the decompression buffer.
+    const KEPT_SAMPLE_CAPACITY: usize = 16 * 1024;
+
     /// One surface stream's decoder: owns at most one VideoToolbox session (D2).
     pub(super) struct VtDecoder {
         sets: ParameterSets,
@@ -1002,6 +1002,12 @@ mod vt {
             self.session
                 .as_ref()
                 .map(|session| session.format.full_range)
+        }
+
+        /// How many bytes the access unit copy holds on to between decodes.
+        #[cfg(test)]
+        pub(super) fn sample_capacity(&self) -> usize {
+            self.sample.capacity()
         }
 
         fn end_stream(&mut self) {
@@ -1113,7 +1119,12 @@ mod vt {
         }
 
         fn decode_yuv420(&mut self, data: &[u8]) -> DecoderResult<Yuv420Frame> {
-            match self.decode_picture(data) {
+            let result = self.decode_picture(data);
+            // Whatever the result, a large access unit's copy must not stay for the
+            // decoder's life; upstream bounds its decompression buffer the same way.
+            self.sample.clear();
+            self.sample.shrink_to(KEPT_SAMPLE_CAPACITY);
+            match result {
                 Ok(picture) => {
                     self.stats.pictures += 1;
                     self.total(Totals::picture);
@@ -1400,6 +1411,76 @@ mod tests {
             let summary = totals.seal().unwrap();
             assert!(summary.ends_with(expected), "{summary} vs {expected}");
         }
+    }
+
+    /// The splitter before it became lazy: every start position, then every end position.
+    fn indexed_annex_b_units(data: &[u8]) -> Vec<&[u8]> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= data.len() {
+            if data[i..i + 3] == [0, 0, 1] {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        let ends = starts
+            .iter()
+            .skip(1)
+            .map(|&next| next - 3)
+            .chain([data.len()]);
+        starts
+            .iter()
+            .zip(ends)
+            .filter_map(|(&start, mut end)| {
+                while end > start && data[end - 1] == 0 {
+                    end -= 1;
+                }
+                (end > start).then(|| &data[start..end])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn annex_b_units_split_as_the_indexed_splitter_did() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for length in (0..400).chain([4096]) {
+            let data: Vec<u8> = (0..length)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    // Mostly zeros and ones, so start codes and trailing zeros are frequent.
+                    [0, 0, 0, 1, 0x65, 0x41, 0x09, 0x55][(seed >> 61) as usize]
+                })
+                .collect();
+            assert_eq!(
+                annex_b_units(&data).collect::<Vec<_>>(),
+                indexed_annex_b_units(&data),
+                "{data:02x?}"
+            );
+        }
+    }
+
+    // annex-b-index-amplification: a 60 MiB access unit of four-byte delimiters made the
+    // splitter allocate 248 MiB of start and end positions before it looked at one unit.
+    // The lazy splitter holds the input and one position, so it cannot hold an index.
+    #[test]
+    fn annex_b_units_keep_no_index_of_the_input() {
+        let data = [0, 0, 1, 9].repeat(4096);
+        let units = annex_b_units(&data);
+        assert!(
+            core::mem::size_of_val(&units) <= core::mem::size_of::<(&[u8], Option<usize>)>(),
+            "splitter of {} bytes",
+            core::mem::size_of_val(&units)
+        );
+        assert_eq!(units.count(), 4096);
+        let mut sets = ParameterSets::new();
+        assert_eq!(
+            parse(&mut sets, &data).unwrap_err(),
+            "access unit without a picture"
+        );
     }
 
     #[test]
@@ -1966,5 +2047,60 @@ mod vt_tests {
         assert!(ready.contains(&0x80004));
         let unavailable = advertised(VtDecoder::new(PixelBudget::new(u64::MAX), broken_probe));
         assert_eq!(unavailable, [0x80004]);
+    }
+
+    // retained-h264-sample-buffer: a large access unit's copy kept its capacity for the
+    // decoder's life whether it failed to parse, waited for an IDR picture or decoded.
+    #[test]
+    fn a_large_access_unit_leaves_no_large_copy_behind() {
+        const KEPT: usize = 16 * 1024;
+        let _serial = serial();
+        let filler = vec![0x55; 1 << 20];
+        let mut decoder = decoder();
+        // An IDR slice, then a NAL unit type the parser rejects after copying the slice.
+        let failing = [
+            &[0, 0, 0, 1, 0x65, 0xb8][..],
+            &filler,
+            &[0, 0, 0, 1, 0x74, 0x80],
+        ]
+        .concat();
+        assert!(decoder.decode_yuv420(&failing).is_err());
+        assert!(
+            decoder.sample_capacity() <= KEPT,
+            "{}",
+            decoder.sample_capacity()
+        );
+        // A predicted slice before any IDR picture.
+        let waiting = [&[0, 0, 0, 1, 0x41, 0x9a][..], &filler].concat();
+        assert!(decoder.decode_yuv420(&waiting).is_err());
+        assert_eq!(decoder.stats.idr_waits, 1);
+        assert!(
+            decoder.sample_capacity() <= KEPT,
+            "{}",
+            decoder.sample_capacity()
+        );
+        // A picture that decodes, carrying a 1 MiB user data SEI after its delimiter.
+        let size = 16 + filler.len();
+        let mut sei = vec![0, 0, 0, 1, 0x06, 0x05];
+        sei.extend(std::iter::repeat_n(0xff, size / 255));
+        sei.push((size % 255) as u8);
+        sei.extend([0x11; 16]);
+        sei.extend(&filler);
+        sei.push(0x80);
+        let first = access_units(&read("avc420-pc.h264")).swap_remove(0);
+        let unit = [&first[..6], &sei, &first[6..]].concat();
+        let picture = decoder.decode_yuv420(&unit).unwrap();
+        assert_eq!(picture_hash(&picture), reference_hashes("avc420-pc")[0]);
+        assert!(
+            decoder.sample_capacity() <= KEPT,
+            "{}",
+            decoder.sample_capacity()
+        );
+        decoder.reset();
+        assert!(
+            decoder.sample_capacity() <= KEPT,
+            "{}",
+            decoder.sample_capacity()
+        );
     }
 }
