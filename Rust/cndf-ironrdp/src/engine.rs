@@ -1415,7 +1415,9 @@ mod tests {
             scope.spawn(|| {
                 deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, || base)
             });
+            let deadline = Instant::now() + Duration::from_secs(5);
             while lock(&connection.statistics).updates_received != 2 {
+                assert!(Instant::now() < deadline, "the first two updates are not composed");
                 std::thread::yield_now();
             }
             // Let the delivery thread decide on the empty queue and block on it.
@@ -1548,7 +1550,9 @@ mod tests {
             output
                 .blocking_send(marked(row(TILES, 0, &px(&vec![1; TILES.into()]))))
                 .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
             while lock(&connection.statistics).frames_delivered != 1 {
+                assert!(Instant::now() < deadline, "a lone completed frame is held");
                 std::thread::yield_now();
             }
             std::thread::sleep(Duration::from_millis(20));
