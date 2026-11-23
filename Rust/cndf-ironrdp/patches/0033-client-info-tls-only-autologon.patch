@@ -1,0 +1,184 @@
+diff --git a/crates/ironrdp-client/src/config.rs b/crates/ironrdp-client/src/config.rs
+index edbec81..beac890 100644
+--- a/crates/ironrdp-client/src/config.rs
++++ b/crates/ironrdp-client/src/config.rs
+@@ -128,6 +128,8 @@ pub struct Config {
+     #[cfg(feature = "rustls")]
+     pub(crate) certificate_chain_validation_callback: Option<ironrdp_tls::CertificateChainValidationCallback>,
+     pub(crate) tls_upgrader: Option<Arc<dyn TlsUpgrader>>,
++    /// CNDF: see [`Config::with_tls_only_autologon`].
++    pub(crate) tls_only_autologon: Option<Arc<core::sync::atomic::AtomicBool>>,
+     #[cfg(feature = "sound")]
+     pub(crate) audio_wave_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+     #[cfg(feature = "entra-auth")]
+@@ -200,6 +202,18 @@ impl Config {
+         self
+     }
+ 
++    /// CNDF: Client Info sends `INFO_AUTOLOGON` and the password only on a connection whose
++    /// server selected TLS-only security, after the TLS upgrade and its certificate validation
++    /// succeeded, and never to a server redirection target. Every other connection sends
++    /// neither; CredSSP still uses the configured credentials.
++    ///
++    /// Each connection attempt stores in `sent` whether its Client Info logs on.
++    #[must_use]
++    pub fn with_tls_only_autologon(mut self, sent: Arc<core::sync::atomic::AtomicBool>) -> Self {
++        self.tls_only_autologon = Some(sent);
++        self
++    }
++
+     /// Observes each wave delivered to the shared playback handler.
+     /// The callback runs on the session thread and must return promptly.
+     #[cfg(feature = "sound")]
+@@ -2864,6 +2878,7 @@ impl ConfigBuilder {
+             #[cfg(feature = "rustls")]
+             certificate_chain_validation_callback: self.certificate_chain_validation_callback,
+             tls_upgrader: None,
++            tls_only_autologon: None,
+             #[cfg(feature = "sound")]
+             audio_wave_observer: None,
+             #[cfg(feature = "entra-auth")]
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index d1fff88..a1804ae 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -3095,6 +3095,11 @@ fn build_connector(
+         connector = connector.with_redirection_password_cookie(password_cookie);
+     }
+ 
++    if let Some(sent) = &config.tls_only_autologon {
++        sent.store(false, Ordering::Release);
++        connector = connector.with_tls_only_autologon(config.redirection.is_none());
++    }
++
+     if let Some(rail_client) = rail_client {
+         connector = connector.with_static_channel(rail_client);
+     }
+@@ -4015,6 +4020,11 @@ where
+     let (erased_stream, tls_cert) = tls_upgrade.map_err(|e| ironrdp_connector::custom_err!("TLS upgrade", e))?;
+     warn_on_unexpected_target_certificate(config, &tls_cert);
+ 
++    // CNDF: the upgrade succeeded, so the certificate passed validation or the user trusted it.
++    if let Some(sent) = &config.tls_only_autologon {
++        sent.store(connector.confirm_tls_only_autologon(), Ordering::Release);
++    }
++
+     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+ 
+     let mut upgraded_framed = ironrdp_tokio::TokioFramed::new_with_leftover(erased_stream, leftover_bytes);
+diff --git a/crates/ironrdp-connector/src/connection.rs b/crates/ironrdp-connector/src/connection.rs
+index 1860d16..0a2da60 100644
+--- a/crates/ironrdp-connector/src/connection.rs
++++ b/crates/ironrdp-connector/src/connection.rs
+@@ -453,6 +453,8 @@ pub struct ClientConnector {
+     pub auto_reconnect_cookie: Option<ServerAutoReconnect>,
+     /// Password cookie from a Server Redirection PDU, sent in the Client Info PDU.
+     redirection_password_cookie: Option<Vec<u8>>,
++    /// CNDF: set by [`ClientConnector::with_tls_only_autologon`].
++    tls_only_autologon: Option<TlsOnlyAutologon>,
+     /// Start of the in-flight connect-time bandwidth measurement window.
+     ///
+     /// Set when the server's Bandwidth Measure Start arrives, and only when the
+@@ -495,6 +497,7 @@ impl ClientConnector {
+             server_rdp_version: None,
+             auto_reconnect_cookie: None,
+             redirection_password_cookie: None,
++            tls_only_autologon: None,
+             connect_time_bw_started_at: None,
+             connect_time_bw_bytes: 0,
+             network_characteristics: None,
+@@ -953,6 +956,48 @@ impl ClientConnector {
+             .and_then(|channel| channel.channel_processor_downcast_mut())
+     }
+ 
++    /// CNDF: Client Info carries `INFO_AUTOLOGON` and the password only after
++    /// [`Self::confirm_tls_only_autologon`]; until then, and on every other connection, it
++    /// carries neither. CredSSP still uses the configured credentials.
++    ///
++    /// `eligible` is false for a connection the configured password must not log on to, such
++    /// as a server redirection target.
++    #[must_use]
++    pub fn with_tls_only_autologon(mut self, eligible: bool) -> Self {
++        self.tls_only_autologon = Some(TlsOnlyAutologon {
++            eligible,
++            confirmed: false,
++        });
++        self
++    }
++
++    /// CNDF: call once the TLS upgrade, its certificate validation included, has succeeded, and
++    /// before [`Self::mark_security_upgrade_as_done`].
++    ///
++    /// Confirms autologon when the server selected TLS-only security (`PROTOCOL_SSL`) and the
++    /// connection has a username and a password to log on with. Returns whether Client Info
++    /// carries them.
++    pub fn confirm_tls_only_autologon(&mut self) -> bool {
++        let ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } = self.state else {
++            return false;
++        };
++        let has_password = matches!(
++            &self.config.credentials,
++            crate::Credentials::UsernamePassword { username, password } if !username.is_empty() && !password.is_empty()
++        );
++        let allowed = self.config.autologon
++            && selected_protocol == nego::SecurityProtocol::SSL
++            && has_password
++            && !self.entra_auth
++            && !self.remote_guard
++            && self.redirection_password_cookie.is_none();
++        let Some(policy) = self.tls_only_autologon.as_mut() else {
++            return false;
++        };
++        policy.confirmed = policy.eligible && allowed;
++        policy.confirmed
++    }
++
+     pub fn should_perform_security_upgrade(&self) -> bool {
+         matches!(self.state, ClientConnectorState::EnhancedSecurityUpgrade { .. })
+     }
+@@ -1836,7 +1881,7 @@ impl Sequence for ClientConnector {
+             } => {
+                 debug!("Secure Settings Exchange");
+ 
+-                let client_info = create_client_info_pdu(
++                let mut client_info = create_client_info_pdu(
+                     &self.config,
+                     &self.client_addr,
+                     self.auto_reconnect_cookie.as_ref(),
+@@ -1844,6 +1889,9 @@ impl Sequence for ClientConnector {
+                     self.entra_auth,
+                     self.remote_guard,
+                 );
++                if let Some(policy) = self.tls_only_autologon {
++                    policy.apply(&mut client_info.client_info);
++                }
+ 
+                 debug!(message = ?client_info, "Send");
+ 
+@@ -2339,6 +2387,26 @@ fn monitor_extended_layout(config: &Config) -> Option<gcc::ClientMonitorExtended
+     Some(extended.clone())
+ }
+ 
++/// CNDF: whether Client Info logs on with the configured password (see
++/// [`ClientConnector::with_tls_only_autologon`]).
++#[derive(Debug, Clone, Copy)]
++struct TlsOnlyAutologon {
++    eligible: bool,
++    confirmed: bool,
++}
++
++impl TlsOnlyAutologon {
++    /// Sends `INFO_AUTOLOGON` and the password together, or neither.
++    fn apply(self, client_info: &mut rdp::client_info::ClientInfo) {
++        use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
++
++        client_info.flags.set(ClientInfoFlags::AUTOLOGON, self.confirmed);
++        if !self.confirmed {
++            client_info.credentials.password.clear();
++        }
++    }
++}
++
+ fn create_client_info_pdu(
+     config: &Config,
+     client_addr: &SocketAddr,

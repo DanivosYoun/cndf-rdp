@@ -1255,6 +1255,7 @@ mod real {
                     closed: AtomicBool::new(false),
                 }),
                 statistics: Arc::default(),
+                h264: Arc::default(),
             };
 
             let (input, _events) = RdpInputSender::channel(1);
@@ -1343,6 +1344,7 @@ mod real {
                     closed: AtomicBool::new(false),
                 }),
                 statistics: Arc::default(),
+                h264: Arc::default(),
             };
 
             let (input, _events) = RdpInputSender::channel(1);
@@ -1424,6 +1426,7 @@ mod real {
                     closed: AtomicBool::new(false),
                 }),
                 statistics: Arc::default(),
+                h264: Arc::default(),
             }
         }
 
@@ -1662,6 +1665,7 @@ mod real {
                     closed: AtomicBool::new(false),
                 }),
                 statistics: Arc::default(),
+                h264: Arc::default(),
             }
         }
 
@@ -2700,6 +2704,7 @@ mod real {
                     closed: AtomicBool::new(false),
                 }),
                 statistics: Arc::default(),
+                h264: Arc::default(),
             }
         }
 

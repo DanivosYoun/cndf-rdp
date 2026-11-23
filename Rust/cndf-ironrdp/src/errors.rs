@@ -2,6 +2,10 @@ use crate::CNDFIronFailureKind::{self, *};
 use crate::CNDFIronStage::{self, *};
 use ironrdp_connector::{sspi::ErrorKind, ConnectorError, ConnectorErrorKind};
 use ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError;
+use ironrdp_pdu::rdp::session_info::{
+    LogonErrorNotificationData, LogonErrorNotificationDataErrorCode, LogonErrorNotificationType,
+    LogonErrorsInfo,
+};
 use std::error::Error;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,6 +46,39 @@ pub(super) const CHANNEL_MESSAGE_LIMIT: Failure = Failure(
     CNDF_IRON_STAGE_ACTIVE,
     "서버가 보낸 채널 메시지가 크기 상한을 넘어 세션을 끝냈습니다",
 );
+
+/// A server rejected the credentials Client Info logged on with (TLS-only autologon).
+pub(super) const LOGON_REJECTED: Failure = Failure(
+    CNDF_IRON_FAILURE_AUTHENTICATION,
+    0x4952000F,
+    CNDF_IRON_STAGE_AUTHENTICATION,
+    "Server logon rejected the credentials",
+);
+
+/// Whether a Logon Errors notification ([MS-RDPBCGR] 2.2.10.1.1.4.1.1) explicitly rejects the
+/// credentials: a credential NTSTATUS, or `ERROR_CODE_ACCESS_DENIED` with
+/// `LOGON_FAILED_BAD_PASSWORD`. A password change, a warning, a permission or session message
+/// and any other status are not.
+pub(super) fn rejects_logon(info: &LogonErrorsInfo) -> bool {
+    use LogonErrorNotificationData::ErrorCode;
+    use LogonErrorNotificationDataErrorCode::*;
+    use LogonErrorNotificationType::*;
+    match (info.error_type, &info.error_data) {
+        (_, ErrorCode(FailedUpdatePassword | Warning)) => false,
+        (NtStatus(status), _) => credential_status(status),
+        (AccessDenied, ErrorCode(FailedBadPassword)) => true,
+        _ => false,
+    }
+}
+
+fn credential_status(status: u32) -> bool {
+    matches!(
+        status,
+        0xC0000064 | // STATUS_NO_SUCH_USER
+        0xC000006A | // STATUS_WRONG_PASSWORD
+        0xC000006D // STATUS_LOGON_FAILURE
+    )
+}
 
 /// The channel size limit that failed `error`, if one did.
 pub(super) fn channel_limit_cause<'a>(
@@ -204,6 +241,36 @@ mod tests {
             let Failure(kind, _, _, description) = classify(&error, rejected);
             assert_eq!(kind, expected);
             assert!(!description.contains("secret sentinel"));
+        }
+    }
+
+    #[test]
+    fn only_explicit_credential_rejections_fail_the_logon() {
+        use LogonErrorNotificationData::*;
+        use LogonErrorNotificationDataErrorCode::*;
+        use LogonErrorNotificationType::*;
+        let cases = [
+            (NtStatus(0xC000006D), ErrorCode(FailedBadPassword), true), // STATUS_LOGON_FAILURE
+            (NtStatus(0xC000006A), ErrorCode(FailedOther), true), // STATUS_WRONG_PASSWORD
+            (NtStatus(0xC0000064), ErrorCode(FailedBadPassword), true), // STATUS_NO_SUCH_USER
+            (AccessDenied, ErrorCode(FailedBadPassword), true),
+            // A password change, a warning, permission, session messages and other statuses.
+            (NtStatus(0xC000006D), ErrorCode(FailedUpdatePassword), false),
+            (NtStatus(0xC000006D), ErrorCode(Warning), false),
+            (NtStatus(0xC0000224), ErrorCode(FailedBadPassword), false), // PASSWORD_MUST_CHANGE
+            (NtStatus(0xC0000071), ErrorCode(FailedOther), false), // STATUS_PASSWORD_EXPIRED
+            (NtStatus(0xC0000022), ErrorCode(FailedBadPassword), false), // STATUS_ACCESS_DENIED
+            (AccessDenied, ErrorCode(FailedOther), false),
+            (NoPermission, SessionId(0), false),
+            (SessionContinue, SessionId(0), false),
+            (DisconnectRefused, SessionId(3), false),
+        ];
+        for (error_type, error_data, expected) in cases {
+            let info = LogonErrorsInfo {
+                error_type,
+                error_data: error_data.clone(),
+            };
+            assert_eq!(rejects_logon(&info), expected, "{error_type:?} {error_data:?}");
         }
     }
 
