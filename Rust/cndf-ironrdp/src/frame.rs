@@ -1,14 +1,27 @@
 use crate::{lock, CNDFIronRect, Connection};
 use ironrdp_client::rdp::DesktopUpdate;
 use ironrdp_pdu::desktop_framebuffer::{desktop_pixel_count, DesktopFramebufferError};
+use std::time::{Duration, Instant};
+
+// The 0xFFRRGGBB words are handed to the host as BGRA bytes, which holds on little-endian only.
+#[cfg(not(target_endian = "little"))]
+compile_error!("the frame hands its pixel words to the host as BGRA bytes");
+
+/// How long a backlog may hold back a completed frame.
+const BATCH: Duration = Duration::from_millis(16);
 
 #[derive(Default)]
 pub(super) struct Frame {
-    pixels: Vec<u8>,
+    /// Opaque 0xFFRRGGBB words, which are BGRA bytes in memory.
+    pixels: Vec<u32>,
     width: u32,
     height: u32,
     dirty: Option<CNDFIronRect>,
     sequence: u64,
+    /// When the oldest change not yet published was composed.
+    since: Option<Instant>,
+    /// Whether the server data composed since the last publish ended a frame.
+    complete: bool,
 }
 
 impl Frame {
@@ -17,10 +30,12 @@ impl Frame {
             || self.height != u32::from(update.height().get())
     }
 
-    pub fn compose(&mut self, update: &DesktopUpdate) -> Result<u64, DesktopFramebufferError> {
+    pub fn compose(&mut self, update: DesktopUpdate) -> Result<u64, DesktopFramebufferError> {
         let width = u32::from(update.width().get());
         let height = u32::from(update.height().get());
-        let len = desktop_pixel_count(width, height)? as usize * 4;
+        let len = desktop_pixel_count(width, height)? as usize;
+        self.complete |= update.ends_frame();
+        self.since.get_or_insert_with(Instant::now);
         let region = update.region();
         let dirty = CNDFIronRect {
             x: region.left.into(),
@@ -28,26 +43,29 @@ impl Frame {
             width: u32::from(region.right - region.left) + 1,
             height: u32::from(region.bottom - region.top) + 1,
         };
-        if self.changes_size(update) {
-            if dirty.x != 0 || dirty.y != 0 || dirty.width != width || dirty.height != height {
-                return Ok(0);
-            }
-            self.pixels
-                .try_reserve_exact(len.saturating_sub(self.pixels.len()))
-                .map_err(|_| DesktopFramebufferError::Allocation)?;
-            self.pixels.resize(len, 0);
+        if dirty.x == 0 && dirty.y == 0 && dirty.width == width && dirty.height == height {
+            // A full update's packed words already carry the alpha, so they become the frame.
+            let (buffer, ..) = update.into_parts();
+            debug_assert_eq!(buffer.len(), len);
+            debug_assert!(buffer.first().is_none_or(|pixel| pixel >> 24 == 0xff));
+            self.pixels = buffer;
             self.width = width;
             self.height = height;
+            self.dirty = Some(dirty);
+            return Ok(len as u64 * 4);
+        }
+        if self.changes_size(&update) {
+            return Ok(0);
         }
         for (row, source) in update
             .buffer()
             .chunks_exact(dirty.width as usize)
             .enumerate()
         {
-            let offset = ((dirty.y as usize + row) * width as usize + dirty.x as usize) * 4;
-            let destination = &mut self.pixels[offset..offset + source.len() * 4];
-            for (pixel, rgb) in destination.chunks_exact_mut(4).zip(source) {
-                pixel.copy_from_slice(&(rgb | 0xff00_0000).to_le_bytes());
+            let offset = (dirty.y as usize + row) * width as usize + dirty.x as usize;
+            let destination = &mut self.pixels[offset..offset + source.len()];
+            for (pixel, rgb) in destination.iter_mut().zip(source) {
+                *pixel = rgb | 0xff00_0000;
             }
         }
         self.dirty = Some(self.dirty.map_or(dirty, |other| {
@@ -63,7 +81,15 @@ impl Frame {
         Ok(update.buffer().len() as u64 * 4)
     }
 
+    /// Whether the composed changes should be published now: once the server data ended a
+    /// frame, and with a backlog only after the oldest unpublished change waited for `BATCH`.
+    pub fn ready(&self, backlog: bool) -> bool {
+        self.complete && (!backlog || self.since.is_some_and(|since| since.elapsed() >= BATCH))
+    }
+
     pub fn publish(&mut self, connection: &Connection, full: bool) {
+        self.since = None;
+        self.complete = false;
         let dirty = self.dirty.take();
         let dirty = if full && !self.pixels.is_empty() {
             Some(CNDFIronRect {
@@ -81,12 +107,12 @@ impl Frame {
                 {
                     let mut statistics = lock(&connection.statistics);
                     statistics.frames_delivered += 1;
-                    statistics.frame_bytes_delivered += self.pixels.len() as u64;
+                    statistics.frame_bytes_delivered += self.pixels.len() as u64 * 4;
                 }
                 self.sequence += 1;
                 callback(
                     connection.generation,
-                    self.pixels.as_ptr(),
+                    self.pixels.as_ptr().cast::<u8>(),
                     self.width,
                     self.height,
                     self.width * 4,
@@ -181,29 +207,105 @@ mod tests {
         .unwrap();
         let mut frame = Frame::default();
         assert_eq!(
-            frame.compose(&update),
+            frame.compose(update),
             Err(DesktopFramebufferError::Dimensions)
         );
         assert_eq!(frame.pixels.capacity(), 0);
         assert_eq!(OVERSIZED_ATTEMPTS.load(Ordering::Relaxed), 0);
     }
 
+    fn bytes(pixels: &[u32]) -> Vec<u8> {
+        pixels.iter().flat_map(|pixel| pixel.to_le_bytes()).collect()
+    }
+
     #[test]
-    fn composes_bgra_and_requires_full_update_on_resize() {
+    fn full_update_becomes_the_frame_without_copy() {
+        let mut frame = Frame::default();
+        let update = update(2, 0, vec![0xff112233, 0xffaabbcc]);
+        let pointer = update.buffer().as_ptr();
+        assert_eq!(frame.compose(update), Ok(8));
+        assert_eq!(frame.pixels.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn full_update_frame_is_opaque_bgra() {
+        let mut frame = Frame::default();
+        assert_eq!(frame.compose(update(1, 0, vec![0xff112233])), Ok(4));
+        assert_eq!(bytes(&frame.pixels), [0x33, 0x22, 0x11, 0xff]);
+    }
+
+    #[test]
+    fn partial_update_after_adoption_keeps_other_pixels() {
         let mut frame = Frame::default();
         assert_eq!(
-            frame.compose(&update(2, 0, vec![0x00112233, 0x00aabbcc])),
+            frame.compose(update(2, 0, vec![0xff112233, 0xffaabbcc])),
             Ok(8)
         );
         frame.dirty = None;
-        assert_eq!(frame.compose(&update(2, 1, vec![0x00123456])), Ok(4));
-        assert_eq!(frame.pixels, [0x33, 0x22, 0x11, 255, 0x56, 0x34, 0x12, 255]);
+        assert_eq!(frame.compose(update(2, 1, vec![0x00123456])), Ok(4));
+        assert_eq!(
+            bytes(&frame.pixels),
+            [0x33, 0x22, 0x11, 255, 0x56, 0x34, 0x12, 255]
+        );
         assert_eq!(frame.dirty.unwrap().x, 1);
-        assert_eq!(frame.compose(&update(3, 1, vec![0])), Ok(0));
-        assert_eq!(frame.width, 2);
+        assert_eq!(frame.dirty.unwrap().width, 1);
+    }
+
+    #[test]
+    fn new_extent_requires_full_update() {
+        let mut frame = Frame::default();
+        assert_eq!(frame.compose(update(2, 0, vec![0xff00_0000; 2])), Ok(8));
         frame.dirty = None;
-        assert_eq!(frame.compose(&update(3, 0, vec![0; 3])), Ok(12));
+        assert_eq!(frame.compose(update(3, 1, vec![0xff00_0000])), Ok(0));
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.pixels.len(), 2);
+        assert!(frame.dirty.is_none());
+        assert_eq!(frame.compose(update(3, 0, vec![0xff00_0000; 3])), Ok(12));
         assert_eq!(frame.width, 3);
-        assert_eq!(frame.pixels, [0, 0, 0, 255].repeat(3));
+        assert_eq!(bytes(&frame.pixels), [0, 0, 0, 255].repeat(3));
+    }
+
+    fn marked(update: DesktopUpdate) -> DesktopUpdate {
+        update.with_frame_end()
+    }
+
+    #[test]
+    fn frame_is_ready_only_at_frame_end() {
+        let mut frame = Frame::default();
+        frame.compose(update(3, 0, vec![0xff00_0000; 3])).unwrap();
+        frame.compose(update(3, 1, vec![0xff00_0000])).unwrap();
+        let first = frame.ready(false);
+        frame.compose(update(3, 2, vec![0xff00_0000])).unwrap();
+        let second = frame.ready(false);
+        frame.compose(marked(update(3, 0, vec![0xff00_0000]))).unwrap();
+        assert_eq!((first, second, frame.ready(false)), (false, false, true));
+    }
+
+    #[test]
+    fn ignored_update_still_ends_the_frame() {
+        let mut frame = Frame::default();
+        frame.compose(update(2, 0, vec![0xff00_0000; 2])).unwrap();
+        assert_eq!(frame.compose(marked(update(3, 1, vec![0]))), Ok(0));
+        assert!(frame.ready(false));
+    }
+
+    #[test]
+    fn stale_publish_time_does_not_split_a_frame() {
+        // A frame just published has neither a pending change nor an end.
+        let mut frame = Frame::default();
+        std::thread::sleep(Duration::from_millis(20));
+        frame.compose(update(2, 0, vec![0xff00_0000; 2])).unwrap();
+        assert!(!frame.ready(true));
+        assert!(!frame.ready(false));
+    }
+
+    #[test]
+    fn backlog_coalesces_until_batch_limit() {
+        let mut frame = Frame::default();
+        frame.compose(marked(update(2, 0, vec![0xff00_0000; 2]))).unwrap();
+        assert!(!frame.ready(true));
+        assert!(frame.ready(false));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(frame.ready(true));
     }
 }

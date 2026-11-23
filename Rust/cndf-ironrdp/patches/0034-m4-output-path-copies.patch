@@ -1,0 +1,185 @@
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index d1fff88..a9321ef 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -342,7 +342,7 @@ pub enum RdpOutputEvent {
+ 
+ /// A tightly packed changed region from the composited desktop framebuffer.
+ ///
+-/// Pixels use the same `0x00RRGGBB` representation as [`RdpOutputEvent::Image`].
++/// Pixels are opaque `0xFFRRGGBB` words, unlike the `0x00RRGGBB` of [`RdpOutputEvent::Image`].
+ /// `region` uses inclusive coordinates in the full framebuffer described by `width` and `height`.
+ #[derive(Debug)]
+ pub struct DesktopUpdate {
+@@ -350,6 +350,8 @@ pub struct DesktopUpdate {
+     width: NonZeroU16,
+     height: NonZeroU16,
+     region: InclusiveRectangle,
++    /// The last update of the server data processed in one session iteration.
++    frame_end: bool,
+     /// The session's desktop update budget this update holds until it is dropped.
+     permit: Option<crate::output_channel::DesktopUpdatePermit>,
+ }
+@@ -369,11 +371,26 @@ impl DesktopUpdate {
+             width,
+             height,
+             region,
++            frame_end: false,
+             permit: None,
+         })
+     }
+ 
+-    /// Returns the packed `0x00RRGGBB` pixels.
++    /// Marks this update as the last one of the server data processed in one session iteration.
++    #[must_use]
++    pub fn with_frame_end(mut self) -> Self {
++        self.frame_end = true;
++        self
++    }
++
++    /// Returns whether this is the last update of the server data processed in one session iteration.
++    ///
++    /// The embedder may present the framebuffer after this update. For EGFX, that data ended with EndFrame.
++    pub fn ends_frame(&self) -> bool {
++        self.frame_end
++    }
++
++    /// Returns the packed `0xFFRRGGBB` pixels.
+     pub fn buffer(&self) -> &[u32] {
+         &self.buffer
+     }
+@@ -4822,6 +4839,7 @@ fn pack_desktop_update(
+     height: NonZeroU16,
+     region: InclusiveRectangle,
+     permit: Option<crate::output_channel::DesktopUpdatePermit>,
++    alpha: u8,
+ ) -> SessionResult<DesktopUpdate> {
+     let region_width = region
+         .right
+@@ -4877,7 +4895,7 @@ fn pack_desktop_update(
+             let r = pixel[0];
+             let g = pixel[1];
+             let b = pixel[2];
+-            u32::from_be_bytes([0, r, g, b])
++            u32::from_be_bytes([alpha, r, g, b])
+         }));
+     }
+ 
+@@ -5897,7 +5915,8 @@ async fn active_session(
+                                     ));
+                                 }
+                             };
+-                            let update = pack_desktop_update(&image, width, height, region, Some(permit))?;
++                            let update = pack_desktop_update(&image, width, height, region, Some(permit), 0xff)?
++                                .with_frame_end();
+                             if !send_active_output_event(
+                                 output_event_sender,
+                                 RdpOutputEvent::DesktopUpdate(update),
+@@ -5914,7 +5933,8 @@ async fn active_session(
+                             if desktop_damage_regions.is_empty() {
+                                 desktop_damage_regions.push(region);
+                             }
+-                            for region in desktop_damage_regions.drain(..) {
++                            let last = desktop_damage_regions.len() - 1;
++                            for (index, region) in desktop_damage_regions.drain(..).enumerate() {
+                                 let permit = match reserve_desktop_update(
+                                     output_event_sender,
+                                     width,
+@@ -5933,7 +5953,9 @@ async fn active_session(
+                                         ));
+                                     }
+                                 };
+-                                let update = pack_desktop_update(&image, width, height, region, Some(permit))?;
++                                let mut update =
++                                    pack_desktop_update(&image, width, height, region, Some(permit), 0xff)?;
++                                update.frame_end = index == last;
+                                 if !send_active_output_event(
+                                     output_event_sender,
+                                     RdpOutputEvent::DesktopUpdate(update),
+@@ -5961,6 +5983,7 @@ async fn active_session(
+                             bottom: height.get() - 1,
+                         },
+                         None,
++                        0,
+                     )?
+                     .buffer;
+                     if !send_active_output_event(
+@@ -6755,6 +6778,24 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn pack_desktop_update_sets_the_requested_alpha() {
++        let image = DecodedImage::new(ironrdp_graphics::image_processing::PixelFormat::RgbA32, 2, 2);
++        let width = NonZeroU16::new(2).unwrap();
++        let region = InclusiveRectangle {
++            left: 0,
++            top: 0,
++            right: 1,
++            bottom: 1,
++        };
++        let opaque = pack_desktop_update(&image, width, width, region.clone(), None, 0xff).unwrap();
++        assert!(opaque.buffer().iter().all(|pixel| pixel >> 24 == 0xff));
++        let image = pack_desktop_update(&image, width, width, region, None, 0).unwrap();
++        assert!(image.buffer().iter().all(|pixel| pixel >> 24 == 0));
++        assert!(!image.ends_frame());
++        assert!(image.with_frame_end().ends_frame());
++    }
++
+     fn mouse_move(x: u16, y: u16) -> FastPathInputEvent {
+         FastPathInputEvent::MouseEvent(MousePdu {
+             flags: PointerFlags::MOVE,
+diff --git a/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs b/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
+index 3eb9926..3a6b2ca 100644
+--- a/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
++++ b/crates/ironrdp-testsuite-extra/tests/desktop_update_budget.rs
+@@ -330,11 +330,11 @@ impl Session {
+     }
+ }
+ 
+-/// The `0x00RRGGBB` screen a client shows for `frame`.
++/// The opaque `0xFFRRGGBB` screen a client shows for `frame`.
+ fn screen(frame: usize, pixels: usize) -> Vec<u32> {
+     frame_data(frame, pixels)
+         .chunks_exact(4)
+-        .map(|bgra| u32::from_be_bytes([0, bgra[2], bgra[1], bgra[0]]))
++        .map(|bgra| u32::from_be_bytes([0xff, bgra[2], bgra[1], bgra[0]]))
+         .collect()
+ }
+ 
+@@ -434,6 +434,35 @@ fn resumed_consumer_receives_every_update_in_order() {
+     });
+ }
+ 
++/// Each server frame ends with a desktop update marked as the frame end, and the screen
++/// composed up to that update is the whole frame.
++#[test]
++fn each_server_frame_ends_with_a_marked_update() {
++    run_local(|| async {
++        let frames = 3;
++        let mut session = start(1024, 1024, vec![Step::Frame; frames], 128, None).await;
++        for frame in 0..frames {
++            session.release.send_modify(|released| *released += 1);
++            let mut last = None;
++            // The frame has been processed once no event arrives for a second.
++            while let Ok(event) = tokio::time::timeout(Duration::from_secs(1), session.output.recv()).await {
++                let event = event.expect("the client is running");
++                if let RdpOutputEvent::DesktopUpdate(update) = &event {
++                    last = Some(update.ends_frame());
++                }
++                session.compose(event);
++            }
++            assert_eq!(session.sent.load(Ordering::SeqCst), frame + 1);
++            assert_eq!(last, Some(true), "frame {frame} ends with a marked update");
++            assert!(session.screen == screen(frame, 1024 * 1024), "frame {frame} is composed");
++        }
++        session.input.request_close();
++        session.server.abort();
++        drop(session.output);
++        let _ = tokio::time::timeout(Duration::from_secs(5), session.client).await;
++    });
++}
++
+ /// A close while the session loop waits for budget ends the session within a second, and so
+ /// does a graceful close, which still reaches the server (it disconnects on a shutdown request),
+ /// with the consumer stalled throughout.
