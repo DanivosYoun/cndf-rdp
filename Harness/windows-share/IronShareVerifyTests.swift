@@ -805,10 +805,11 @@ final class IronShareVerifyTests: XCTestCase {
                     await pause(1500)
                 }
             }
-            let codecLines = conn.logLines.filter { $0.localizedCaseInsensitiveContains("h264") || $0.localizedCaseInsensitiveContains("avc") || $0.localizedCaseInsensitiveContains("codec") }
-            log.write("codec_lines", ["lines": Array(codecLines.suffix(40)), "total": conn.logLines.count])
             await marker(conn, "R-END")
             conn.close()
+            // All engine log lines of the resize session (the "H.264 summary" line is not among them:
+            // RDPConnectionView drops engine logs once shutdown starts).
+            log.write("session_log", ["lines": conn.logLines, "total": conn.logLines.count])
         }
         await pause(3000)
         // P: pixel size and click position at 1×, simulated 2× backing scale, fixed WxH.

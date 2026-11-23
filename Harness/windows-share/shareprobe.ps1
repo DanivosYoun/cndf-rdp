@@ -23,6 +23,8 @@ using System.Windows.Forms;
 
 public static class ShareProbe {
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr mod, uint thread);
     [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
@@ -38,6 +40,7 @@ public static class ShareProbe {
     static HookProc keyProc = KeyHook, mouseProc = MouseHook;
     static Stopwatch clock = Stopwatch.StartNew();
     static string lastHeld = null, lastScreen = null, lastFg = null;
+    static uint lastDpi = 0;
     static Form form;
     static TextBox tb;
     static int frame;
@@ -92,6 +95,9 @@ public static class ShareProbe {
             lastScreen = screen;
             form.Bounds = new Rectangle(0, 0, GetSystemMetrics(0), GetSystemMetrics(1));
         }
+        // Per-monitor aware, so a reconnect at another scale shows its physical size and its DPI.
+        uint dpi = GetDpiForWindow(form.Handle);
+        if (dpi != lastDpi) { Log("dpi " + dpi); lastDpi = dpi; }
         var sb = new StringBuilder(128);
         GetWindowText(GetForegroundWindow(), sb, 128);
         string fg = sb.ToString();
@@ -99,7 +105,10 @@ public static class ShareProbe {
     }
 
     public static void Run(string dir, string run, int limitSeconds) {
-        SetProcessDPIAware();
+        // Per-monitor v2 (-4): a system-aware process keeps its logon DPI and sees a reconnect at
+        // 200% as a scaled-down screen, while the mouse hook still reports physical pixels.
+        bool pmv2 = SetProcessDpiAwarenessContext(new IntPtr(-4));
+        if (!pmv2) SetProcessDPIAware();
         Directory.CreateDirectory(dir);
         log = new StreamWriter(Path.Combine(dir, run + ".log"), true, new UTF8Encoding(false));
         Application.EnableVisualStyles();
@@ -127,7 +136,7 @@ public static class ShareProbe {
         anim.Tick += (s, e) => { frame++; form.Invalidate(new Rectangle(0, 80, form.ClientSize.Width, 40)); };
         IntPtr kh = SetWindowsHookEx(13, keyProc, GetModuleHandle(null), 0);
         IntPtr mh = SetWindowsHookEx(14, mouseProc, GetModuleHandle(null), 0);
-        Log("start run=" + run + " keyhook=" + (kh != IntPtr.Zero ? 1 : 0) + " mousehook=" + (mh != IntPtr.Zero ? 1 : 0));
+        Log("start run=" + run + " pmv2=" + (pmv2 ? 1 : 0) + " keyhook=" + (kh != IntPtr.Zero ? 1 : 0) + " mousehook=" + (mh != IntPtr.Zero ? 1 : 0));
         poll.Start();
         anim.Start();
         Application.Run(form);

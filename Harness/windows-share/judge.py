@@ -143,7 +143,9 @@ def judge_row(name, seg, mac_events):
         checks["mouse_released"] = mouse_idx(seg, "lup") is not None
     elif name.startswith("K"):
         taps = [e for e in keys(seg) if e["vk"] in TAPS and e["dir"] == "down"]
-        want = 2 if name.startswith(("K5-", "K13-")) else 1
+        # K12: 104 goes down, then the viewer loses input before its up. The tap is formed on the up
+        # (or after Ctrl), i.e. after the revoke, so a revoked viewer must produce none.
+        want = 2 if name.startswith(("K5-", "K13-")) else 0 if name.startswith("K12-") else 1
         checks["taps"] = len(taps)
         checks["taps_expected"] = want
         checks["taps_ok"] = len(taps) == want
