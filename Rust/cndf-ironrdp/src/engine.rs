@@ -656,16 +656,14 @@ fn deliver(
     repeats: &Mutex<Repeats>,
 ) {
     let mut frame = Frame::default();
-    let mut batch = Instant::now();
     let mut pending = None;
     while let Some(update) = pending.take().or_else(|| updates.blocking_recv()) {
         match update {
             Output::Rdp(RdpOutputEvent::DesktopUpdate(update)) => {
                 if frame.changes_size(&update) {
                     frame.publish(connection, false);
-                    batch = Instant::now();
                 }
-                let bytes = match frame.compose(&update) {
+                let bytes = match frame.compose(update) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         connection.stop.store(true, Ordering::Release);
@@ -695,9 +693,9 @@ fn deliver(
             },
         }
         pending = updates.try_recv().ok();
-        if pending.is_none() || batch.elapsed() >= Duration::from_millis(16) {
+        let backlog = matches!(pending, Some(Output::Rdp(RdpOutputEvent::DesktopUpdate(_))));
+        if frame.ready(backlog) {
             frame.publish(connection, false);
-            batch = Instant::now();
         }
     }
     connection.connected.store(false, Ordering::Release);
@@ -1094,6 +1092,23 @@ mod tests {
         failures: Vec<(CNDFIronFailureKind, u32, CNDFIronStage, String)>,
         disconnects: Vec<(CNDFIronDisconnectKind, u32)>,
         ended: bool,
+        frames_before_end: usize,
+    }
+
+    extern "C" fn host_frame(
+        _: u64,
+        _: *const u8,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: CNDFIronRect,
+        _: u64,
+        context: *mut c_void,
+    ) {
+        let host = unsafe { &mut *context.cast::<Host>() };
+        if !host.ended {
+            host.frames_before_end += 1;
+        }
     }
 
     extern "C" fn host_log(
@@ -1172,6 +1187,93 @@ mod tests {
             gate: Mutex::default(),
             closed: AtomicBool::new(false),
         })
+    }
+
+    fn framed_connection(host: &mut Host) -> Arc<Connection> {
+        let mut table = host_table(host);
+        table.frame = Some(host_frame);
+        host_connection(Arc::new(Callbacks {
+            table,
+            gate: Mutex::default(),
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    fn tile(width: u16, x: u16, pixels: usize) -> Output {
+        let update = ironrdp_client::rdp::DesktopUpdate::new(
+            vec![0xff00_0000; pixels],
+            std::num::NonZeroU16::new(width).unwrap(),
+            std::num::NonZeroU16::new(1).unwrap(),
+            ironrdp_pdu::geometry::InclusiveRectangle {
+                left: x,
+                right: x + pixels as u16 - 1,
+                top: 0,
+                bottom: 0,
+            },
+        )
+        .unwrap();
+        Output::Rdp(RdpOutputEvent::DesktopUpdate(update))
+    }
+
+    fn marked(output: Output) -> Output {
+        let Output::Rdp(RdpOutputEvent::DesktopUpdate(update)) = output else {
+            unreachable!()
+        };
+        Output::Rdp(RdpOutputEvent::DesktopUpdate(update.with_frame_end()))
+    }
+
+    // Finding m4-cpu shadow 194 vs 97: the first tile of a server frame arriving more than
+    // 16 ms after the last publish was published alone, so each frame was published twice.
+    #[test]
+    fn multi_region_frame_publishes_once() {
+        const TILES: u16 = 260;
+        let mut host = Host::default();
+        let connection = framed_connection(&mut host);
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let (output, updates) = async_channel::channel(usize::from(TILES) + 1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats)
+            });
+            output
+                .blocking_send(marked(tile(TILES, 0, TILES.into())))
+                .unwrap();
+            while lock(&connection.statistics).frames_delivered != 1 {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            for x in 0..TILES {
+                let update = tile(TILES, x, 1);
+                let update = if x == TILES - 1 { marked(update) } else { update };
+                output.blocking_send(update).unwrap();
+            }
+            drop(output);
+        });
+        assert_eq!(lock(&connection.statistics).frames_delivered, 2);
+        assert_eq!(lock(&connection.statistics).updates_received, 261);
+    }
+
+    #[test]
+    fn terminated_publishes_an_unfinished_batch_once() {
+        let mut host = Host::default();
+        let connection = framed_connection(&mut host);
+        let repeats = Arc::<Mutex<Repeats>>::default();
+        let (output, updates) = async_channel::channel(4);
+        output.try_send(tile(2, 0, 2)).unwrap();
+        output
+            .try_send(Output::Rdp(RdpOutputEvent::Terminated(Ok(
+                ironrdp_session::GracefulDisconnectReason::ServerInitiated,
+            ))))
+            .unwrap();
+        drop(output);
+        deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
+
+        assert_eq!(host.frames_before_end, 1);
+        assert_eq!(lock(&connection.statistics).frames_delivered, 1);
+        assert_eq!(
+            host.disconnects,
+            [(CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER, 0)]
+        );
     }
 
     #[derive(Debug)]
