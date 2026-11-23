@@ -530,7 +530,7 @@ private func runIteration(
         redirectedFolderName: driveURL.map { _ in "Home" },
         audioPlaybackMode: audioMode,
         logFileURL: logURL,
-        logLevel: .info,
+        logLevel: RDPLogLevel(rawValue: run.logLevel ?? "info") ?? .info,
         networkAutoDetect: run.networkAutoDetect ?? false,
         graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic,
         engine: engine,
@@ -597,6 +597,19 @@ private func runIteration(
             result.steps.append("waitFirstFrame:\(ok ? "ok" : "timeout")")
             // Keep the tap only where a step needs it: its CVPixelBuffer copy costs CPU.
             view.onRenderedFrame = nil
+            if !ok { aborted = true }
+        case "waitLogin":
+            // The run script writes this connection's server-side login result ("ok" or
+            // "refused") to <work>/<run id>-<iteration>.login; nothing is typed before it.
+            let marker = workDirectory.appendingPathComponent("\(run.id)-\(iteration).login")
+            var outcome = ""
+            _ = waitUntil(step.timeout ?? 30) {
+                outcome = ((try? String(contentsOf: marker, encoding: .utf8)) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return !outcome.isEmpty || delegate.currentFailure != nil
+            }
+            let ok = outcome == (step.text ?? "ok")
+            result.steps.append("waitLogin:\(outcome.isEmpty ? "none" : outcome):\(ok ? "ok" : "failed")")
             if !ok { aborted = true }
         case "idle":
             drainRunLoop(step.seconds ?? 5)

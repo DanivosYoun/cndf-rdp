@@ -29,6 +29,8 @@ struct HarnessRun: Decodable {
     var networkAutoDetect: Bool?
     /// "standard" or "korean" (RDPKeyboardProfile raw values). Default "standard".
     var keyboardProfile: String?
+    /// RDPLogLevel raw value of the session log ("trace" ... "off"). Default "info".
+    var logLevel: String?
     /// Window content size in points.
     var window: HarnessSize?
     /// Repeat the whole step list this many times (fresh window/view each time). Default 1.
@@ -46,7 +48,7 @@ struct HarnessRun: Decodable {
     enum CodingKeys: String, CodingKey {
         case id, host, port, username, passwordEnv, domain, graphicsMode, networkAutoDetect, window, steps, expect
         case engine, expectByEngine, enableClipboard, shareHome, audioMode, fixturePort
-        case promptAnswer, keyboardProfile
+        case promptAnswer, keyboardProfile, logLevel
         case repeatCount = "repeat"
     }
 }

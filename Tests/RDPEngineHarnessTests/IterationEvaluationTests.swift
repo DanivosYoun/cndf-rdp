@@ -129,6 +129,15 @@ final class IterationEvaluationTests: XCTestCase {
         ])
     }
 
+    // Design iron-autologon-log: a login the server did not confirm fails the iteration.
+    func testUnconfirmedLoginFailsTheIteration() {
+        var iteration = IterationResult(iteration: 1)
+        iteration.steps = ["connect:ok", "waitConnected:ok", "waitFirstFrame:ok", "waitLogin:refused:failed", "cpuWindow:skipped"]
+        XCTAssertEqual(evaluate(iteration, against: nil), ["iteration 1: waitLogin:refused:failed"])
+        iteration.steps[3] = "waitLogin:ok:ok"
+        XCTAssertEqual(evaluate(iteration, against: nil), [])
+    }
+
     func testUnexpectedDisconnectFailsBeforeShutdown() {
         var iteration = IterationResult(iteration: 1)
         iteration.disconnectReason = "error"

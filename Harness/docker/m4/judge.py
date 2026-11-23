@@ -14,8 +14,16 @@ Checks (each pass / fail / not-run; the verdict passes only when every check pas
   cpu       median IronRDP window CPU (user + system) <= 1.2 x median FreeRDP window CPU
   codec     the FreeRDP session log's Graphics summary counted the expected codec (> 0), so
             the comparison is really about that codec
-  hardware  IronRDP log: "H.264 decoder: VideoToolbox hardware" and summary hardware=yes
-  failures  IronRDP log: H.264 summary failures=0
+  run       the run script collected every engine's result and the harness exited 0
+  harness   every iteration of every engine that ran: no harness failure, connected, no
+            failed step, exactly one connection, no password in the session log
+  summary   every IronRDP iteration's own <run id>-<iteration>.session.log has exactly one
+            intact "H.264 summary" line with pictures > 0 and sessions > 0 (design
+            iron-autologon-log); a missing, malformed or repeated line fails that iteration,
+            and another iteration's line never stands in for it
+  hardware  every IronRDP iteration: summary hardware=yes
+  failures  every IronRDP iteration: summary failures=0
+An IronRDP that did not run leaves summary/hardware/failures not run (verdict incomplete).
 Diagnostics (not gating): each engine vs the xwd screen, xwd vs the animator's reference
 picture, FreeRDP run-to-run PSNR (encoder noise floor), per-half Y/Cb/Cr PSNR so a chroma
 error confined to the right half (the design's first falsification point) is visible.
@@ -180,12 +188,21 @@ def load_engine(result_path):
         if final:
             frames.append((it["iteration"], read_ppm(os.path.join(frames_dir, final["file"]))))
     logs = []
+    per_iteration = []
     for run in result["runs"]:
         for it in run["iterations"]:
             path = os.path.join(frames_dir, f"{run['id']}-{it['iteration']}.session.log")
+            log = None
             if os.path.exists(path):
                 with open(path, errors="replace") as f:
-                    logs.append(f.read())
+                    log = f.read()
+                logs.append(log)
+            per_iteration.append({"name": f"{run['id']}-{it['iteration']}", "result": it, "log": log})
+    errors_path = os.path.join(frames_dir, "collect-errors.txt")
+    collect_errors = []
+    if os.path.exists(errors_path):
+        with open(errors_path) as f:
+            collect_errors = [line.strip() for line in f if line.strip()]
     return {
         "engine": result.get("engine"),
         "passed": result.get("passed"),
@@ -194,7 +211,15 @@ def load_engine(result_path):
         "framesInWindow": [w["framesReceived"] for it in iterations for w in it.get("cpuWindows", [])[:1]],
         "frames": frames,
         "logs": logs,
+        "perIteration": per_iteration,
+        "collectErrors": collect_errors,
     }
+
+
+def missing_engine(errors):
+    """An engine whose result the run script could not collect."""
+    return {"engine": None, "passed": False, "iterations": 0, "cpuWindowMs": [], "framesInWindow": [],
+            "frames": [], "logs": [], "perIteration": [], "collectErrors": errors}
 
 
 SUMMARY_FREERDP = re.compile(r"Graphics: summary .*?AVC420=(\d+) AVC444=(\d+) AVC444v2=(\d+)")
@@ -211,6 +236,52 @@ def freerdp_codec_counts(logs):
             for key, value in zip(totals, m.groups()):
                 totals[key] += int(value)
     return totals if seen else None
+
+
+SUMMARY_LINE = re.compile(r"H\.264 summary(.*)$", re.M)
+SUMMARY_FIELDS = re.compile(r" pictures=(\d+) failures=(\d+) idr_waits=(\d+) sessions=(\d+) hardware=(yes|no|mixed|unknown)")
+
+
+def iteration_h264(log):
+    """(summary dict or None, problem or None) for one iteration's session log."""
+    if log is None:
+        return None, "no session log"
+    lines = SUMMARY_LINE.findall(log)
+    if not lines:
+        return None, "no H.264 summary"
+    if len(lines) > 1:
+        return None, f"{len(lines)} H.264 summaries"
+    m = SUMMARY_FIELDS.fullmatch(lines[0])
+    if m is None:
+        return None, "malformed H.264 summary"
+    pictures, failures, idr_waits, sessions = (int(v) for v in m.groups()[:4])
+    summary = {"pictures": pictures, "failures": failures, "idrWaits": idr_waits, "sessions": sessions,
+               "hardware": m.group(5)}
+    if pictures == 0:
+        return summary, "pictures=0"
+    if sessions == 0:
+        return summary, "sessions=0"
+    return summary, None
+
+
+def harness_problems(engine):
+    """Iterations the harness itself did not pass, or that connected more than once."""
+    problems = []
+    for it in engine["perIteration"]:
+        r = it["result"]
+        bad = []
+        if r.get("failure"):
+            bad.append(f"failure={r['failure']}")
+        if not r.get("connected"):
+            bad.append("not connected")
+        if r.get("connectRises", 1) != 1:
+            bad.append(f"connectRises={r.get('connectRises')}")
+        if r.get("passwordFoundInSessionLog"):
+            bad.append("password in session log")
+        bad += [step for step in r.get("steps", []) if step.split(" ")[0].endswith((":failed", ":unknown"))]
+        if bad:
+            problems.append(f"{it['name']}: {', '.join(bad)}")
+    return problems
 
 
 def ironrdp_h264(logs):
@@ -277,17 +348,29 @@ def evaluate(case, codec, freerdp, ironrdp, truth=None, reference=None):
     else:
         checks["codec"] = check("pass" if counts.get(codec, 0) > 0 else "fail", f"{codec}={counts.get(codec, 0)}")
 
-    h264 = ironrdp_h264(ironrdp["logs"]) if ironrdp else None
-    report["ironrdpH264"] = h264
-    if h264 is None:
-        reason = "no IronRDP run" if ironrdp is None else "no H.264 decoder/summary lines in the IronRDP logs (needs K1)"
-        checks["hardware"] = check("not-run", reason)
-        checks["failures"] = check("not-run", reason)
+    ran = [e for e in (freerdp, ironrdp) if e is not None]
+    collect = [f"{e.get('engine') or '?'}: {err}" for e in ran for err in e["collectErrors"]]
+    checks["run"] = check("fail" if collect else "pass", "; ".join(collect) or "all results collected")
+    problems = [p for e in ran for p in harness_problems(e)]
+    checks["harness"] = check("fail" if problems else "pass", "; ".join(problems) or "every iteration passed")
+
+    report["ironrdpH264"] = ironrdp_h264(ironrdp["logs"]) if ironrdp else None
+    if ironrdp is None:
+        for name in ("summary", "hardware", "failures"):
+            checks[name] = check("not-run", "no IronRDP run")
     else:
-        hw_ok = h264["decoderLines"] == ["hardware"] and h264["summaryHardware"] == ["yes"]
-        checks["hardware"] = check("pass" if hw_ok else "fail",
-                                   f"decoder={h264['decoderLines']} summary={h264['summaryHardware']}")
-        checks["failures"] = check("pass" if h264["failures"] == 0 else "fail", f"failures={h264['failures']}")
+        per = [(it["name"], *iteration_h264(it["log"])) for it in ironrdp["perIteration"]]
+        report["ironrdpIterations"] = [{"iteration": n, "summary": s, "problem": p} for n, s, p in per]
+        if not per:
+            for name in ("summary", "hardware", "failures"):
+                checks[name] = check("fail", "IronRDP ran no iteration")
+        else:
+            bad = [f"{n}: {p}" for n, _, p in per if p]
+            checks["summary"] = check("fail" if bad else "pass", "; ".join(bad) or f"{len(per)} iterations, one summary each")
+            hw = [f"{n}: hardware={s['hardware'] if s else 'none'}" for n, s, _ in per if not s or s["hardware"] != "yes"]
+            checks["hardware"] = check("fail" if hw else "pass", "; ".join(hw) or "hardware=yes in every iteration")
+            fl = [f"{n}: failures={s['failures'] if s else 'none'}" for n, s, _ in per if not s or s["failures"] != 0]
+            checks["failures"] = check("fail" if fl else "pass", "; ".join(fl) or "failures=0 in every iteration")
 
     diagnostics = {}
     if truth is not None:
@@ -352,21 +435,34 @@ def right_half_chroma_shift(image, shift):
     return Image(w, h, out)
 
 
-def write_case(root, engine, run_id, frames, cpu_ms, log_lines):
+def write_case(root, engine, run_id, frames, cpu_ms, log_lines, logs=None, results=None, errors=None):
+    """Writes one engine's result, frames and session logs. `logs` gives each iteration's own
+    lines (None: no session log file), `results` fields to change per iteration, `errors` a
+    collect-errors.txt."""
     directory = os.path.join(root, engine)
     os.makedirs(directory)
     iterations = []
     for i, (image, cpu) in enumerate(zip(frames, cpu_ms), start=1):
         name = f"{run_id}-{i}.final.ppm"
         write_ppm(os.path.join(directory, name), image)
-        with open(os.path.join(directory, f"{run_id}-{i}.session.log"), "w") as f:
-            f.write("\n".join(log_lines) + "\n")
-        iterations.append({"iteration": i, "cpuWindows": [{"seconds": 9, "userMs": cpu * 0.8, "systemMs": cpu * 0.2,
-                                                           "framesReceived": 97}],
-                           "finalFrame": {"file": name, "size": [image.width, image.height], "sha256": ""}})
+        lines = log_lines if logs is None else logs[i - 1]
+        if lines is not None:
+            with open(os.path.join(directory, f"{run_id}-{i}.session.log"), "w") as f:
+                f.write("\n".join(lines) + "\n")
+        iteration = {"iteration": i, "cpuWindows": [{"seconds": 9, "userMs": cpu * 0.8, "systemMs": cpu * 0.2,
+                                                     "framesReceived": 97}],
+                     "finalFrame": {"file": name, "size": [image.width, image.height], "sha256": ""},
+                     "connected": True, "connectRises": 1, "passwordFoundInSessionLog": False,
+                     "steps": ["connect:ok", "waitConnected:ok", "waitFirstFrame:ok", "waitLogin:ok:ok",
+                               "cpuWindow:97 frames", "dumpFrame:ok", "shutdown:ok"]}
+        iteration.update((results or {}).get(i, {}))
+        iterations.append(iteration)
     path = os.path.join(directory, f"{engine}.json")
     with open(path, "w") as f:
         json.dump({"engine": engine, "passed": True, "runs": [{"id": run_id, "iterations": iterations}]}, f)
+    if errors:
+        with open(os.path.join(directory, "collect-errors.txt"), "w") as f:
+            f.write("\n".join(errors) + "\n")
     return path
 
 
@@ -375,46 +471,78 @@ def selftest():
     width, height = 256, 128
     ref = reference_image(width, height)
     free_log = ["Graphics: summary rdpgfx=10.7 mode=auto AVC420=0 AVC444=0 AVC444v2=97 surfaceCommands:x."]
-    iron_ok = ["H.264 decoder: VideoToolbox hardware 256x128 range=full",
-               "H.264 summary pictures=97 failures=0 idr_waits=0 sessions=1 hardware=yes"]
+    decoder = "2026-11-23T02:00:00Z H.264 decoder: VideoToolbox hardware 256x128 range=full"
+    good = "2026-11-23T02:00:09Z H.264 summary pictures=97 failures=0 idr_waits=0 sessions=1 hardware=yes"
+    iron_ok = [decoder, good]
+    h264 = {"summary", "hardware", "failures"}
+    frames = lambda: [perturbed(ref, s, 1) for s in (7, 8, 9)]  # noqa: E731
+    # name, iron frames, iron cpu, iron log, codec, expected verdict, expected failing checks, write_case extras
     cases = [
-        # name, iron frames, iron cpu, iron log, codec, expected verdict, expected failing checks
-        ("pass: independent encodes, cpu 1.0x", [perturbed(ref, s, 1) for s in (7, 8, 9)], 100, iron_ok, "AVC444v2", "pass", set()),
-        ("pass: cpu exactly 1.2x", [perturbed(ref, s, 1) for s in (7, 8, 9)], 120, iron_ok, "AVC444v2", "pass", set()),
-        ("fail: cpu 1.3x", [perturbed(ref, s, 1) for s in (7, 8, 9)], 130, iron_ok, "AVC444v2", "fail", {"cpu"}),
-        ("fail: right-half chroma shifted 16", [right_half_chroma_shift(ref, 16)] * 3, 100, iron_ok, "AVC444v2", "fail", {"psnr"}),
+        ("pass: independent encodes, cpu 1.0x", frames(), 100, iron_ok, "AVC444v2", "pass", set(), {}),
+        ("pass: cpu exactly 1.2x", frames(), 120, iron_ok, "AVC444v2", "pass", set(), {}),
+        ("fail: cpu 1.3x", frames(), 130, iron_ok, "AVC444v2", "fail", {"cpu"}, {}),
+        ("fail: right-half chroma shifted 16", [right_half_chroma_shift(ref, 16)] * 3, 100, iron_ok, "AVC444v2", "fail", {"psnr"}, {}),
         ("fail: frame size differs", [Image(width - 16, height, ref.rgb[:(width - 16) * height * 3])] * 3, 100, iron_ok,
-         "AVC444v2", "fail", {"psnr"}),
-        ("fail: software decoder, 2 failures", [perturbed(ref, s, 1) for s in (7, 8, 9)], 100,
+         "AVC444v2", "fail", {"psnr"}, {}),
+        ("fail: software decoder, 2 failures", frames(), 100,
          ["H.264 decoder: VideoToolbox software 256x128 range=full",
           "H.264 summary pictures=95 failures=2 idr_waits=1 sessions=2 hardware=no"], "AVC444v2", "fail",
-         {"hardware", "failures"}),
-        ("fail: expected codec not used", [perturbed(ref, s, 1) for s in (7, 8, 9)], 100, iron_ok, "AVC420", "fail", {"codec"}),
-        ("incomplete: no IronRDP run", None, None, None, "AVC444v2", "incomplete", set()),
-        ("incomplete: IronRDP without K1 log lines", [perturbed(ref, s, 1) for s in (7, 8, 9)], 100, [], "AVC444v2",
-         "incomplete", set()),
+         {"hardware", "failures"}, {}),
+        ("fail: expected codec not used", frames(), 100, iron_ok, "AVC420", "fail", {"codec"}, {}),
+        ("incomplete: no IronRDP run", None, None, None, "AVC444v2", "incomplete", set(), {}),
+        # Design iron-autologon-log: each iteration needs its own intact summary.
+        ("fail: IronRDP logs without summaries", frames(), 100, [decoder], "AVC444v2", "fail", h264, {}),
+        ("fail: one iteration's summary deleted", frames(), 100, None, "AVC444v2", "fail", h264,
+         {"logs": [iron_ok, [decoder], iron_ok]}),
+        ("fail: one iteration's summary corrupted", frames(), 100, None, "AVC444v2", "fail", h264,
+         {"logs": [iron_ok, [decoder, good.replace("sessions=1", "sessions=one")], iron_ok]}),
+        ("fail: one iteration's summary duplicated", frames(), 100, None, "AVC444v2", "fail", h264,
+         {"logs": [iron_ok, [decoder, good, good], iron_ok]}),
+        ("fail: a missing summary filled by another iteration's duplicate", frames(), 100, None, "AVC444v2", "fail",
+         h264, {"logs": [iron_ok, [decoder], [decoder, good, good]]}),
+        ("fail: one iteration's session log missing", frames(), 100, None, "AVC444v2", "fail", h264,
+         {"logs": [iron_ok, None, iron_ok]}),
+        ("fail: pictures=0", frames(), 100, None, "AVC444v2", "fail", {"summary"},
+         {"logs": [iron_ok, [decoder, good.replace("pictures=97", "pictures=0")], iron_ok]}),
+        ("fail: failures=1", frames(), 100, None, "AVC444v2", "fail", {"failures"},
+         {"logs": [iron_ok, [decoder, good.replace("failures=0", "failures=1")], iron_ok]}),
+        ("fail: hardware=mixed", frames(), 100, None, "AVC444v2", "fail", {"hardware"},
+         {"logs": [iron_ok, [decoder, good.replace("hardware=yes", "hardware=mixed")], iron_ok]}),
+        ("fail: an iteration the harness failed", frames(), 100, iron_ok, "AVC444v2", "fail", {"harness"},
+         {"results": {2: {"failure": "connectThrew"}}}),
+        ("fail: an iteration with two connections", frames(), 100, iron_ok, "AVC444v2", "fail", {"harness"},
+         {"results": {3: {"connectRises": 2}}}),
+        ("fail: login not confirmed before the keys", frames(), 100, iron_ok, "AVC444v2", "fail", {"harness"},
+         {"results": {1: {"steps": ["connect:ok", "waitConnected:ok", "waitFirstFrame:ok",
+                                    "waitLogin:refused:failed", "cpuWindow:skipped", "shutdown:ok"]}}}),
+        ("fail: the run script reported a collection error", frames(), 100, iron_ok, "AVC444v2", "fail", {"run"},
+         {"errors": ["rdp-engine-harness exit 1"]}),
+        ("fail: IronRDP result not collected", "missing", None, None, "AVC444v2", "fail", {"run"} | h264, {}),
     ]
     failures = 0
-    for name, iron_frames, iron_cpu, iron_log, codec, want, want_failing in cases:
+    for name, iron_frames, iron_cpu, iron_log, codec, want, want_failing, extra in cases:
         with tempfile.TemporaryDirectory() as d:
             free = write_case(d, "freerdp", "case", [perturbed(ref, s, 1) for s in (1, 2, 3)], [100, 90, 110], free_log)
-            iron = None if iron_frames is None else write_case(d, "ironrdp", "case", iron_frames,
-                                                                [iron_cpu] * 3, iron_log)
+            if iron_frames == "missing":
+                iron_engine = missing_engine(["result.json not collected"])
+            elif iron_frames is None:
+                iron_engine = None
+            else:
+                iron_engine = load_engine(write_case(d, "ironrdp", "case", iron_frames, [iron_cpu] * 3, iron_log, **extra))
             truth_path = os.path.join(d, "screen.xwd")
             write_xwd(truth_path, ref)
             truth = read_xwd(truth_path)
-            report = evaluate(name, codec, load_engine(free), None if iron is None else load_engine(iron),
-                              truth=truth, reference=ref)
+            report = evaluate(name, codec, load_engine(free), iron_engine, truth=truth, reference=ref)
         failing = {k for k, c in report["checks"].items() if c["status"] == "fail"}
         ok = (report["verdict"] == want and failing == want_failing and "warnings" not in report
               and report["diagnostics"]["screenVsReferenceDb"] == "inf")
         failures += not ok
-        extra = ""
+        extra_text = ""
         if "regionPsnrEngines" in report and report["regionPsnrEngines"]:
             r = report["regionPsnrEngines"]
-            extra = f" left Cb/Cr {r['left']['Cb']}/{r['left']['Cr']} right Cb/Cr {r['right']['Cb']}/{r['right']['Cr']}"
+            extra_text = f" left Cb/Cr {r['left']['Cb']}/{r['left']['Cr']} right Cb/Cr {r['right']['Cb']}/{r['right']['Cr']}"
         print(f"{'ok  ' if ok else 'FAIL'} {name}: verdict={report['verdict']} failing={sorted(failing)} "
-              f"psnr={report.get('psnrEnginesDb')} cpuRatio={report.get('cpuRatio')}{extra}")
+              f"psnr={report.get('psnrEnginesDb')} cpuRatio={report.get('cpuRatio')}{extra_text}")
     # The FreeRDP reference itself off the screen (seen on B2 1104x704): verdict unchanged, warning set.
     with tempfile.TemporaryDirectory() as d:
         shifted = right_half_chroma_shift(ref, 16)
@@ -447,7 +575,15 @@ def main():
     if args.command == "selftest":
         return selftest()
     freerdp = load_engine(args.freerdp)
-    ironrdp = load_engine(args.ironrdp) if args.ironrdp and os.path.exists(args.ironrdp) else None
+    ironrdp = None
+    if args.ironrdp and os.path.exists(args.ironrdp):
+        ironrdp = load_engine(args.ironrdp)
+    elif args.ironrdp:
+        # The run script records why an engine that ran left no result next to where it belongs.
+        errors_path = os.path.join(os.path.dirname(os.path.abspath(args.ironrdp)), "collect-errors.txt")
+        if os.path.exists(errors_path):
+            with open(errors_path) as f:
+                ironrdp = missing_engine([line.strip() for line in f if line.strip()] + ["no result.json"])
     truth = read_xwd(args.truth) if args.truth else None
     reference = reference_image(truth.width, truth.height) if truth else None
     report = evaluate(args.case, args.codec, freerdp, ironrdp, truth=truth, reference=reference)

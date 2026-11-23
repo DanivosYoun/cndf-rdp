@@ -15,6 +15,7 @@
         { "op": "connect" },
         { "op": "waitConnected", "timeout": 30 },
         { "op": "waitFirstFrame", "timeout": 30 },
+        { "op": "waitLogin", "timeout": 30 },
         { "op": "idle", "seconds": 3 },
         { "op": "cpuWindow", "seconds": 9, "scanCode": 30 },
         { "op": "dumpFrame", "seconds": 2, "timeout": 15, "scanCode": 48 },

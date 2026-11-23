@@ -5,6 +5,7 @@
 #   HARNESS_BATCH=<batch8> Scripts/run-m4-acceptance.sh all       # images, Mac build, every case, judge, clean up
 #   HARNESS_BATCH=<batch8> Scripts/run-m4-acceptance.sh case <c>  # one case: b2-1280x800 | b2-1104x704 | b3-1280x720
 #   Scripts/run-m4-acceptance.sh selftest                          # judge on synthetic inputs only (no servers)
+#   HARNESS_BATCH=<batch8> Scripts/run-m4-acceptance.sh login     # B3 IronRDP autologon, right and wrong password
 #   HARNESS_BATCH=<batch8> Scripts/run-m4-acceptance.sh down      # remove containers, tunnel, Mac dir, secrets
 #
 # Cases (server -> codec the FreeRDP session log must count):
@@ -15,7 +16,15 @@
 # Harness/docker/scenarios/m4-<case>.json runs 5 times (connect, first frame, `a` = ~8 s colour
 # change measured by cpuWindow, `b` = final picture kept by dumpFrame); then xwd captures the
 # server screen. Harness/docker/m4/judge.py compares PSNR(IronRDP, FreeRDP) >= 40 dB and
-# median CPU IronRDP <= 1.2 x FreeRDP, plus codec and (IronRDP K1 log) hardware/failures.
+# median CPU IronRDP <= 1.2 x FreeRDP, plus codec, harness success and, per IronRDP iteration,
+# its own H.264 summary (hardware/failures). A harness exit or a result the script could not
+# collect is written to <engine>/collect-errors.txt and fails the verdict.
+# B3 logs on with the scenario password (Client Info autologon, no typing): the script watches
+# the server's login results and hands each to its iteration (<run id>-<n>.login on the Mac),
+# and the scenario's waitLogin step sends no key before "ok".
+# `login` connects IronRDP to B3 once with the right and once with a wrong one-time password
+# (session log at TRACE), checks the server's login result and the X session, and searches
+# both passwords in every log and result it copied (plus a planted control).
 #
 # Environment:
 #   HARNESS_BATCH    label value for roster.batch (required except for selftest)
@@ -64,9 +73,21 @@ check_memory() {
   (( avail >= 20 )) || { log "less than 20G available; not starting servers"; exit 1; }
 }
 
+# Builds the server images the given cases use.
 images() {
-  docker build --label "${LABEL}" -t "${B2_IMAGE}" "${ROOT_DIR}/Harness/docker/b2-freerdp-shadow"
-  docker build --label "${LABEL}" -t "${B3_IMAGE}" -f "${M4_DIR}/b3-xrdp-gfx.Dockerfile" "${M4_DIR}"
+  local case
+  for case in "$@"; do
+    if [[ "${case}" == b2-* ]]; then
+      docker build --label "${LABEL}" -t "${B2_IMAGE}" "${ROOT_DIR}/Harness/docker/b2-freerdp-shadow"
+      break
+    fi
+  done
+  for case in "$@"; do
+    if [[ "${case}" == b3-* ]]; then
+      docker build --label "${LABEL}" -t "${B3_IMAGE}" -f "${M4_DIR}/b3-xrdp-gfx.Dockerfile" "${M4_DIR}"
+      break
+    fi
+  done
 }
 
 secrets() {
@@ -76,6 +97,7 @@ secrets() {
     {
       echo "HARNESS_B2_PASS=$(openssl rand -hex 12)"
       echo "HARNESS_B3GFX_PASS=$(openssl rand -hex 12)"
+      echo "HARNESS_B3GFX_WRONG=$(openssl rand -hex 12)"
     } > "${WORK}/secrets.env"
     chmod 600 "${WORK}/secrets.env"
   fi
@@ -147,6 +169,7 @@ start_server() {
       pause 5
       ;;
     b3-*)
+      # One B3 server per case; b3-login uses the same image.
       docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
       docker run -d --label "${LABEL}" --name "$(name b3)" -m 4g -p "${BIND_IP}:${PORT_B3}:3389" \
         -e HARNESS_USER=harness -e HARNESS_PASS="${HARNESS_B3GFX_PASS}" "${B3_IMAGE}" >/dev/null
@@ -169,13 +192,55 @@ capture_screen() {
   esac
 }
 
+# B3 login results the server logged so far: ok (sesman logged the user in) or refused.
+login_count() {
+  local pattern
+  case "$1" in
+    ok) pattern='Received sys login status for harness : logged in' ;;
+    refused) pattern='User does not exist, or could not be authenticated' ;;
+  esac
+  docker exec "$(name b3)" sh -c "cat /var/log/xrdp.log /var/log/xrdp-sesman.log 2>/dev/null | grep -cF '${pattern}'" \
+    2>/dev/null || echo 0
+}
+
+# Hands each new B3 login result to the next iteration of run $1 ($2 iterations): writes
+# <run id>-<n>.login ("ok" or "refused") into the Mac work directory. Stops at the first
+# connection without a result within 40 s; its iteration's waitLogin then fails.
+login_markers() {
+  local run_id="$1" iterations="$2" i ok refused result
+  local ok_base refused_base
+  ok_base="$(login_count ok)" refused_base="$(login_count refused)"
+  for ((i = 1; i <= iterations; i++)); do
+    result=""
+    for _ in $(seq 1 80); do
+      ok="$(login_count ok)" refused="$(login_count refused)"
+      if (( ok > ok_base )); then result=ok; ok_base="${ok}"; break; fi
+      if (( refused > refused_base )); then result=refused; refused_base="${refused}"; break; fi
+      pause 0.5
+    done
+    [[ -n "${result}" ]] || { log "login ${run_id}-${i}: no server result"; return 0; }
+    log "login ${run_id}-${i}: ${result}"
+    mac "mkdir -p \$HOME/${MAC_DIR}/work && echo ${result} > \$HOME/${MAC_DIR}/work/${run_id}-${i}.login"
+  done
+}
+
 # One engine through one case on the Mac; copies the result, final frames and session logs.
+# $3 overrides the scenario (default m4-<case>).
 run_engine() {
-  local case="$1" engine="$2" scenario="m4-$1" out="${WORK}/results/$1/$2"
+  local case="$1" engine="$2" scenario="${3:-m4-$1}" out="${WORK}/results/$1/$2" watcher="" errors
+  errors="${out}/collect-errors.txt"
   mkdir -p "${out}"
+  rm -f "${errors}"
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${ROOT_DIR}/Harness/docker/scenarios/${scenario}.json" \
     "${MAC}:${MAC_DIR}/scenarios/"
   log "case ${case} engine ${engine}"
+  if [[ "${case}" == b3-* ]]; then
+    local run_id iterations
+    read -r run_id iterations < <(python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1]))["runs"][0]; print(r["id"], r.get("repeat", 1))' \
+      "${ROOT_DIR}/Harness/docker/scenarios/${scenario}.json")
+    login_markers "${run_id}" "${iterations}" &
+    watcher=$!
+  fi
   set +e
   mac "set -a; source \$HOME/${MAC_DIR}/secrets.env; set +a; M=\$HOME/${MAC_DIR}
     rm -rf \$M/home \$M/work; mkdir -p \$M/home \$M/results \$M/work
@@ -185,10 +250,16 @@ run_engine() {
       --trust-suite cndf.rdp-engine-harness.${HARNESS_BATCH} --work-dir \$M/work --reset-trust 1 --drop-trust 1" \
     > "${out}/stdout.log" 2> "${out}/stderr.log"
   local status=$?
-  set -e
-  rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${MAC_DIR}/results/${scenario}.json" "${out}/result.json" || true
+  if [[ -n "${watcher}" ]]; then
+    kill "${watcher}" 2>/dev/null
+    wait "${watcher}" 2>/dev/null
+  fi
+  (( status == 0 )) || echo "rdp-engine-harness exit ${status}" >> "${errors}"
+  rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${MAC_DIR}/results/${scenario}.json" "${out}/result.json" \
+    || echo "result.json not collected" >> "${errors}"
   rsync -a --rsync-path=/opt/homebrew/bin/rsync --include '*.final.ppm' --include '*.session.log' --exclude '*' \
-    "${MAC}:${MAC_DIR}/work/" "${out}/" || true
+    "${MAC}:${MAC_DIR}/work/" "${out}/" || echo "frames and session logs not collected" >> "${errors}"
+  set -e
   log "case ${case} engine ${engine} exit ${status}: $(tail -1 "${out}/stdout.log" 2>/dev/null)"
 }
 
@@ -226,6 +297,56 @@ run_case() {
   return "${status}"
 }
 
+# B3 autologon (design iron-autologon-log): IronRDP with the right password must start the
+# user's X session without a key press; with a wrong one the server must refuse the login.
+# Neither password may appear in anything the run copied back.
+login_case() {
+  local dir="${WORK}/results/b3-login" status=0 problems=() ok_before x_before
+  rm -rf "${dir}"
+  mkdir -p "${dir}"
+  start_server b3-login
+  ok_before="$(login_count ok)"
+  run_engine b3-login ironrdp m4-b3-login-ok
+  mv "${dir}/ironrdp" "${dir}/right"
+  docker exec "$(name b3)" sh -c 'grep -c "X server :[0-9]* is working" /var/log/xrdp-sesman.log' > "${dir}/x-sessions.txt" 2>&1 || true
+  docker exec "$(name b3)" sh -c 'pgrep -u harness -f m4/animator.py >/dev/null && echo desktop-running || echo no-desktop' \
+    > "${dir}/desktop.txt" 2>&1 || true
+  (( $(login_count ok) == ok_before + 1 )) || problems+=("right password: server logged in $(( $(login_count ok) - ok_before )) times, expected 1")
+  grep -q desktop-running "${dir}/desktop.txt" || problems+=("right password: no desktop (animator) for the user")
+  x_before="$(login_count refused)"
+  ok_before="$(login_count ok)"
+  run_engine b3-login ironrdp m4-b3-login-refused
+  mv "${dir}/ironrdp" "${dir}/wrong"
+  (( $(login_count refused) == x_before + 1 )) || problems+=("wrong password: server refused $(( $(login_count refused) - x_before )) times, expected 1")
+  (( $(login_count ok) == ok_before )) || problems+=("wrong password: the server logged the user in")
+  docker exec "$(name b3)" sh -c 'tail -200 /var/log/xrdp.log; tail -200 /var/log/xrdp-sesman.log' > "${dir}/server.log" 2>&1 || true
+  docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
+  for side in right wrong; do
+    [[ -s "${dir}/${side}/collect-errors.txt" ]] && problems+=("${side}: $(tr '\n' ' ' < "${dir}/${side}/collect-errors.txt")")
+  done
+  # The search must find a planted copy, or a clean result proves nothing.
+  # shellcheck disable=SC1091
+  source "${WORK}/secrets.env"
+  printf 'planted %s\n' "${HARNESS_B3GFX_WRONG}" > "${dir}/planted-control.log"
+  grep -rqF -- "${HARNESS_B3GFX_WRONG}" "${dir}/planted-control.log" || problems+=("leak search missed the planted control")
+  rm -f "${dir}/planted-control.log"
+  local secret
+  for secret in "${HARNESS_B3GFX_PASS}" "${HARNESS_B3GFX_WRONG}"; do
+    if grep -rlF -- "${secret}" "${dir}" > "${dir}/leaks.txt"; then problems+=("a password is in $(tr '\n' ' ' < "${dir}/leaks.txt")"); fi
+  done
+  rm -f "${dir}/leaks.txt"
+  python3 -I - "${dir}" "${problems[@]+"${problems[@]}"}" <<'PY'
+import json, sys
+directory, problems = sys.argv[1], sys.argv[2:]
+verdict = {"case": "b3-login", "verdict": "fail" if problems else "pass", "problems": problems}
+with open(f"{directory}/login-verdict.json", "w") as f:
+    json.dump(verdict, f, indent=2)
+print(f"b3-login: verdict={verdict['verdict']} " + "; ".join(problems))
+PY
+  (( ${#problems[@]} == 0 )) || status=1
+  return "${status}"
+}
+
 down() {
   local n
   for n in b2 b3; do
@@ -244,7 +365,7 @@ down() {
 run_cases() {
   local case status worst=0
   check_memory
-  images
+  images "$@"
   secrets
   mac_build
   tunnel_up
@@ -270,9 +391,18 @@ case "${1:-}" in
     trap down EXIT
     run_cases "$2"
     ;;
+  login)
+    trap down EXIT
+    check_memory
+    images b3-login
+    secrets
+    mac_build
+    tunnel_up
+    login_case
+    ;;
   down) down ;;
   *)
-    echo "usage: $0 all|case <case>|selftest|down" >&2
+    echo "usage: $0 all|case <case>|login|selftest|down" >&2
     exit 2
     ;;
 esac
