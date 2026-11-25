@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise the actual driver functions with synthetic server and client output.
+# Exercise the driver with fixture server and client output.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 scratch="$(mktemp -d "$root/.harness-baseline-test.XXXXXXXX")"
@@ -24,10 +24,10 @@ keyboard_layout: 0 keyboard_type: KeyboardType(4) keyboard_subtype: 0 keyboard_f
 keyboard_layout: 1042 keyboard_type: KeyboardType(8) keyboard_subtype: 3 keyboard_functional_keys_count: 12 ime_file_name: ""
 DATA
 cat > "$fixture/b3-keyboard.txt" <<'DATA'
-Loading keymap file /etc/xrdp/km-00000409.ini
-Cannot find keymap file /etc/xrdp/km-00000000.ini
-Loading keymap file /etc/xrdp/km-00000409.ini
-Loading keymap file /etc/xrdp/km-00000412.ini
+[20261125-04:05:19] [WARN ] Cannot find keymap file /etc/xrdp/km-00000000.ini
+[20261125-04:05:19] [WARN ] Cannot find keymap file /etc/xrdp/km-00000000.ini
+[20261125-04:05:19] [INFO ] Loading keymap file /etc/xrdp/km-00000409.ini
+[20261125-21:05:37] [INFO ] Loading keymap file /etc/xrdp/km-00000412.ini
 DATA
 cat > "$fixture/client-keyboard.txt" <<'DATA'
 RDP keyboard profile=korean layout=0x412 type=8 subtype=3 fn=12

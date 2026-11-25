@@ -1,4 +1,4 @@
-Loading keymap file /etc/xrdp/km-00000409.ini
+Cannot find keymap file /etc/xrdp/km-00000000.ini
 Cannot find keymap file /etc/xrdp/km-00000000.ini
 Loading keymap file /etc/xrdp/km-00000409.ini
 Loading keymap file /etc/xrdp/km-00000412.ini
