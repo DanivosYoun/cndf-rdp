@@ -149,7 +149,7 @@ for label in ("iron-1", "iron-2", "iron-3", "free-1"):
     ])
     feature("ime", label, [
         step("idle", seconds=8),
-        step("keys", text="click:100,40 f7 ropt wait:800 f7 ropt wait:800 f7", seconds=1),
+        step("keys", text="click:750,40 f7 ropt wait:800 f7 ropt wait:800 f7", seconds=1),
     ], keyboardProfile="korean")
     feature("drive", label, [step("idle", seconds=9)], shareHome=True)
     feature("reconnect", label, [
