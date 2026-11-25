@@ -4,7 +4,7 @@ import Foundation
 /// one certificate trust store (so "new -> same -> changed -> rejected" can be chained).
 struct HarnessScenario: Decodable {
     var name: String
-    /// Default engine for runs without their own: `freerdp` or `ironrdp` (`--engine` overrides).
+    /// Optional engine declaration. Only `ironrdp` is supported.
     var engine: String?
     var runs: [HarnessRun]
 }
@@ -25,8 +25,6 @@ struct HarnessRun: Decodable {
     var fixturePort: UInt16?
     /// "auto" or "compat" (RDPGraphicsMode raw values).
     var graphicsMode: String?
-    /// RDPConnectionOptions.networkAutoDetect (app default false). Default false.
-    var networkAutoDetect: Bool?
     /// "standard" or "korean" (RDPKeyboardProfile raw values). Default "standard".
     var keyboardProfile: String?
     /// Window content size in points.
@@ -37,14 +35,14 @@ struct HarnessRun: Decodable {
     var promptAnswer: String?
     var steps: [HarnessStep]
     var expect: HarnessExpectation?
-    /// Engine for this run only (overrides `--engine`); lets one scenario mix engines.
+    /// Optional engine declaration for this run.
     var engine: String?
     /// Replaces `expect` when this run uses the keyed engine. IronRDP has no known_hosts of
     /// its own, so a stored certificate reaches the app as a "same" callback instead of none.
     var expectByEngine: [String: HarnessExpectation]?
 
     enum CodingKeys: String, CodingKey {
-        case id, host, port, username, passwordEnv, domain, graphicsMode, networkAutoDetect, window, steps, expect
+        case id, host, port, username, passwordEnv, domain, graphicsMode, window, steps, expect
         case engine, expectByEngine, enableClipboard, shareHome, audioMode, fixturePort
         case promptAnswer, keyboardProfile
         case repeatCount = "repeat"

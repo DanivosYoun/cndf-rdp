@@ -67,7 +67,7 @@ private final class FollowKeySession: RDPEngineSession {
         lock.unlock()
     }
 
-    let engine = RDPEngineKind.freeRDP
+    let engine = RDPEngineKind.ironRDP
     weak var delegate: RDPSessionDelegate?
     var connectionGeneration: UInt64 { 1 }
     func isInputConnectionCurrent(generation: UInt64) -> Bool { isConnected }
@@ -498,7 +498,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         }
 
         session.isConnected = true
-        connection.rdpSession(session, didLog: "FreeRDP connected.")
+        connection.rdpSession(session, didLog: "IronRDP connected.")
         RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         clock.advance(by: 5)
         view.handleInputSourceSettleElapsed()
@@ -510,7 +510,7 @@ final class RDPClientViewFollowTests: XCTestCase {
         // The disconnected boundary disarms: a flip after it sends nothing.
         session.clearKeys()
         session.isConnected = false
-        connection.rdpSession(session, didLog: "FreeRDP disconnected.")
+        connection.rdpSession(session, didLog: "IronRDP disconnected.")
         RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         session.isConnected = true
         reader.language = .other

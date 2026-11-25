@@ -84,7 +84,7 @@ final class IterationEvaluationTests: XCTestCase {
         ))
         XCTAssertTrue(updateDisplayControlReady(true, forLogMessage: "Display resize encoded: 1024x700."))
         XCTAssertFalse(updateDisplayControlReady(true, forLogMessage: "Display control channel closed."))
-        XCTAssertFalse(updateDisplayControlReady(true, forLogMessage: "FreeRDP disconnected."))
+        XCTAssertFalse(updateDisplayControlReady(true, forLogMessage: "IronRDP disconnected."))
         XCTAssertFalse(updateDisplayControlReady(true, forLogMessage: "IronRDP disconnected."))
     }
 

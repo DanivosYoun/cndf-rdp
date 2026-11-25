@@ -2,9 +2,7 @@ import ClipboardBridge
 import CoreGraphics
 import Foundation
 
-/// The session surface `RDPConnectionView`, `RDPClientView` and the input executor use. Each
-/// engine (`RDPSession` for FreeRDP, `IronRDPSession`) adopts it; callers never branch on the
-/// engine except to read `engine` and the `supports…` capabilities.
+/// The session surface used by the connection view, client view and input executor.
 public protocol RDPEngineSession: AnyObject {
     var engine: RDPEngineKind { get }
     var delegate: RDPSessionDelegate? { get set }

@@ -18,16 +18,11 @@ public struct RDPConnectionOptions: Equatable, Sendable {
     public let audioPlaybackMode: RDPAudioPlaybackMode
     public let logFileURL: URL?
     public let logLevel: RDPLogLevel
-    public let logFilters: [String: RDPLogLevel]
     public let preferDeviceNativeResolution: Bool
     public let colorDepth: RDPColorDepth
     public let forcedDesktopSize: CGSize?
-    /// Lets the server run RDP network auto-detection (RTT/bandwidth). Off by default.
-    public let networkAutoDetect: Bool
     public let graphicsMode: RDPGraphicsMode
-    /// The engine `RDPConnectionView.connect` creates the session with. Fixed for the session.
-    public let engine: RDPEngineKind
-    /// GCC keyboard fields both engines advertise. Fixed for the session.
+    /// GCC keyboard fields the session advertises. Fixed for the session.
     public let keyboardProfile: RDPKeyboardProfile
 
     public init(
@@ -44,13 +39,10 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         audioPlaybackMode: RDPAudioPlaybackMode = .disabled,
         logFileURL: URL? = nil,
         logLevel: RDPLogLevel = .info,
-        logFilters: [String: RDPLogLevel] = [:],
         preferDeviceNativeResolution: Bool = true,
         colorDepth: RDPColorDepth = .depth32,
         forcedDesktopSize: CGSize? = nil,
-        networkAutoDetect: Bool = false,
         graphicsMode: RDPGraphicsMode = .automatic,
-        engine: RDPEngineKind = .freeRDP,
         pasteboardName: String? = nil,
         keyboardProfile: RDPKeyboardProfile = .standard
     ) {
@@ -68,13 +60,10 @@ public struct RDPConnectionOptions: Equatable, Sendable {
         self.audioPlaybackMode = audioPlaybackMode
         self.logFileURL = logFileURL
         self.logLevel = logLevel
-        self.logFilters = logFilters
         self.preferDeviceNativeResolution = preferDeviceNativeResolution
         self.colorDepth = colorDepth
         self.forcedDesktopSize = forcedDesktopSize
-        self.networkAutoDetect = networkAutoDetect
         self.graphicsMode = graphicsMode
-        self.engine = engine
         self.keyboardProfile = keyboardProfile
     }
 }
@@ -82,7 +71,7 @@ public struct RDPConnectionOptions: Equatable, Sendable {
 /// The keyboard a connection reports in GCC Client Core Data (design D2). The server's keyboard
 /// driver for this type and subtype decides which scancodes become VK_HANGUL and VK_HANJA.
 public enum RDPKeyboardProfile: String, Codable, Sendable {
-    /// What both engines sent before profiles existed.
+    /// The default GCC keyboard fields.
     case standard
     /// Korean 101-key Type 1: right Alt is Han/Yeong and right Ctrl is Hanja.
     case korean
@@ -107,7 +96,6 @@ public enum RDPGraphicsMode: String, Codable, Sendable {
 }
 
 public enum RDPEngineKind: String, Codable, Sendable {
-    case freeRDP = "freerdp"
     case ironRDP = "ironrdp"
 
     /// Whether this engine has a clipboard channel (`RDPEngineSession.supportsClipboard`).
@@ -130,7 +118,7 @@ public enum RDPEngineKind: String, Codable, Sendable {
     }
 
     private func supportsIronCapability(_ bit: UInt32) -> Bool {
-        self == .freeRDP || (cndf_iron_capabilities() & bit) != 0
+        (cndf_iron_capabilities() & bit) != 0
     }
 }
 
@@ -168,7 +156,7 @@ extension RDPConnectionOptions {
         return "RDP channels clipboard=\(enableClipboard ? "on" : "off") folder=\(folder ? "on" : "off") audio=\(audio)"
     }
 
-    /// Both engines log this line, so their GCC keyboard fields can be diffed (design I4).
+    /// Records the advertised GCC keyboard fields.
     var keyboardLogMessage: String {
         let profile = keyboardProfile
         return "RDP keyboard profile=\(profile.rawValue) layout=0x\(String(profile.keyboardLayout, radix: 16))"

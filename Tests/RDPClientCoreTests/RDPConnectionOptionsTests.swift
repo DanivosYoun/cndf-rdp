@@ -15,11 +15,9 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertEqual(options.audioPlaybackMode, .disabled)
         XCTAssertNil(options.logFileURL)
         XCTAssertEqual(options.logLevel, .info)
-        XCTAssertTrue(options.logFilters.isEmpty)
         XCTAssertTrue(options.preferDeviceNativeResolution)
         XCTAssertEqual(options.colorDepth, .depth32)
         XCTAssertNil(options.forcedDesktopSize)
-        XCTAssertFalse(options.networkAutoDetect)
         XCTAssertEqual(options.graphicsMode, .automatic)
         XCTAssertEqual(options.keyboardProfile, .standard)
     }
@@ -46,11 +44,9 @@ final class RDPConnectionOptionsTests: XCTestCase {
             audioPlaybackMode: .playLocally,
             logFileURL: logURL,
             logLevel: .debug,
-            logFilters: ["com.freerdp.channels.cliprdr": .trace],
             preferDeviceNativeResolution: false,
             colorDepth: .depth24,
             forcedDesktopSize: CGSize(width: 1920, height: 1080),
-            networkAutoDetect: true,
             graphicsMode: .compatibility
         )
 
@@ -60,11 +56,9 @@ final class RDPConnectionOptionsTests: XCTestCase {
         XCTAssertEqual(options.audioPlaybackMode, .playLocally)
         XCTAssertEqual(options.logFileURL, logURL)
         XCTAssertEqual(options.logLevel, .debug)
-        XCTAssertEqual(options.logFilters["com.freerdp.channels.cliprdr"], .trace)
         XCTAssertFalse(options.preferDeviceNativeResolution)
         XCTAssertEqual(options.colorDepth, .depth24)
         XCTAssertEqual(options.forcedDesktopSize, CGSize(width: 1920, height: 1080))
-        XCTAssertTrue(options.networkAutoDetect)
         XCTAssertEqual(options.graphicsMode, .compatibility)
     }
 
@@ -84,19 +78,15 @@ final class RDPConnectionOptionsTests: XCTestCase {
 
     func testExposesBuildInfo() {
         XCTAssertFalse(RDPMacInfo.packageVersion.isEmpty)
-        // Reported by the loaded library, so it tracks Scripts/build-freerdp.sh (3.33.1 / 65bcca1).
-        XCTAssertTrue(RDPMacInfo.freerdpVersion.hasPrefix("3.33.1 ("), RDPMacInfo.freerdpVersion)
+        XCTAssertFalse(RDPMacInfo.ironRDPVersion.isEmpty)
         XCTAssertTrue(RDPMacInfo.buildConfiguration.contains("rdpsnd"))
     }
 
     func testSessionExposesInitialStatisticsAndReconnectGuard() throws {
-        let session = try RDPSession()
+        let session = try IronRDPSession()
 
         XCTAssertEqual(session.statistics.framesReceived, 0)
         XCTAssertEqual(session.statistics.localFilesOffered, 0)
-        XCTAssertNil(session.statistics.networkBandwidthKbps)
-        XCTAssertNil(session.statistics.networkBaseRTTMs)
-        XCTAssertNil(session.statistics.networkAverageRTTMs)
         XCTAssertThrowsError(try session.reconnect()) { error in
             XCTAssertEqual(
                 error as? RDPSessionError,

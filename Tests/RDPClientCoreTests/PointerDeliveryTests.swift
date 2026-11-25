@@ -3,7 +3,7 @@ import XCTest
 
 final class PointerDeliveryTests: XCTestCase {
     func testIdenticalShapesAreDeduplicatedWithoutDroppingStateTransitions() throws {
-        let session = try RDPSession()
+        let session = try IronRDPSession()
         let delegate = PointerDelegate()
         session.delegate = delegate
         let image = RDPRemotePointer.image(RDPPointerImage(

@@ -13,7 +13,6 @@ struct ExternalCredentialProvider {
         static let audioPlaybackMode = "RDP_MAC_AUDIO_MODE"
         static let logFilePath = "RDP_MAC_LOG_FILE"
         static let logLevel = "RDP_MAC_LOG_LEVEL"
-        static let logFilters = "RDP_MAC_LOG_FILTERS"
         static let preferDeviceNativeResolution = "RDP_MAC_PREFER_NATIVE_RESOLUTION"
         static let colorDepth = "RDP_MAC_COLOR_DEPTH"
         static let forcedDesktopSize = "RDP_MAC_FORCED_DESKTOP_SIZE"
@@ -47,7 +46,6 @@ struct ExternalCredentialProvider {
             audioPlaybackMode: parsedAudioPlaybackMode(environment[Key.audioPlaybackMode]),
             logFileURL: parsedLogFileURL(environment[Key.logFilePath]),
             logLevel: parsedLogLevel(environment[Key.logLevel]),
-            logFilters: parsedLogFilters(environment[Key.logFilters]),
             preferDeviceNativeResolution: parsedBool(environment[Key.preferDeviceNativeResolution], defaultValue: true),
             colorDepth: parsedColorDepth(environment[Key.colorDepth]),
             forcedDesktopSize: parsedDesktopSize(environment[Key.forcedDesktopSize])
@@ -96,22 +94,6 @@ struct ExternalCredentialProvider {
             return .info
         }
         return level
-    }
-
-    private func parsedLogFilters(_ value: String?) -> [String: RDPLogLevel] {
-        guard let value = nilIfEmpty(trimmed(value)) else {
-            return [:]
-        }
-
-        var filters: [String: RDPLogLevel] = [:]
-        for entry in value.split(separator: ";") {
-            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
-            guard parts.count == 2, let level = RDPLogLevel(rawValue: parts[1].lowercased()) else {
-                continue
-            }
-            filters[parts[0]] = level
-        }
-        return filters
     }
 
     private func parsedBool(_ value: String?, defaultValue: Bool) -> Bool {

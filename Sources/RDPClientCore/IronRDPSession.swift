@@ -4,8 +4,8 @@ import CoreGraphics
 import Foundation
 import IronRDPBridge
 
-/// IronRDP engine session over the `CNDFIronRDP.h` ABI v1. Mirrors `RDPSession`'s contract:
-/// callbacks arrive on engine threads, frames are copied into `RDPFrame` and handed to the
+/// IronRDP engine session over the `CNDFIronRDP.h` ABI v1.
+/// Callbacks arrive on engine threads, frames are copied into `RDPFrame` and handed to the
 /// existing `didReceiveFrame` path, and certificate trust uses the FreeRDP-compatible PEM key.
 ///
 /// Output suppression is unsupported.
@@ -105,7 +105,7 @@ public final class IronRDPSession: RDPEngineSession {
             guard let context else { return }
             let session = Unmanaged<IronRDPSession>.fromOpaque(context).takeUnretainedValue()
             // A failure ends the generation; the engine sends no disconnect after it. Report
-            // the disconnect here, as FreeRDP does after its failure callback.
+            // the disconnect here.
             guard session.endCallbackGeneration(generation) else { return }
             let description = utf8String(bytes, length)
             session.emitLog("IronRDP connect failed: \(description) [\(String(format: "0x%08x", code))].")
@@ -397,7 +397,7 @@ public final class IronRDPSession: RDPEngineSession {
     /// Rejects a pending certificate decision, requests shutdown and destroys the native
     /// session. When this returns no further callback starts (ABI `cndf_iron_session_destroy`).
     /// If the connection had not ended yet, `didDisconnectWith(.localRequest)` is delivered
-    /// once before returning, as FreeRDP's worker does while `disconnect()` waits for it.
+    /// once before returning.
     public func disconnect() throws {
         tearDownNativeSession(reportingDisconnect: true)
     }
@@ -677,7 +677,7 @@ public final class IronRDPSession: RDPEngineSession {
         return true
     }
 
-    /// `keyCode` is an RDP scancode. As with the FreeRDP bridge, bit 0x100 also marks it extended.
+    /// `keyCode` is an RDP scancode. Bit 0x100 also marks it extended.
     public func sendKey(keyCode: UInt16, pressed: Bool, extended: Bool) throws {
         var event = CNDFIronInputEvent(kind: CNDF_IRON_INPUT_KEY, x: 0, y: 0)
         event.code = keyCode & 0xFF

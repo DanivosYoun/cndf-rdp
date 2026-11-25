@@ -162,9 +162,9 @@ final class RDPSharedInputSessionTests: XCTestCase {
     }
 
     func testRejectedConnectDoesNotResetTheNativeConnectionGeneration() throws {
-        let session = try RDPSession()
+        let session = try IronRDPSession()
         let generation = session.connectionGeneration
-        XCTAssertThrowsError(try session.connect(RDPConnectionOptions(host: "")))
+        XCTAssertThrowsError(try session.connect(RDPConnectionOptions(host: ""), initialPointSize: .zero, scale: 1))
         XCTAssertEqual(session.connectionGeneration, generation)
         var ran = false
         XCTAssertThrowsError(try session.withInputConnection(generation: generation) { ran = true })
@@ -173,11 +173,6 @@ final class RDPSharedInputSessionTests: XCTestCase {
 
     @MainActor
     func testTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock() async throws {
-        try await checkTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock(try RDPSession())
-    }
-
-    @MainActor
-    func testTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlockIronRDP() async throws {
         try await checkTwoViewsAndReattachmentShareConnectionOwnershipAndFailureBlock(try IronRDPSession())
     }
 
@@ -225,11 +220,6 @@ final class RDPSharedInputSessionTests: XCTestCase {
 
     @MainActor
     func testDetachedViewHandleRetainsItsNativeSessionThroughClose() async throws {
-        try await checkDetachedViewHandleRetainsItsNativeSessionThroughClose { try RDPSession() }
-    }
-
-    @MainActor
-    func testDetachedViewHandleRetainsItsNativeSessionThroughCloseIronRDP() async throws {
         try await checkDetachedViewHandleRetainsItsNativeSessionThroughClose { try IronRDPSession() }
     }
 
@@ -251,10 +241,6 @@ final class RDPSharedInputSessionTests: XCTestCase {
     }
 
     func testDelayedOldGenerationCannotReplaceNewConnectionRegistry() throws {
-        try checkDelayedOldGenerationCannotReplaceNewConnectionRegistry(try RDPSession())
-    }
-
-    func testDelayedOldGenerationCannotReplaceNewConnectionRegistryIronRDP() throws {
         try checkDelayedOldGenerationCannotReplaceNewConnectionRegistry(try IronRDPSession())
     }
 
@@ -567,7 +553,6 @@ final class RDPSharedInputSessionTests: XCTestCase {
     /// engine as the same rotation, saturating symmetrically at ±255.
     @MainActor
     func testLocalViewAndSharedSessionSendTheSameWheelRotation() throws {
-        try checkLocalViewAndSharedSessionSendTheSameWheelRotation(try RDPSession())
         try checkLocalViewAndSharedSessionSendTheSameWheelRotation(try IronRDPSession())
     }
 

@@ -1,8 +1,0 @@
-{
-  "name": "legacy-tls-freerdp",
-  "runs": [
-    {"id": "b4-tls10-freerdp", "engine": "freerdp", "host": "127.0.0.1", "port": 33895, "username": "harness", "passwordEnv": "HARNESS_B3_PASS", "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 20}, {"op": "shutdown"}], "expect": {"connected": true, "firstFrame": true, "trustCallbacks": ["new"], "prompts": 0, "maxShutdownMs": 1000}},
-    {"id": "b4-tls11-freerdp", "engine": "freerdp", "host": "127.0.0.1", "port": 33896, "username": "harness", "passwordEnv": "HARNESS_B3_PASS", "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 20}, {"op": "shutdown"}], "expect": {"connected": true, "firstFrame": true, "trustCallbacks": ["new"], "prompts": 0, "maxShutdownMs": 1000}},
-    {"id": "b4-tls12-freerdp", "engine": "freerdp", "host": "127.0.0.1", "port": 33897, "username": "harness", "passwordEnv": "HARNESS_B3_PASS", "steps": [{"op": "connect"}, {"op": "waitConnected", "timeout": 30}, {"op": "waitFirstFrame", "timeout": 20}, {"op": "shutdown"}], "expect": {"connected": true, "firstFrame": true, "trustCallbacks": ["new"], "prompts": 0, "maxShutdownMs": 1000}}
-  ]
-}

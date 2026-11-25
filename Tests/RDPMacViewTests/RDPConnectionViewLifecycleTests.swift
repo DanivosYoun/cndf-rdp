@@ -13,12 +13,12 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
 
         XCTAssertFalse(view.isConnected)
         XCTAssertNil(view.statistics)
-        XCTAssertFalse(firstDiagnostics.didWaitForFreeRDPWorker)
+        XCTAssertFalse(firstDiagnostics.didWaitForSession)
         XCTAssertEqual(firstDiagnostics.pendingMainQueueTasks, 0)
         XCTAssertEqual(firstDiagnostics.inFlightCommandBuffers, 0)
-        XCTAssertEqual(firstDiagnostics.freeRDPWorkerWaitDurationMs, 0)
+        XCTAssertEqual(firstDiagnostics.sessionWaitDurationMs, 0)
         XCTAssertEqual(firstDiagnostics.metalDrainDurationMs, 0)
-        XCTAssertFalse(secondDiagnostics.didWaitForFreeRDPWorker)
+        XCTAssertFalse(secondDiagnostics.didWaitForSession)
     }
 
     func testShutdownDetachesDelegateAfterSingleStateCallback() throws {
@@ -28,8 +28,8 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
 
         view.shutdown()
         try view.pollLocalClipboard()
-        view.rdpSession(try RDPSession(), didLog: "late callback")
-        view.rdpSession(try RDPSession(), didReceiveRemoteText: "late text")
+        view.rdpSession(try IronRDPSession(), didLog: "late callback")
+        view.rdpSession(try IronRDPSession(), didReceiveRemoteText: "late text")
 
         XCTAssertEqual(delegate.connectedChanges, [false])
         XCTAssertTrue(delegate.logs.isEmpty)
@@ -50,7 +50,7 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
 
     func testFramesArrivingFasterThanMainAreCoalescedToLatest() throws {
         let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
-        let session = try RDPSession()
+        let session = try IronRDPSession()
         var shownFirstBytes: [UInt8] = []
         view.onRenderedFrame = { pixelBuffer, _ in
             CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -76,7 +76,7 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
 
     func testPointerBurstQueuesOneDeliveryAndKeepsLastState() throws {
         let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
-        let session = try RDPSession()
+        let session = try IronRDPSession()
         let image = RDPRemotePointer.image(RDPPointerImage(
             bgra: Data(repeating: 255, count: 384 * 384 * 4), width: 384, height: 384,
             stride: 384 * 4, hotSpotX: 0, hotSpotY: 0))
@@ -143,7 +143,7 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
             XCTAssertFalse(view.isConnected)
             XCTAssertEqual(diagnostics.pendingMainQueueTasks, 0)
             XCTAssertEqual(diagnostics.inFlightCommandBuffers, 0)
-            XCTAssertGreaterThanOrEqual(diagnostics.freeRDPWorkerWaitDurationMs, 0)
+            XCTAssertGreaterThanOrEqual(diagnostics.sessionWaitDurationMs, 0)
             XCTAssertGreaterThanOrEqual(diagnostics.metalDrainDurationMs, 0)
         }
         drainRunLoop()
@@ -187,8 +187,8 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
 
                     drainRunLoop(duration: 0.5)
                     let diagnostics = view.shutdown()
-                    XCTAssertTrue(diagnostics.didWaitForFreeRDPWorker)
-                    XCTAssertGreaterThanOrEqual(diagnostics.freeRDPWorkerWaitDurationMs, 0)
+                    XCTAssertTrue(diagnostics.didWaitForSession)
+                    XCTAssertGreaterThanOrEqual(diagnostics.sessionWaitDurationMs, 0)
                     XCTAssertGreaterThanOrEqual(diagnostics.metalDrainDurationMs, 0)
                     XCTAssertEqual(diagnostics.inFlightCommandBuffers, 0)
                     XCTAssertFalse(window.isReleasedWhenClosed)
@@ -227,7 +227,7 @@ private func drainRunLoop(duration: TimeInterval) {
 private func waitForLiveSession(view: RDPConnectionView, delegate: LifecycleDelegate, timeout: TimeInterval) {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        if view.isConnected || delegate.connectedChanges.contains(true) || delegate.logs.contains("FreeRDP connected.") {
+        if view.isConnected || delegate.connectedChanges.contains(true) || delegate.logs.contains("IronRDP connected.") {
             return
         }
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))

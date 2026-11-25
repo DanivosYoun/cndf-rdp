@@ -35,18 +35,14 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(cndf_iron_abi_version(), 1)
         XCTAssertEqual(cndf_iron_capabilities(), 0xF)
         XCTAssertTrue(session.supportsClipboard)
-        for engine in [RDPEngineKind.freeRDP, .ironRDP] {
-            XCTAssertTrue(engine.supportsDriveRedirection)
-            XCTAssertTrue(engine.supportsAudioPlayback(.disabled))
-            XCTAssertTrue(engine.supportsAudioPlayback(.playLocally))
-            XCTAssertTrue(engine.supportsAudioPlayback(.playOnRemote))
-        }
+        XCTAssertTrue(RDPEngineKind.ironRDP.supportsDriveRedirection)
+        XCTAssertTrue(RDPEngineKind.ironRDP.supportsAudioPlayback(.disabled))
+        XCTAssertTrue(RDPEngineKind.ironRDP.supportsAudioPlayback(.playLocally))
+        XCTAssertTrue(RDPEngineKind.ironRDP.supportsAudioPlayback(.playOnRemote))
         XCTAssertFalse(session.supportsOutputSuppression)
         XCTAssertNoThrow(try session.pollLocalClipboard())
         XCTAssertThrowsError(try session.sendLocalText("x"))
         XCTAssertThrowsError(try session.setOutputSuppressed(true))
-        XCTAssertEqual(try RDPSession().engine, .freeRDP)
-        XCTAssertTrue(try RDPSession().supportsClipboard)
     }
 
     func testRejectedConnectDoesNotAdvanceTheGeneration() throws {
@@ -266,50 +262,32 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(recorder.lifecycle, ["disconnect:server"])
     }
 
-    // stub + real FreeRDP. Both engines, same observable lifecycle.
-    func testLifecycleMatchesFreeRDPForFailureAndForDisconnectWhileConnecting() throws {
+    // stub
+    func testLifecycleForFailureAndForDisconnectWhileConnecting() throws {
         try skipUnlessStub()
 
-        // Async connect failure. FreeRDP: refused TCP port. IronRDP stub: rejected certificate.
-        let freeRDPFailure = Recorder(trust: false)
-        let freeRDP = try RDPSession()
-        freeRDP.delegate = freeRDPFailure
-        try freeRDP.connect(RDPConnectionOptions(host: "127.0.0.1", port: 1, username: "u", password: "p"), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
-        XCTAssertTrue(waitUntil(timeout: 20) { freeRDPFailure.lifecycle.count == 2 })
+        // Async certificate rejection.
         let ironFailure = Recorder(trust: false)
         let iron = try IronRDPSession()
         iron.delegate = ironFailure
         try iron.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
         XCTAssertTrue(waitUntil { ironFailure.lifecycle.count == 2 })
-        XCTAssertEqual(freeRDPFailure.lifecycle, ["failure", "disconnect:error"])
-        XCTAssertEqual(ironFailure.lifecycle, freeRDPFailure.lifecycle)
-        try freeRDP.disconnect()
+        XCTAssertEqual(ironFailure.lifecycle, ["failure", "disconnect:error"])
         try iron.disconnect()
         Thread.sleep(forTimeInterval: 0.2)
-        XCTAssertEqual(freeRDPFailure.lifecycle, ["failure", "disconnect:error"])
-        XCTAssertEqual(ironFailure.lifecycle, freeRDPFailure.lifecycle)
 
-        // Local disconnect while still connecting. FreeRDP: a local listener that accepts the
-        // TCP handshake and never answers X.224. IronRDP stub: an unanswered certificate prompt.
-        let silent = try SilentListener()
-        defer { silent.close() }
-        let freeRDPConnecting = Recorder(trust: false)
-        let freeRDP2 = try RDPSession()
-        freeRDP2.delegate = freeRDPConnecting
-        try freeRDP2.connect(RDPConnectionOptions(host: "127.0.0.1", port: silent.port, username: "u", password: "p"), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
-        Thread.sleep(forTimeInterval: 0.5)
-        XCTAssertEqual(freeRDPConnecting.lifecycle, [])
-        try freeRDP2.disconnect()
+        XCTAssertEqual(ironFailure.lifecycle, ["failure", "disconnect:error"])
+
+        // Local disconnect with an unanswered certificate prompt.
         let ironConnecting = Recorder(trust: nil)
         let iron2 = try IronRDPSession()
         iron2.delegate = ironConnecting
         try iron2.connect(options(), initialPointSize: CGSize(width: 640, height: 480), scale: 1)
         XCTAssertTrue(waitUntil { ironConnecting.trustRequests.count == 1 })
         try iron2.disconnect()
-        XCTAssertEqual(freeRDPConnecting.lifecycle, ["disconnect:localRequest"])
-        XCTAssertEqual(ironConnecting.lifecycle, freeRDPConnecting.lifecycle)
+        XCTAssertEqual(ironConnecting.lifecycle, ["disconnect:localRequest"])
         Thread.sleep(forTimeInterval: 0.2)
-        XCTAssertEqual(ironConnecting.lifecycle, freeRDPConnecting.lifecycle)
+        XCTAssertEqual(ironConnecting.lifecycle, ["disconnect:localRequest"])
     }
 
     // MARK: resize (finding ironrdp-resize-state-desync-on-rejected-send)
@@ -417,7 +395,7 @@ final class IronRDPSessionTests: XCTestCase {
         XCTAssertEqual(attempts, 1)
 
         // A native FreeRDP offer on this disconnected session would throw.
-        let free = try RDPSession(staging: staging)
+        let free = try IronRDPSession(staging: staging)
         XCTAssertEqual(try free.sendLocalFiles([link]), onlyOmitted)
         XCTAssertThrowsError(try free.sendLocalFiles([file, link]))
     }
@@ -716,44 +694,6 @@ func waitUntil(timeout: TimeInterval = 3, _ condition: () -> Bool) -> Bool {
     return true
 }
 
-/// A loopback TCP listener that never accepts: the kernel completes the handshake from the
-/// backlog, so a client stays in its connect sequence until it gives up or is stopped.
-private final class SilentListener {
-    private var descriptor: Int32
-    let port: UInt16
-
-    init() throws {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        descriptor = fd
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        address.sin_port = 0
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let bound = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer -> Bool in
-                bind(fd, pointer, length) == 0
-                    && listen(fd, 4) == 0
-                    && getsockname(fd, pointer, &length) == 0
-            }
-        }
-        guard fd >= 0, bound else {
-            if fd >= 0 { Darwin.close(fd) }
-            throw RDPSessionError.configurationInvalid(reason: "listener")
-        }
-        port = UInt16(bigEndian: address.sin_port)
-    }
-
-    func close() {
-        if descriptor >= 0 {
-            Darwin.close(descriptor)
-            descriptor = -1
-        }
-    }
-}
-
-/// Thread-safe delegate. `trust == nil` never answers a certificate prompt.
 private final class Recorder: RDPSessionDelegate {
     private let lock = NSLock()
     private var trust: Bool?

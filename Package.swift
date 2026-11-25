@@ -4,7 +4,6 @@ import Foundation
 import PackageDescription
 
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-let freeRDPInstall = "\(packageRoot)/Vendor/FreeRDP/install"
 // Built by Scripts/build-ironrdp.sh (aarch64-apple-darwin static library, design D1).
 let ironRDPInstall = "\(packageRoot)/Vendor/IronRDP/install"
 
@@ -21,7 +20,6 @@ let package = Package(
         .library(name: "RDPMacView", targets: ["RDPMacView"]),
         .library(name: "ClipboardBridge", targets: ["ClipboardBridge"]),
         .library(name: "FileTransferStaging", targets: ["FileTransferStaging"]),
-        .library(name: "FreeRDPBridge", targets: ["FreeRDPBridge"]),
         .library(name: "IronRDPBridge", targets: ["IronRDPBridge"])
     ],
     targets: [
@@ -43,35 +41,14 @@ let package = Package(
         ),
         .target(
             name: "RDPClientCore",
-            dependencies: ["FreeRDPBridge", "IronRDPBridge", "ClipboardBridge", "FileTransferStaging"]
+            dependencies: ["IronRDPBridge", "ClipboardBridge", "FileTransferStaging"]
         ),
         .target(
             name: "ClipboardBridge",
-            dependencies: ["FreeRDPBridge", "FileTransferStaging"]
+            dependencies: ["FileTransferStaging"]
         ),
         .target(
             name: "FileTransferStaging"
-        ),
-        .target(
-            name: "FreeRDPBridge",
-            publicHeadersPath: "include",
-            cSettings: [
-                .define("RDP_FREERDP_REAL", to: "1"),
-                .unsafeFlags([
-                    "-I\(freeRDPInstall)/include/freerdp3",
-                    "-I\(freeRDPInstall)/include/winpr3"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-L\(freeRDPInstall)/lib",
-                    "-Xlinker", "-rpath",
-                    "-Xlinker", "\(freeRDPInstall)/lib",
-                    "-lfreerdp-client3",
-                    "-lfreerdp3",
-                    "-lwinpr3"
-                ])
-            ]
         ),
         .target(
             name: "IronRDPBridge",
@@ -98,10 +75,6 @@ let package = Package(
         .testTarget(
             name: "ClipboardBridgeTests",
             dependencies: ["ClipboardBridge"]
-        ),
-        .testTarget(
-            name: "FreeRDPBridgeTests",
-            dependencies: ["FreeRDPBridge"]
         ),
         .testTarget(
             name: "FileTransferStagingTests",

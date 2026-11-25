@@ -117,7 +117,7 @@ private func drainRunLoop(duration: TimeInterval) {
 private func waitForConnection(view: RDPConnectionView, delegate: StressDelegate, timeout: TimeInterval) throws {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        if view.isConnected || delegate.connected || delegate.logs.contains("FreeRDP connected.") {
+        if view.isConnected || delegate.connected || delegate.logs.contains("IronRDP connected.") {
             return
         }
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
@@ -146,8 +146,8 @@ private func runCycle(index: Int, options: RDPConnectionOptions, waitAfterConnec
 
         let diagnostics = view.shutdown()
         print(
-            "cycle \(index): didWait=\(diagnostics.didWaitForFreeRDPWorker) " +
-            "freeRDPWaitMs=\(diagnostics.freeRDPWorkerWaitDurationMs) " +
+            "cycle \(index): didWait=\(diagnostics.didWaitForSession) " +
+            "sessionWaitMs=\(diagnostics.sessionWaitDurationMs) " +
             "renderDrainMs=\(diagnostics.metalDrainDurationMs) " +
             "pendingMain=\(diagnostics.pendingMainQueueTasks) " +
             "inFlight=\(diagnostics.inFlightCommandBuffers)"

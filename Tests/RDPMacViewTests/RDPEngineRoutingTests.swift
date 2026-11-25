@@ -4,22 +4,17 @@ import RDPClientCore
 import XCTest
 @testable import RDPMacView
 
-/// Engine selection in `RDPConnectionView` and the IronRDP session behind the existing view,
+/// IronRDP routing in `RDPConnectionView` and the IronRDP session behind the existing view,
 /// executor and shutdown paths. Tests marked "stub" need the C1 stub `libcndf_ironrdp.a`.
 @MainActor
 final class RDPEngineRoutingTests: XCTestCase {
-    func testConnectCreatesTheSessionForTheSelectedEngine() throws {
-        for engine in [RDPEngineKind.freeRDP, .ironRDP] {
-            let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
-            XCTAssertNil(view.engine)
-            try view.connect(RDPConnectionOptions(host: "127.0.0.1", port: 9, username: "routing", engine: engine))
-            XCTAssertEqual(view.engine, engine)
-            view.shutdown()
-            XCTAssertNil(view.engine)
-        }
-        XCTAssertEqual(RDPConnectionOptions(host: "h").engine, .freeRDP)
-        XCTAssertTrue(RDPEngineKind.freeRDP.supportsClipboard)
-        XCTAssertTrue(RDPEngineKind.ironRDP.supportsClipboard)
+    func testConnectCreatesAnIronRDPSession() throws {
+        let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
+        XCTAssertNil(view.engine)
+        try view.connect(RDPConnectionOptions(host: "127.0.0.1", port: 9, username: "routing"))
+        XCTAssertEqual(view.engine, .ironRDP)
+        view.shutdown()
+        XCTAssertNil(view.engine)
     }
 
     // stub
@@ -30,14 +25,14 @@ final class RDPEngineRoutingTests: XCTestCase {
         view.delegate = delegate
         var tapped = 0
         view.onRenderedFrame = { _, _ in tapped += 1 }
-        try view.connect(RDPConnectionOptions(host: "localhost", username: "stub", engine: .ironRDP))
+        try view.connect(RDPConnectionOptions(host: "localhost", username: "stub"))
 
         XCTAssertTrue(waitUntil { tapped > 0 && delegate.connectedChanges.contains(true) })
         XCTAssertTrue(view.isConnected)
         XCTAssertGreaterThan(view.statistics?.framesReceived ?? 0, 0)
 
         let diagnostics = view.shutdown()
-        XCTAssertTrue(diagnostics.didWaitForFreeRDPWorker)
+        XCTAssertTrue(diagnostics.didWaitForSession)
         let afterShutdown = (tapped, delegate.eventCount)
         drainRunLoop(0.3)
         XCTAssertEqual(tapped, afterShutdown.0)
@@ -50,13 +45,13 @@ final class RDPEngineRoutingTests: XCTestCase {
         let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
         let delegate = EngineViewDelegate(trust: nil)
         view.delegate = delegate
-        try view.connect(RDPConnectionOptions(host: "localhost", username: "stub", engine: .ironRDP))
+        try view.connect(RDPConnectionOptions(host: "localhost", username: "stub"))
         XCTAssertTrue(waitUntil { delegate.trustRequests == 1 })
 
         let started = Date()
         let diagnostics = view.shutdown()
         XCTAssertLessThan(Date().timeIntervalSince(started), 1.0)
-        XCTAssertTrue(diagnostics.didWaitForFreeRDPWorker)
+        XCTAssertTrue(diagnostics.didWaitForSession)
         XCTAssertFalse(view.isConnected)
         let events = delegate.eventCount
         drainRunLoop(0.3)

@@ -27,7 +27,7 @@ private final class KeySession: RDPEngineSession {
         return recorded
     }
 
-    let engine = RDPEngineKind.freeRDP
+    let engine = RDPEngineKind.ironRDP
     weak var delegate: RDPSessionDelegate?
     var isConnected: Bool { true }
     var connectionGeneration: UInt64 { 1 }

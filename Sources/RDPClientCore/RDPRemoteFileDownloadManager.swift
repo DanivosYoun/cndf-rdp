@@ -1,6 +1,5 @@
 import FileTransferStaging
 import Foundation
-import FreeRDPBridge
 
 final class RDPRemoteFileDownloadManager {
     /// A range reply that cannot belong to the file the descriptor described (design D-5, INV-C1).
@@ -149,6 +148,7 @@ final class RDPRemoteFileDownloadManager {
         }
 
         if case .received(let data)? = responses[streamId] { return data }
-        throw RDPSessionError.bridgeRejectedOperation(Int32(RDPBridgeStatusBackendUnavailable.rawValue))
+        // Preserve the shared range request error code for unavailable data.
+        throw RDPSessionError.bridgeRejectedOperation(3)
     }
 }

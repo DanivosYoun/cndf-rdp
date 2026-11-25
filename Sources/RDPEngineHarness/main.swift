@@ -10,14 +10,12 @@ import RDPMacView
 // connection to a test server (Harness/docker, Scripts/run-engine-harness.sh).
 //
 // usage: rdp-engine-harness --scenario <file.json> --out <result.json>
-//            [--engine freerdp|ironrdp] [--trust-suite <UserDefaults suite>] [--work-dir <dir>]
+//            [--engine ironrdp] [--trust-suite <UserDefaults suite>] [--work-dir <dir>]
 //            [--reset-trust 1] [--drop-trust 1]
 //
 // The trust store persists across invocations with the same --trust-suite so a scenario can
 // span server restarts (cert A -> B -> A). --reset-trust clears it first, --drop-trust last.
 //
-// FreeRDP keeps its own known_hosts under $HOME; run with an isolated HOME so trust
-// scenarios start clean (the run script does this).
 
 private enum HarnessError: Error, CustomStringConvertible {
     case usage(String)
@@ -28,7 +26,7 @@ private enum HarnessError: Error, CustomStringConvertible {
         case .usage(let message):
             "usage error: \(message)"
         case .unknownEngine(let engine):
-            "unknown engine '\(engine)' (expected freerdp or ironrdp)"
+            "unknown engine '\(engine)' (expected ironrdp)"
         }
     }
 }
@@ -233,7 +231,6 @@ func updateDisplayControlReady(_ current: Bool, forLogMessage message: String) -
         return true
     }
     if message == "Display control channel closed."
-        || message == "FreeRDP disconnected."
         || message == "IronRDP disconnected." {
         return false
     }
@@ -356,7 +353,6 @@ private func failureName(_ error: RDPSessionError) -> String {
     case .tlsHandshakeFailed: "tlsHandshakeFailed"
     case .authenticationFailed: "authenticationFailed"
     case .certificateRejected: "certificateRejected"
-    case .freerdp: "freerdp"
     case .configurationInvalid: "configurationInvalid"
     case .ironrdp: "ironrdp"
     }
@@ -373,7 +369,6 @@ private func disconnectName(_ reason: RDPDisconnectReason) -> String {
 
 private func runIteration(
     _ run: HarnessRun,
-    engine: RDPEngineKind,
     iteration: Int,
     trustStore: TrustStore,
     workDirectory: URL
@@ -420,9 +415,7 @@ private func runIteration(
         audioPlaybackMode: audioMode,
         logFileURL: logURL,
         logLevel: .info,
-        networkAutoDetect: run.networkAutoDetect ?? false,
         graphicsMode: RDPGraphicsMode(rawValue: run.graphicsMode ?? "auto") ?? .automatic,
-        engine: engine,
         pasteboardName: pasteboard?.name.rawValue,
         keyboardProfile: RDPKeyboardProfile(rawValue: run.keyboardProfile ?? "standard") ?? .standard
     )
@@ -678,7 +671,7 @@ private func runIteration(
             delegate.shutdownReturned = true
             probe.shutdownReturned = true
             result.shutdownDiagnostics = [
-                "freeRDPWorkerWaitMs": diagnostics.freeRDPWorkerWaitDurationMs,
+                "sessionWaitMs": diagnostics.sessionWaitDurationMs,
                 "renderDrainMs": diagnostics.metalDrainDurationMs,
                 "pendingMain": diagnostics.pendingMainQueueTasks,
                 "inFlightCommandBuffers": diagnostics.inFlightCommandBuffers
@@ -822,14 +815,9 @@ private func iso8601Now() -> String {
 
 private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
     let scenario = try JSONDecoder().decode(HarnessScenario.self, from: Data(contentsOf: arguments.scenarioURL))
-    // A run's own engine wins (mixed-engine scenarios such as I3); otherwise --engine, then
-    // the scenario default, then FreeRDP.
-    let engine = arguments.engine ?? scenario.engine ?? RDPEngineKind.freeRDP.rawValue
-    guard RDPEngineKind(rawValue: engine) != nil else { throw HarnessError.unknownEngine(engine) }
-    for run in scenario.runs {
-        if let runEngine = run.engine, RDPEngineKind(rawValue: runEngine) == nil {
-            throw HarnessError.unknownEngine(runEngine)
-        }
+    let engine = RDPEngineKind.ironRDP.rawValue
+    for declared in [arguments.engine, scenario.engine] + scenario.runs.map(\.engine) {
+        if let declared, declared != engine { throw HarnessError.unknownEngine(declared) }
     }
     try FileManager.default.createDirectory(at: arguments.workDirectory, withIntermediateDirectories: true)
     let trustStore = TrustStore(suiteName: arguments.trustSuite)
@@ -839,14 +827,13 @@ private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
     let startedAt = iso8601Now()
     var runs: [RunResult] = []
     for run in scenario.runs {
-        let runEngine = RDPEngineKind(rawValue: run.engine ?? engine) ?? .freeRDP
-        let expect = run.expectByEngine?[runEngine.rawValue] ?? run.expect
-        fputs("== run \(run.id) (\(run.host):\(run.port), engine \(runEngine.rawValue))\n", stderr)
+        let expect = run.expectByEngine?[engine] ?? run.expect
+        fputs("== run \(run.id) (\(run.host):\(run.port), engine \(engine))\n", stderr)
         var iterations: [IterationResult] = []
         var failures: [String] = []
         for iteration in 1...max(1, run.repeatCount ?? 1) {
             var result = autoreleasepool {
-                runIteration(run, engine: runEngine, iteration: iteration, trustStore: trustStore, workDirectory: arguments.workDirectory)
+                runIteration(run, iteration: iteration, trustStore: trustStore, workDirectory: arguments.workDirectory)
             }
             result.resizeFrameSizeCheck = evaluateResizeFrameSize(result, against: expect).status?.rawValue
             failures += evaluate(result, against: expect)
@@ -855,7 +842,7 @@ private func runScenario(_ arguments: Arguments) throws -> ScenarioResult {
         }
         runs.append(RunResult(
             id: run.id,
-            engine: runEngine.rawValue,
+            engine: engine,
             host: run.host,
             port: run.port,
             iterations: iterations,

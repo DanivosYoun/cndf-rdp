@@ -2,7 +2,6 @@ import AppKit
 import ClipboardBridge
 import FileTransferStaging
 import Foundation
-import FreeRDPBridge
 import IronRDPBridge
 import XCTest
 @testable import RDPClientCore
@@ -168,260 +167,11 @@ final class RemoteFileLifecycleTests: XCTestCase {
         )) {
             XCTAssertEqual(
                 $0 as? RDPSessionError,
-                .bridgeRejectedOperation(Int32(RDPBridgeStatusBackendUnavailable.rawValue))
+                .bridgeRejectedOperation(3)
             )
         }
         XCTAssertEqual(checks, 2)
         XCTAssertEqual(stagedNames, [])
-    }
-
-    // MARK: FreeRDP session
-
-    private func freeRDPSession(_ server: RangeServer) throws -> (RDPSession, FakePasteboard, FakeSink, LogRecorder) {
-        let session = try RDPSession(staging: staging)
-        let pasteboard = FakePasteboard()
-        let sink = FakeSink()
-        session.clipboardCoordinator = ClipboardCoordinator(pasteboard: pasteboard, remoteSink: sink)
-        session.remoteFileDownloadManager = server.manager(staging: staging)
-        let recorder = LogRecorder()
-        session.delegate = recorder
-        return (session, pasteboard, sink, recorder)
-    }
-
-    private func sendFreeRDPList(_ files: [(String, UInt64)], to session: RDPSession) {
-        let data = descriptor(files)
-        data.withUnsafeBytes { bytes in
-            session.callbacks.remoteFileList?(bytes.bindMemory(to: UInt8.self).baseAddress, data.count, session.callbacks.context)
-        }
-    }
-
-    // S1: L1 is waiting on a range when L2 arrives. L1 fails, only L2 reaches the pasteboard,
-    // and one copy is staged.
-    func testFreeRDPNewListEndsTheWaitingMaterialization() throws {
-        let server = RangeServer()
-        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-
-        sendFreeRDPList([("a.txt", 3)], to: session)
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-        server.answering = true
-        sendFreeRDPList([("a.txt", 3)], to: session)
-
-        XCTAssertTrue(waitUntil { pasteboard.fileURLs?.count == 1 })
-        XCTAssertEqual(recorder.count(prefix: "Remote file materialization failed:"), 1)
-        XCTAssertEqual(server.requests.count, 2)
-        XCTAssertEqual(stagedNames, ["a.txt"])
-        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(pasteboard.fileURLs?.first)), Data("abc".utf8))
-    }
-
-    // S1: two lists back to back. Only the newest one is materialized.
-    func testFreeRDPDuplicateListsBackToBackMaterializeOnce() throws {
-        let server = RangeServer(answer: true)
-        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-
-        sendFreeRDPList([("a.txt", 3)], to: session)
-        sendFreeRDPList([("a.txt", 3)], to: session)
-
-        XCTAssertTrue(waitUntil { pasteboard.fileURLs?.count == 1 })
-        _ = waitUntil(timeout: 0.3) { false }
-        XCTAssertEqual(server.requests.count, 1)
-        XCTAssertEqual(stagedNames, ["a.txt"])
-        XCTAssertEqual(recorder.count(prefix: "Remote files materialized"), 1)
-    }
-
-    // S1: a list that finished after newer server text is not written and its copy is removed.
-    func testFreeRDPResultFinishedAfterNewerTextIsDiscarded() throws {
-        let server = RangeServer(answer: true)
-        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-        let finished = DispatchSemaphore(value: 0)
-        let release = DispatchSemaphore(value: 0)
-        session.materializeRemoteFileList = { manager, entries, shouldContinue in
-            let urls = try manager.materialize(entries, shouldContinue: shouldContinue)
-            finished.signal()
-            release.wait()
-            return urls
-        }
-
-        sendFreeRDPList([("a.txt", 3)], to: session)
-        XCTAssertTrue(waitUntil { finished.wait(timeout: .now()) == .success })
-        XCTAssertEqual(stagedNames, ["a.txt"])
-        Array("T".utf8).withUnsafeBufferPointer {
-            session.callbacks.remoteText?($0.baseAddress, $0.count, session.callbacks.context)
-        }
-        release.signal()
-
-        XCTAssertTrue(waitUntil { recorder.count(prefix: "Remote file materialization superseded") == 1 })
-        XCTAssertEqual(pasteboard.text, "T")
-        XCTAssertEqual(stagedNames, [])
-    }
-
-    // T-F1 (design D-3): a NULL FileContents payload is a FAIL and ends the wait at once.
-    func testFreeRDPFileContentsFailEndsTheWaitWithoutTruncation() throws {
-        let server = RangeServer()
-        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-        sendFreeRDPList([("a.txt", 3)], to: session)
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-        let stream = try XCTUnwrap(server.requests.first).stream
-        session.callbacks.remoteFileContents?(stream, nil, 0, session.callbacks.context)
-        XCTAssertTrue(waitUntil(timeout: 1) { recorder.count(prefix: "Remote file materialization failed:") == 1 })
-        XCTAssertEqual(recorder.count(prefix: "Remote file materialization failed: truncated"), 0)
-        XCTAssertEqual(stagedNames, [])
-        XCTAssertNil(pasteboard.fileURLs)
-    }
-
-    private func sendFreeRDPText(_ text: String, to session: RDPSession) {
-        Array(text.utf8).withUnsafeBufferPointer {
-            session.callbacks.remoteText?($0.baseAddress, $0.count, session.callbacks.context)
-        }
-    }
-
-    // T-T1 (design D-4, INV-T1): remote text from the channel thread is written on main.
-    func testFreeRDPRemoteTextFromChannelThreadWritesOnMain() throws {
-        let (session, pasteboard, _, _) = try freeRDPSession(RangeServer())
-        DispatchQueue.global().async { self.sendFreeRDPText("T", to: session) }
-        XCTAssertTrue(waitUntil { pasteboard.text == "T" })
-        XCTAssertEqual(pasteboard.textWritesOffMain, 0)
-    }
-
-    // T-T2: cancel stays on the channel thread, so a blocked main does not hold the range wait.
-    func testFreeRDPRemoteTextCancelsTheRangeWhileMainIsBlocked() throws {
-        let server = RangeServer()
-        let (session, _, _, _) = try freeRDPSession(server)
-        let manager = try XCTUnwrap(session.remoteFileDownloadManager)
-        let failed = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
-            do {
-                _ = try manager.materialize([RDPFileListEntry(fileName: "a.txt", byteCount: 3, localURL: nil)])
-            } catch {
-                failed.signal()
-            }
-        }
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-        DispatchQueue.global().async { self.sendFreeRDPText("T", to: session) }
-        // Main is held here; the wait has to fail without main running.
-        XCTAssertEqual(failed.wait(timeout: .now() + 2), .success)
-    }
-
-    // T-T3: two texts back to back from the channel thread leave the second on the pasteboard.
-    func testFreeRDPTwoRemoteTextsLeaveTheSecond() throws {
-        let (session, pasteboard, _, _) = try freeRDPSession(RangeServer())
-        DispatchQueue.global().async {
-            self.sendFreeRDPText("T1", to: session)
-            self.sendFreeRDPText("T2", to: session)
-        }
-        XCTAssertTrue(waitUntil { pasteboard.text == "T2" })
-        _ = waitUntil(timeout: 0.2) { false }
-        XCTAssertEqual(pasteboard.text, "T2")
-    }
-
-    // S3 (FreeRDP): disconnect while a range waits ends it at once and leaves nothing staged.
-    func testFreeRDPDisconnectEndsTheWaitingMaterialization() throws {
-        for viaCallback in [false, true] {
-            let server = RangeServer()
-            let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-            sendFreeRDPList([("a.txt", 3)], to: session)
-            XCTAssertTrue(waitUntil { server.requests.count == 1 })
-            if viaCallback {
-                session.callbacks.disconnect?(RDPBridgeDisconnectServer, 0, session.callbacks.context)
-            } else {
-                try? session.disconnect()
-            }
-            XCTAssertTrue(waitUntil(timeout: 2) { recorder.count(prefix: "Remote file materialization failed:") == 1 }, "\(viaCallback)")
-            XCTAssertEqual(stagedNames, [])
-            XCTAssertNil(pasteboard.fileURLs)
-        }
-    }
-
-    // S4 (6b): a local copy made while A materializes wins even after a poll ran.
-    func testFreeRDPLocalCopyDuringMaterializationWins() throws {
-        let server = RangeServer()
-        let (session, pasteboard, sink, recorder) = try freeRDPSession(server)
-        sendFreeRDPList([("a.txt", 3)], to: session)
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-
-        pasteboard.copyLocally("local")
-        try session.pollLocalClipboard()
-        server.answerWaiting()
-
-        XCTAssertTrue(waitUntil { recorder.count(prefix: "Remote file materialization discarded:") == 1 })
-        XCTAssertEqual(pasteboard.text, "local")
-        XCTAssertNil(pasteboard.fileURLs)
-        XCTAssertEqual(stagedNames, [])
-        XCTAssertEqual(sink.sentText, ["local"])
-        XCTAssertEqual(recorder.count(prefix: "Remote files materialized"), 0)
-    }
-
-    // S-G2 (design D-G5, INV-T1): a disconnect makes a list still queued behind a running one
-    // stale, so it never reaches the pasteboard.
-    func testFreeRDPDisconnectDropsTheQueuedList() throws {
-        for viaCallback in [true, false] {
-            let server = RangeServer(answer: true)
-            let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-            let lock = NSLock()
-            var calls = 0
-            let started = DispatchSemaphore(value: 0)
-            let release = DispatchSemaphore(value: 0)
-            session.materializeRemoteFileList = { manager, entries, shouldContinue in
-                lock.lock()
-                calls += 1
-                let first = calls == 1
-                lock.unlock()
-                if first {
-                    started.signal()
-                    release.wait()
-                }
-                return try manager.materialize(entries, shouldContinue: shouldContinue)
-            }
-
-            sendFreeRDPList([("a.txt", 3)], to: session)
-            XCTAssertTrue(waitUntil { started.wait(timeout: .now()) == .success })
-            sendFreeRDPList([("B.txt", 0)], to: session)
-            let queued = expectation(description: "the second list reached main")
-            DispatchQueue.main.async { queued.fulfill() }
-            wait(for: [queued], timeout: 2)
-            if viaCallback {
-                session.callbacks.disconnect?(RDPBridgeDisconnectServer, 0, session.callbacks.context)
-            } else {
-                try? session.disconnect()
-            }
-            release.signal()
-
-            XCTAssertTrue(waitUntil(timeout: 2) { recorder.count(prefix: "Remote file materialization failed:") == 1 }, "\(viaCallback)")
-            XCTAssertFalse(waitUntil(timeout: 1) { pasteboard.fileURLs != nil }, "\(viaCallback)")
-            XCTAssertEqual(stagedNames, [], "\(viaCallback)")
-            XCTAssertEqual(recorder.count(prefix: "Remote files materialized"), 0, "\(viaCallback)")
-        }
-    }
-
-    // S-G3 (design D-G6, INV-T2): the manager's range closure can outlive the session. Called
-    // after the last strong reference is gone, it fails without touching the freed bridge.
-    // Also run under `swift test --sanitize=address`.
-    func testFreeRDPRangeRequestAfterTheSessionIsGoneDoesNotReachTheBridge() throws {
-        var session: RDPSession? = try RDPSession(staging: staging)
-        let request = try XCTUnwrap(session?.remoteFileDownloadManager).requestRange
-        weak var released = session
-        session = nil
-        XCTAssertNil(released)
-        XCTAssertThrowsError(try request(1, 0, 0, 1)) {
-            XCTAssertEqual($0 as? RDPSessionError, .unableToCreateBridgeSession)
-        }
-    }
-
-    // S-G5 (design D-G6): a session released while a range waits ends the wait at once and
-    // removes what the list made.
-    func testFreeRDPSessionReleasedWhileARangeWaitsLeavesNothing() throws {
-        let server = RangeServer()
-        var session: RDPSession?
-        do {
-            let (created, _, _, _) = try freeRDPSession(server)
-            session = created
-        }
-        sendFreeRDPList([("a.txt", 3)], to: try XCTUnwrap(session))
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-        XCTAssertEqual(stagedNames, ["a.txt"])
-        weak var released = session
-        session = nil
-        XCTAssertNil(released)
-        XCTAssertTrue(waitUntil(timeout: 1) { self.stagedNames.isEmpty })
     }
 
     // MARK: IronRDP session (stub)
@@ -707,26 +457,6 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertEqual(stagedNames, [])
     }
 
-    // L-3 (FreeRDP close): the delegate is detached before the disconnect. The failure still
-    // writes one line to the session log file.
-    func testFreeRDPFailureAfterCloseWritesOneLogFileLine() throws {
-        let server = RangeServer()
-        let (session, pasteboard, _, recorder) = try freeRDPSession(server)
-        session.logFile = RDPSessionLogFile(url: logURL, lock: NSLock())
-        sendFreeRDPList([("secret-name.txt", 3)], to: session)
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-        session.delegate = nil
-        try? session.disconnect()
-
-        XCTAssertTrue(waitUntil(timeout: 2) { self.logLines(containing: "Remote file materialization failed:") == 1 })
-        _ = waitUntil(timeout: 0.3) { false }
-        XCTAssertEqual(logLines(containing: "Remote file materialization"), 1)
-        XCTAssertEqual(logLines(containing: "secret-name"), 0)
-        XCTAssertEqual(recorder.count(prefix: "Remote file materialization failed:"), 0)
-        XCTAssertEqual(stagedNames, [])
-        XCTAssertNil(pasteboard.fileURLs)
-    }
-
     /// Lets a materialization finish, then holds its result until `release`.
     private func holdResult(
         _ set: (@escaping (RDPRemoteFileDownloadManager, [RDPFileListEntry], () -> Bool) throws -> [URL]) -> Void
@@ -782,36 +512,6 @@ final class RemoteFileLifecycleTests: XCTestCase {
         }
     }
 
-    // L-4 (FreeRDP): a result that finished as the session went is removed with one line.
-    func testFreeRDPResultAfterTheSessionWentWritesOneDiscardedLine() throws {
-        let server = RangeServer(answer: true)
-        var session: RDPSession?
-        let pasteboard: FakePasteboard
-        do {
-            let (created, createdPasteboard, _, _) = try freeRDPSession(server)
-            session = created
-            pasteboard = createdPasteboard
-        }
-        session?.logFile = RDPSessionLogFile(url: logURL, lock: NSLock())
-        let held = holdResult { session?.materializeRemoteFileList = $0 }
-
-        sendFreeRDPList([("done.txt", 3)], to: try XCTUnwrap(session))
-        XCTAssertTrue(waitUntil { held.finished.wait(timeout: .now()) == .success })
-        XCTAssertEqual(stagedNames, ["done.txt"])
-        weak var released = session
-        session = nil
-        XCTAssertNil(released)
-        held.release.signal()
-
-        XCTAssertTrue(waitUntil(timeout: 2) { self.stagedNames.isEmpty })
-        XCTAssertTrue(waitUntil(timeout: 2) {
-            self.logLines(containing: "Remote file materialization discarded: the connection ended.") == 1
-        })
-        _ = waitUntil(timeout: 0.3) { false }
-        XCTAssertEqual(logLines(containing: "Remote file materialization"), 1)
-        XCTAssertNil(pasteboard.fileURLs)
-    }
-
     func testMaterializationLogsUseOnlySafeReasons() throws {
         let marker = "private-name-marker"
         let path = URL(fileURLWithPath: "/private/" + marker)
@@ -820,41 +520,26 @@ final class RemoteFileLifecycleTests: XCTestCase {
             (NSError(domain: marker, code: 1, userInfo: [NSLocalizedDescriptionKey: marker]), "unknown")
         ]
         for (failure, reason) in failures {
-            for iron in [false, true] {
-                for detached in [false, true] {
-                    try? FileManager.default.removeItem(at: logURL)
-                    let server = RangeServer()
-                    let prefix = "Remote file materialization failed:"
-                    let message = "\(prefix) reason=\(reason)"
-                    if iron {
-                        let (session, recorder, board) = try connectStub(server, logFileURL: logURL)
-                        defer { try? session.disconnect(); board.releaseGlobally() }
-                        let changeCount = board.changeCount
-                        session.materializeRemoteFileList = { _, _, _ in throw failure }
-                        if detached { session.delegate = nil }
-                        sendIronList([("fixture.txt", 3)], to: session)
-                        XCTAssertTrue(waitUntil { self.logLines(containing: prefix) == 1 })
-                        if !detached { XCTAssertTrue(waitUntil { recorder.count(prefix: prefix) == 1 }) }
-                        XCTAssertEqual(recorder.count(prefix: message), detached ? 0 : 1)
-                        XCTAssertEqual(recorder.count(prefix: prefix), detached ? 0 : 1)
-                        XCTAssertEqual(board.changeCount, changeCount)
-                    } else {
-                        let (session, board, _, recorder) = try freeRDPSession(server)
-                        let changeCount = board.changeCount
-                        session.logFile = RDPSessionLogFile(url: logURL, lock: NSLock())
-                        session.materializeRemoteFileList = { _, _, _ in throw failure }
-                        if detached { session.delegate = nil }
-                        sendFreeRDPList([("fixture.txt", 3)], to: session)
-                        XCTAssertTrue(waitUntil { self.logLines(containing: prefix) == 1 })
-                        if !detached { XCTAssertTrue(waitUntil { recorder.count(prefix: prefix) == 1 }) }
-                        XCTAssertEqual(recorder.count(prefix: message), detached ? 0 : 1)
-                        XCTAssertEqual(recorder.count(prefix: prefix), detached ? 0 : 1)
-                        XCTAssertEqual(board.changeCount, changeCount)
-                    }
-                    XCTAssertEqual(logLines(containing: message), 1)
-                    XCTAssertEqual(logLines(containing: marker), 0)
-                    XCTAssertTrue(stagedNames.isEmpty)
-                }
+            for detached in [false, true] {
+                try? FileManager.default.removeItem(at: logURL)
+                let server = RangeServer()
+                let prefix = "Remote file materialization failed:"
+                let message = "\(prefix) reason=\(reason)"
+                let (session, recorder, board) = try connectStub(server, logFileURL: logURL)
+                defer { try? session.disconnect(); board.releaseGlobally() }
+                let changeCount = board.changeCount
+                session.materializeRemoteFileList = { _, _, _ in throw failure }
+                if detached { session.delegate = nil }
+                sendIronList([("fixture.txt", 3)], to: session)
+                XCTAssertTrue(waitUntil { self.logLines(containing: prefix) == 1 })
+                if !detached { XCTAssertTrue(waitUntil { recorder.count(prefix: prefix) == 1 }) }
+                XCTAssertEqual(recorder.count(prefix: message), detached ? 0 : 1)
+                XCTAssertEqual(recorder.count(prefix: prefix), detached ? 0 : 1)
+                XCTAssertEqual(board.changeCount, changeCount)
+
+                XCTAssertEqual(logLines(containing: message), 1)
+                XCTAssertEqual(logLines(containing: marker), 0)
+                XCTAssertTrue(stagedNames.isEmpty)
             }
         }
     }
@@ -876,21 +561,6 @@ final class RemoteFileLifecycleTests: XCTestCase {
         XCTAssertEqual(recorder.count(prefix: "Remote file materialization failed:"), 1)
     }
 
-    // L-5 (FreeRDP): a failure on a live connection is one line in the file and one to the delegate.
-    func testFreeRDPFailureOnALiveConnectionWritesOneLine() throws {
-        let server = RangeServer()
-        let (session, _, _, recorder) = try freeRDPSession(server)
-        session.logFile = RDPSessionLogFile(url: logURL, lock: NSLock())
-        sendFreeRDPList([("a.txt", 3)], to: session)
-        XCTAssertTrue(waitUntil { server.requests.count == 1 })
-        let stream = try XCTUnwrap(server.requests.first).stream
-        session.callbacks.remoteFileContents?(stream, nil, 0, session.callbacks.context)
-
-        XCTAssertTrue(waitUntil(timeout: 2) { recorder.count(prefix: "Remote file materialization failed:") == 1 })
-        _ = waitUntil(timeout: 0.3) { false }
-        XCTAssertEqual(logLines(containing: "Remote file materialization failed:"), 1)
-        XCTAssertEqual(recorder.count(prefix: "Remote file materialization failed:"), 1)
-    }
 }
 
 /// Answers or holds range requests for one manager. Answers are the bytes "abc…" cut to length.
@@ -992,12 +662,6 @@ private final class FakePasteboard: PasteboardClient {
         lock.unlock()
     }
     func writeFileURLs(_ urls: [URL]) { lock.lock(); payload = .fileURLs(urls); count += 1; lock.unlock() }
-}
-
-private final class FakeSink: RemoteClipboardSink {
-    private(set) var sentText: [String] = []
-    func sendLocalText(_ text: String) throws { sentText.append(text) }
-    func sendLocalFiles(_ urls: [URL]) throws -> ClipboardFileOffer { .none }
 }
 
 /// A CF_FILEGROUPDESCRIPTORW with `FD_FILESIZE` entries.

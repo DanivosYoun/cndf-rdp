@@ -4,7 +4,7 @@ import RDPMacView
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPSessionDelegate, ConnectionBarViewDelegate {
     private var window: NSWindow?
-    private var session: RDPSession?
+    private var session: IronRDPSession?
     private var timer: Timer?
     private var clientView: RDPClientView?
     private var connectionBar: ConnectionBarView?
@@ -67,7 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
 
     private func connect(using options: RDPConnectionOptions, statusView view: ConnectionBarView) {
         do {
-            let session = try RDPSession()
+            let session = try IronRDPSession()
             session.delegate = self
             self.session = session
             clientView?.session = session
@@ -78,7 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
                     scale: Double(clientView.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0)
                 )
             } else {
-                try session.connect(options)
+                try session.connect(options, initialPointSize: .zero, scale: 1)
             }
             clientView?.sendForcedDesktopSize()
             view.setConnected(true)
@@ -127,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
         DispatchQueue.main.async { [weak self] in
             self?.connectionBar?.setStatus(message)
             self?.connectionBar?.setConnected(session.isConnected)
-            if message == "FreeRDP connected." || message == "Display control channel connected." {
+            if message == "IronRDP connected." || message == "Display control channel connected." {
                 self?.clientView?.sendForcedDesktopSize()
             }
             if message == "Display control channel connected." {
@@ -239,14 +239,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
         }
     }
 
-    private func sendShortcut(session: RDPSession, modifiers: [UInt16], key: UInt16) throws {
+    private func sendShortcut(session: IronRDPSession, modifiers: [UInt16], key: UInt16) throws {
         for modifier in modifiers {
-            try session.sendKey(keyCode: modifier, pressed: true)
+            try session.sendKey(keyCode: modifier, pressed: true, extended: false)
         }
-        try session.sendKey(keyCode: key, pressed: true)
-        try session.sendKey(keyCode: key, pressed: false)
+        try session.sendKey(keyCode: key, pressed: true, extended: false)
+        try session.sendKey(keyCode: key, pressed: false, extended: false)
         for modifier in modifiers.reversed() {
-            try session.sendKey(keyCode: modifier, pressed: false)
+            try session.sendKey(keyCode: modifier, pressed: false, extended: false)
         }
     }
 }

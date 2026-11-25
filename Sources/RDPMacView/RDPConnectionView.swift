@@ -35,23 +35,23 @@ public extension RDPConnectionViewDelegate {
 }
 
 public struct RDPShutdownDiagnostics: Equatable {
-    public var didWaitForFreeRDPWorker: Bool
+    public var didWaitForSession: Bool
     public var pendingMainQueueTasks: Int
     public var inFlightCommandBuffers: Int
-    public var freeRDPWorkerWaitDurationMs: Int
+    public var sessionWaitDurationMs: Int
     public var metalDrainDurationMs: Int
 
     public init(
-        didWaitForFreeRDPWorker: Bool,
+        didWaitForSession: Bool,
         pendingMainQueueTasks: Int,
         inFlightCommandBuffers: Int,
-        freeRDPWorkerWaitDurationMs: Int = 0,
+        sessionWaitDurationMs: Int = 0,
         metalDrainDurationMs: Int = 0
     ) {
-        self.didWaitForFreeRDPWorker = didWaitForFreeRDPWorker
+        self.didWaitForSession = didWaitForSession
         self.pendingMainQueueTasks = pendingMainQueueTasks
         self.inFlightCommandBuffers = inFlightCommandBuffers
-        self.freeRDPWorkerWaitDurationMs = freeRDPWorkerWaitDurationMs
+        self.sessionWaitDurationMs = sessionWaitDurationMs
         self.metalDrainDurationMs = metalDrainDurationMs
     }
 }
@@ -123,7 +123,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         }
         disconnect()
 
-        let session = try makeSession(for: options.engine)
+        let session = try IronRDPSession()
         session.delegate = self
         self.session = session
         clientView.session = session
@@ -138,16 +138,6 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
     /// The engine of the current session; nil when there is none.
     public var engine: RDPEngineKind? {
         session?.engine
-    }
-
-    /// One session class per engine (design D3); the choice is fixed for the session's lifetime.
-    private func makeSession(for engine: RDPEngineKind) throws -> RDPEngineSession {
-        switch engine {
-        case .freeRDP:
-            return try RDPSession()
-        case .ironRDP:
-            return try IronRDPSession()
-        }
     }
 
     public func disconnect() {
@@ -181,7 +171,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
 
         guard !isShutdown else {
             return RDPShutdownDiagnostics(
-                didWaitForFreeRDPWorker: false,
+                didWaitForSession: false,
                 pendingMainQueueTasks: pendingMainCallbackCount(),
                 inFlightCommandBuffers: 0
             )
@@ -195,15 +185,15 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         let renderDrainStartedAt = Date()
         let inFlightCommandBuffers = clientView.shutdownRendering(waitTimeout: 1.0)
         let renderDrainDurationMs = elapsedMilliseconds(since: renderDrainStartedAt)
-        let freeRDPWorkerWait = detachSessionForSynchronousDisconnect()
+        let sessionWait = detachSessionForSynchronousDisconnect()
         drainPendingMainCallbacks(timeout: 0.25)
         detachFromWindowContent(closeWindow)
         callbackDelegate?.rdpConnectionView(self, didChangeConnected: false)
         return RDPShutdownDiagnostics(
-            didWaitForFreeRDPWorker: freeRDPWorkerWait.didWait,
+            didWaitForSession: sessionWait.didWait,
             pendingMainQueueTasks: pendingMainCallbackCount(),
             inFlightCommandBuffers: inFlightCommandBuffers,
-            freeRDPWorkerWaitDurationMs: freeRDPWorkerWait.durationMs,
+            sessionWaitDurationMs: sessionWait.durationMs,
             metalDrainDurationMs: renderDrainDurationMs
         )
     }
@@ -438,7 +428,7 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
         delegate?.rdpConnectionView(self, didLog: message)
         enqueueMainCallback { [weak self] in
             guard let self, !self.isShutdown else { return }
-            let connected = message == "FreeRDP connected." || message == "IronRDP connected."
+            let connected = message == "IronRDP connected."
             if connected || message == "Display control channel connected." {
                 self.clientView.sendForcedDesktopSize()
             }
@@ -446,10 +436,10 @@ public final class RDPConnectionView: NSView, RDPSessionDelegate {
                 // A fresh connection starts with output allowed; re-evaluate from there.
                 self.outputSuppression.connectionDidReset()
                 self.evaluateOutputSuppression()
-            } else if message == "FreeRDP disconnected." || message == "IronRDP disconnected." {
+            } else if message == "IronRDP disconnected." {
                 self.evaluateOutputSuppression()
             }
-            if connected || message == "FreeRDP disconnected." || message == "IronRDP disconnected." {
+            if connected || message == "IronRDP disconnected." {
                 self.clientView.inputSourceConnectionDidChange()
             }
             self.delegate?.rdpConnectionView(self, didChangeConnected: session.isConnected)
