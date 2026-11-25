@@ -31,7 +31,7 @@ window.close()
 `shutdown()` is one-way. Do not call `connect(_:)` again on the same `RDPConnectionView`; create a
 new view for the next RDP window.
 
-`shutdown()` returns `RDPShutdownDiagnostics` so the host app can log whether FreeRDP worker teardown
+`shutdown()` returns `RDPShutdownDiagnostics` so the host app can log whether session teardown
 was waited, how long that wait took, how long render shutdown took, and how many queued main
 callbacks remain. The `inFlightCommandBuffers` field remains for API compatibility and is `0` with
 the current AppKit layer-backed renderer.
@@ -44,7 +44,7 @@ the current AppKit layer-backed renderer.
 - Replaces the host window's content view with an inert placeholder so AppKit's later close path no
   longer owns the RDP view.
 - Detaches the RDP session delegate and suppresses late callbacks.
-- Synchronously disconnects the RDP session so FreeRDP worker teardown is complete when shutdown
+- Synchronously disconnects the RDP session so native session teardown is complete when shutdown
   returns.
 - Drains queued main-thread RDP view callbacks before returning when possible.
 
@@ -144,7 +144,7 @@ swift test --filter RDPConnectionViewLifecycleTests/testRealSessionShutdownThenW
 ## Notes
 
 - `RDPConnectionView.disconnect()` is still available for normal in-view disconnect behavior.
-- Use `shutdown()` for window/view lifetime teardown. It may block briefly while FreeRDP exits.
+- Use `shutdown()` for window/view lifetime teardown. It may block briefly while the native session disconnects.
 - The host app should not touch renderer internals after adopting this API.
 - `shutdown()` does not keep a graveyard retain. It removes the RDP content tree from the window
   before close and disables close-owned release so normal host ARC/window-controller deallocation can

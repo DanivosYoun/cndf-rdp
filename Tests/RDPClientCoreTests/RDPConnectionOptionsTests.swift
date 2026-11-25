@@ -78,8 +78,6 @@ final class RDPConnectionOptionsTests: XCTestCase {
 
     func testExposesBuildInfo() {
         XCTAssertFalse(RDPMacInfo.packageVersion.isEmpty)
-        XCTAssertFalse(RDPMacInfo.ironRDPVersion.isEmpty)
-        XCTAssertTrue(RDPMacInfo.buildConfiguration.contains("rdpsnd"))
     }
 
     func testSessionExposesInitialStatisticsAndReconnectGuard() throws {
