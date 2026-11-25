@@ -39,7 +39,7 @@ def scenario(name, mode, width, height):
             {"op": "clipboardWaitLocalPrefix", "prefix": "I8DONE pattern", "timeout": 60},
         ]
     elif mode == "resize":
-        steps += [command("anim 32"), idle(3)]
+        steps += [command("anim 32"), idle(8)]
         burst = [(1104, 704), (900, 650), (1200, 760), (1000, 720), (1180, 740)]
         for delay, final in [(0.12, (1060, 690)), (0.4, (1160, 720))]:
             for w, h in burst:
