@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
 """M4 H.264 acceptance judge (design m4-h264-design A1/A2). Standard library only.
 
-  judge.py evaluate --case NAME --codec AVC420|AVC444v2 \
-      --freerdp DIR/RESULT.json [--ironrdp DIR/RESULT.json] [--truth SCREEN.xwd] [--out VERDICT.json]
+  judge.py evaluate --case NAME --codec CODEC --size WIDTH HEIGHT --min-frames N
+      --baseline RESULT.json --baseline-manifest SHA256SUMS [--ironrdp RESULT.json]
+      [--freerdp RESULT.json --freerdp-manifest SHA256SUMS] [--truth SCREEN.xwd] [--out VERDICT.json]
   judge.py selftest
 
-Inputs are the harness result JSON per engine (cpuWindows, finalFrame) with the PPM frames and
-session logs the run copied next to it (one directory per engine), and the server's xwd
-capture of the same screen.
-
-Checks (each pass / fail / not-run; the verdict passes only when every check passes):
-  psnr      PSNR(IronRDP last frame, FreeRDP last frame) >= 40 dB (RGB, 8 bit)
-  cpu       median IronRDP window CPU (user + system) <= 1.2 x median FreeRDP window CPU
-  codec     the FreeRDP session log's Graphics summary counted the expected codec (> 0), so
-            the comparison is really about that codec
-  run       the run script collected every engine's result and the harness exited 0
-  harness   every iteration of every engine that ran: no harness failure, connected, no
-            failed step, exactly one connection, no password in the session log
-  summary   every IronRDP iteration's own <run id>-<iteration>.session.log has exactly one
-            intact "H.264 summary" line with pictures > 0 and sessions > 0 (design
-            iron-autologon-log); a missing, malformed or repeated line fails that iteration,
-            and another iteration's line never stands in for it
-  hardware  every IronRDP iteration: summary hardware=yes
-  failures  every IronRDP iteration: summary failures=0
-An IronRDP that did not run leaves summary/hardware/failures not run (verdict incomplete).
-Diagnostics (not gating): each engine vs the xwd screen, xwd vs the animator's reference
-picture, FreeRDP run-to-run PSNR (encoder noise floor), per-half Y/Cb/Cr PSNR so a chroma
-error confined to the right half (the design's first falsification point) is visible.
+Current IronRDP sessions must prove their codec, frame count and hardware decode
+individually. CPU and PSNR use the verified IronRDP reference from the same conditions.
+Historical FreeRDP data is displayed as diagnostics.
 """
 import argparse
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -37,6 +21,7 @@ import statistics
 import struct
 import sys
 import tempfile
+from pathlib import Path
 
 PSNR_MIN_DB = 40.0
 CPU_RATIO_MAX = 1.2
@@ -52,7 +37,8 @@ class Image:
 
 
 def read_ppm(path):
-    with open(path, "rb") as f:
+    opener = gzip.open if os.fspath(path).endswith(".gz") else open
+    with opener(path, "rb") as f:
         data = f.read()
     tokens, pos = [], 0
     while len(tokens) < 4:
@@ -176,8 +162,25 @@ def rounded(value):
 
 # ---- inputs ---------------------------------------------------------------------------
 
-def load_engine(result_path):
+def frozen_file_reader(manifest, root):
+    checksums = {}
+    for line in Path(manifest).read_text().splitlines():
+        checksum, filename = line.split(maxsplit=1)
+        checksums[Path(filename).as_posix()] = checksum
+
+    def verify(path):
+        path = Path(path)
+        relative = path.resolve().relative_to(Path(root).resolve()).as_posix()
+        if hashlib.sha256(path.read_bytes()).hexdigest() != checksums.get(relative):
+            raise ValueError(f"frozen baseline SHA-256 mismatch or missing entry: {relative}")
+
+    return verify
+
+
+def load_engine(result_path, verify=None, *, read_logs=True):
     frames_dir = os.path.dirname(os.path.abspath(result_path))
+    if verify:
+        verify(result_path)
     with open(result_path) as f:
         result = json.load(f)
     iterations = [it for run in result["runs"] for it in run["iterations"]]
@@ -186,25 +189,32 @@ def load_engine(result_path):
     for it in iterations:
         final = it.get("finalFrame")
         if final:
-            frames.append((it["iteration"], read_ppm(os.path.join(frames_dir, final["file"]))))
+            path = os.path.join(frames_dir, final["file"])
+            if verify:
+                verify(path)
+            frames.append((it["iteration"], read_ppm(path)))
     logs = []
     per_iteration = []
     for run in result["runs"]:
         for it in run["iterations"]:
             path = os.path.join(frames_dir, f"{run['id']}-{it['iteration']}.session.log")
             log = None
-            if os.path.exists(path):
+            if read_logs and os.path.exists(path):
+                if verify:
+                    verify(path)
                 with open(path, errors="replace") as f:
                     log = f.read()
                 logs.append(log)
             per_iteration.append({"name": f"{run['id']}-{it['iteration']}", "result": it, "log": log})
     errors_path = os.path.join(frames_dir, "collect-errors.txt")
     collect_errors = []
-    if os.path.exists(errors_path):
+    if not verify and os.path.exists(errors_path):
         with open(errors_path) as f:
             collect_errors = [line.strip() for line in f if line.strip()]
     return {
         "engine": result.get("engine"),
+        "host": result.get("host"),
+        "baselineCodec": result.get("baselineCodec"),
         "passed": result.get("passed"),
         "iterations": len(iterations),
         "cpuWindowMs": [round(v, 3) for v in cpu],
@@ -304,55 +314,79 @@ def check(status, detail):
     return {"status": status, "detail": detail}
 
 
-def evaluate(case, codec, freerdp, ironrdp, truth=None, reference=None):
-    report = {"case": case, "codec": codec, "thresholds": {"psnrMinDb": PSNR_MIN_DB, "cpuRatioMax": CPU_RATIO_MAX}}
+CODEC_IRON = re.compile(r"\bH\.264 codec=(AVC444v2|AVC444|AVC420)\b")
+
+
+def evaluate(case, codec, freerdp, ironrdp, *, baseline, baseline_codec, size, min_frames,
+             truth=None, reference=None):
+    report = {"case": case, "codec": codec, "thresholds": {"psnrMinDb": PSNR_MIN_DB,
+              "cpuRatioMax": CPU_RATIO_MAX, "minFrames": min_frames}}
     checks = {}
-    engines = {"freerdp": freerdp, "ironrdp": ironrdp}
+    engines = {"freerdp": freerdp, "ironrdp": ironrdp, "ironrdpBaseline": baseline}
     report["engines"] = {
         name: None if e is None else {k: e[k] for k in ("engine", "passed", "iterations", "cpuWindowMs", "framesInWindow")}
-        | {"framesDumped": len(e["frames"])}
+        | {"framesDumped": len(e["frames"]), "host": e.get("host")}
         for name, e in engines.items()
     }
 
     last = {name: (e["frames"][-1][1] if e and e["frames"] else None) for name, e in engines.items()}
-    if last["freerdp"] is None:
-        checks["psnr"] = check("fail", "no FreeRDP final frame")
-    elif last["ironrdp"] is None:
-        checks["psnr"] = check("not-run", "no IronRDP final frame")
-    else:
-        value = psnr(last["ironrdp"], last["freerdp"])
-        report["psnrEnginesDb"] = rounded(value)
-        report["regionPsnrEngines"] = region_psnr(last["ironrdp"], last["freerdp"])
-        if value is None:
-            checks["psnr"] = check("fail", f"frame sizes differ: IronRDP {last['ironrdp'].width}x{last['ironrdp'].height}, "
-                                           f"FreeRDP {last['freerdp'].width}x{last['freerdp'].height}")
+    report["freerdpCodecCounts"] = freerdp_codec_counts(freerdp["logs"]) if freerdp else None
+    for name in ("cpu", "psnr", "codec", "frames", "size", "host"):
+        checks[name] = check("not-run", "no current IronRDP result")
+    if ironrdp and ironrdp["iterations"]:
+        iterations = ironrdp["perIteration"]
+        codecs = [set(CODEC_IRON.findall(it["log"] or "")) for it in iterations]
+        invalid_codec = [it["name"] for it, observed in zip(iterations, codecs) if len(observed) != 1]
+        if invalid_codec or any(observed != codecs[0] for observed in codecs):
+            checks["codec"] = check("fail", "missing or mixed codec: " + (", ".join(invalid_codec) or "across iterations"))
+        elif codecs[0] != {codec}:
+            checks["codec"] = check("not-run", f"observed {next(iter(codecs[0]))}, scenario requires {codec}")
         else:
+            checks["codec"] = check("pass", codec)
+        counts = ironrdp["framesInWindow"]
+        enough_frames = len(counts) == len(iterations) and all(n >= min_frames for n in counts)
+        checks["frames"] = check("pass" if enough_frames else "fail", f"{counts}, minimum={min_frames}")
+        sizes = [(frame.width, frame.height) for _, frame in ironrdp["frames"]]
+        valid_size = len(sizes) == len(iterations) and all(
+            frame_size == size and it["result"]["finalFrame"].get("size") == list(size)
+            for frame_size, it in zip(sizes, iterations))
+        checks["size"] = check("pass" if valid_size else "fail", f"{sizes}, required={size}")
+
+        host = ironrdp.get("host") or {}
+        baseline_host = baseline.get("host") or {}
+        if not host.get("hostName"):
+            checks["host"] = check("fail", "current client host missing")
+        else:
+            checks["host"] = check("pass" if host == baseline_host else "not-run", f"{host} vs {baseline_host}")
+        baseline_sizes = {(f.width, f.height) for _, f in baseline["frames"]}
+        baseline_counts = baseline["framesInWindow"]
+        comparable = (checks["host"]["status"] == "pass" and checks["codec"]["status"] == "pass"
+                      and valid_size and enough_frames
+                      and baseline_codec == codec and baseline_sizes == {size} and baseline_counts
+                      and all(n >= min_frames for n in baseline_counts) and baseline["passed"] is True
+                      and baseline["engine"] == "ironrdp")
+        if not comparable:
+            for name in ("cpu", "psnr"):
+                checks[name] = check("not-run", "IronRDP comparison conditions missing or different")
+        else:
+            cpu_base = statistics.median(baseline["cpuWindowMs"])
+            cpu_iron = statistics.median(ironrdp["cpuWindowMs"])
+            ratio = cpu_iron / cpu_base if cpu_base > 0 else math.inf
+            report["cpuMedianMs"] = {"ironrdpBaseline": cpu_base, "ironrdp": cpu_iron}
+            report["cpuRatio"] = rounded(ratio)
+            checks["cpu"] = check("pass" if ratio <= CPU_RATIO_MAX else "fail", f"{ratio:.3f}x")
+            value = psnr(last["ironrdp"], last["ironrdpBaseline"])
+            report["psnrEnginesDb"] = rounded(value)
+            report["regionPsnrEngines"] = region_psnr(last["ironrdp"], last["ironrdpBaseline"])
             checks["psnr"] = check("pass" if value >= PSNR_MIN_DB else "fail", f"{rounded(value)} dB")
 
-    cpu_free = statistics.median(freerdp["cpuWindowMs"]) if freerdp and freerdp["cpuWindowMs"] else None
-    cpu_iron = statistics.median(ironrdp["cpuWindowMs"]) if ironrdp and ironrdp["cpuWindowMs"] else None
-    report["cpuMedianMs"] = {"freerdp": cpu_free, "ironrdp": cpu_iron}
-    if cpu_free is None:
-        checks["cpu"] = check("fail", "no FreeRDP cpuWindow")
-    elif cpu_iron is None:
-        checks["cpu"] = check("not-run", "no IronRDP cpuWindow")
-    else:
-        ratio = cpu_iron / cpu_free if cpu_free > 0 else math.inf
-        report["cpuRatio"] = round(ratio, 3)
-        checks["cpu"] = check("pass" if ratio <= CPU_RATIO_MAX else "fail", f"{ratio:.3f}x")
-
-    counts = freerdp_codec_counts(freerdp["logs"]) if freerdp else None
-    report["freerdpCodecCounts"] = counts
-    if counts is None:
-        checks["codec"] = check("fail", "no FreeRDP Graphics summary in the session logs")
-    else:
-        checks["codec"] = check("pass" if counts.get(codec, 0) > 0 else "fail", f"{codec}={counts.get(codec, 0)}")
-
-    ran = [e for e in (freerdp, ironrdp) if e is not None]
-    collect = [f"{e.get('engine') or '?'}: {err}" for e in ran for err in e["collectErrors"]]
-    checks["run"] = check("fail" if collect else "pass", "; ".join(collect) or "all results collected")
-    problems = [p for e in ran for p in harness_problems(e)]
-    checks["harness"] = check("fail" if problems else "pass", "; ".join(problems) or "every iteration passed")
+    if ironrdp is not None:
+        collect = ironrdp["collectErrors"]
+        checks["run"] = check("fail" if collect else "pass", "; ".join(collect) or "current result collected")
+        problems = harness_problems(ironrdp)
+        if ironrdp["passed"] is not True or ironrdp["engine"] != "ironrdp":
+            problems.append("current IronRDP harness did not pass")
+        checks["harness"] = check("fail" if problems else "pass", "; ".join(problems) or "every iteration passed")
 
     report["ironrdpH264"] = ironrdp_h264(ironrdp["logs"]) if ironrdp else None
     if ironrdp is None:
@@ -365,7 +399,9 @@ def evaluate(case, codec, freerdp, ironrdp, truth=None, reference=None):
             for name in ("summary", "hardware", "failures"):
                 checks[name] = check("fail", "IronRDP ran no iteration")
         else:
-            bad = [f"{n}: {p}" for n, _, p in per if p]
+            low_picture_count = f"decoded pictures below {min_frames}"
+            bad = [f"{n}: {problem or low_picture_count}"
+                   for n, summary, problem in per if problem or summary["pictures"] < min_frames]
             checks["summary"] = check("fail" if bad else "pass", "; ".join(bad) or f"{len(per)} iterations, one summary each")
             hw = [f"{n}: hardware={s['hardware'] if s else 'none'}" for n, s, _ in per if not s or s["hardware"] != "yes"]
             checks["hardware"] = check("fail" if hw else "pass", "; ".join(hw) or "hardware=yes in every iteration")
@@ -384,8 +420,7 @@ def evaluate(case, codec, freerdp, ironrdp, truth=None, reference=None):
         first = freerdp["frames"][0][1]
         diagnostics["freerdpRunToRunDb"] = [rounded(psnr(first, img)) for _, img in freerdp["frames"][1:]]
     report["diagnostics"] = diagnostics
-    # Not gating (the design gates on IronRDP vs FreeRDP): when FreeRDP itself is below the
-    # threshold against the server screen, a psnr pass only means IronRDP matches FreeRDP.
+    # Report historical FreeRDP picture quality for reference.
     reference_db = diagnostics.get("freerdpVsScreenDb")
     if isinstance(reference_db, (int, float)) and reference_db < PSNR_MIN_DB:
         report["warnings"] = [f"FreeRDP vs server screen {reference_db} dB < {PSNR_MIN_DB} dB: "
@@ -459,7 +494,7 @@ def write_case(root, engine, run_id, frames, cpu_ms, log_lines, logs=None, resul
         iterations.append(iteration)
     path = os.path.join(directory, f"{engine}.json")
     with open(path, "w") as f:
-        json.dump({"engine": engine, "passed": True, "runs": [{"id": run_id, "iterations": iterations}]}, f)
+        json.dump({"engine": engine, "passed": True, "host": {"hostName": "fixture"}, "runs": [{"id": run_id, "iterations": iterations}]}, f)
     if errors:
         with open(os.path.join(directory, "collect-errors.txt"), "w") as f:
             f.write("\n".join(errors) + "\n")
@@ -473,7 +508,8 @@ def selftest():
     free_log = ["Graphics: summary rdpgfx=10.7 mode=auto AVC420=0 AVC444=0 AVC444v2=97 surfaceCommands:x."]
     decoder = "2026-11-23T02:00:00Z H.264 decoder: VideoToolbox hardware 256x128 range=full"
     good = "2026-11-23T02:00:09Z H.264 summary pictures=97 failures=0 idr_waits=0 sessions=1 hardware=yes"
-    iron_ok = [decoder, good]
+    codec_line = "H.264 codec=AVC444v2"
+    iron_ok = [codec_line, decoder, good]
     h264 = {"summary", "hardware", "failures"}
     frames = lambda: [perturbed(ref, s, 1) for s in (7, 8, 9)]  # noqa: E731
     # name, iron frames, iron cpu, iron log, codec, expected verdict, expected failing checks, write_case extras
@@ -483,31 +519,38 @@ def selftest():
         ("fail: cpu 1.3x", frames(), 130, iron_ok, "AVC444v2", "fail", {"cpu"}, {}),
         ("fail: right-half chroma shifted 16", [right_half_chroma_shift(ref, 16)] * 3, 100, iron_ok, "AVC444v2", "fail", {"psnr"}, {}),
         ("fail: frame size differs", [Image(width - 16, height, ref.rgb[:(width - 16) * height * 3])] * 3, 100, iron_ok,
-         "AVC444v2", "fail", {"psnr"}, {}),
+         "AVC444v2", "fail", {"size"}, {}),
         ("fail: software decoder, 2 failures", frames(), 100,
-         ["H.264 decoder: VideoToolbox software 256x128 range=full",
-          "H.264 summary pictures=95 failures=2 idr_waits=1 sessions=2 hardware=no"], "AVC444v2", "fail",
+         [codec_line, "H.264 decoder: VideoToolbox software 256x128 range=full",
+          "H.264 summary pictures=97 failures=2 idr_waits=1 sessions=2 hardware=no"], "AVC444v2", "fail",
          {"hardware", "failures"}, {}),
-        ("fail: expected codec not used", frames(), 100, iron_ok, "AVC420", "fail", {"codec"}, {}),
+        ("incomplete: observed codec differs", frames(), 100, iron_ok, "AVC420", "incomplete", set(), {}),
+        ("fail: only historical codec present", frames(), 100, [decoder, good],
+         "AVC444v2", "fail", {"codec"}, {}),
+        ("fail: CPU window has one frame", frames(), 100, iron_ok, "AVC444v2", "fail", {"frames"},
+         {"results": {1: {"cpuWindows": [{"userMs": 80, "systemMs": 20, "framesReceived": 1}]}}}),
+        ("fail: summary has one decoded picture", frames(), 100,
+         [codec_line, decoder, good.replace("pictures=97", "pictures=1")], "AVC444v2", "fail", {"summary"}, {}),
+        ("incomplete: client host differs", frames(), 100, iron_ok, "AVC444v2", "incomplete", set(), {}),
         ("incomplete: no IronRDP run", None, None, None, "AVC444v2", "incomplete", set(), {}),
         # Design iron-autologon-log: each iteration needs its own intact summary.
-        ("fail: IronRDP logs without summaries", frames(), 100, [decoder], "AVC444v2", "fail", h264, {}),
+        ("fail: IronRDP logs without summaries", frames(), 100, [codec_line, decoder], "AVC444v2", "fail", h264, {}),
         ("fail: one iteration's summary deleted", frames(), 100, None, "AVC444v2", "fail", h264,
-         {"logs": [iron_ok, [decoder], iron_ok]}),
+         {"logs": [iron_ok, [codec_line, decoder], iron_ok]}),
         ("fail: one iteration's summary corrupted", frames(), 100, None, "AVC444v2", "fail", h264,
-         {"logs": [iron_ok, [decoder, good.replace("sessions=1", "sessions=one")], iron_ok]}),
+         {"logs": [iron_ok, [codec_line, decoder, good.replace("sessions=1", "sessions=one")], iron_ok]}),
         ("fail: one iteration's summary duplicated", frames(), 100, None, "AVC444v2", "fail", h264,
-         {"logs": [iron_ok, [decoder, good, good], iron_ok]}),
+         {"logs": [iron_ok, [codec_line, decoder, good, good], iron_ok]}),
         ("fail: a missing summary filled by another iteration's duplicate", frames(), 100, None, "AVC444v2", "fail",
-         h264, {"logs": [iron_ok, [decoder], [decoder, good, good]]}),
-        ("fail: one iteration's session log missing", frames(), 100, None, "AVC444v2", "fail", h264,
+         h264, {"logs": [iron_ok, [codec_line, decoder], [codec_line, decoder, good, good]]}),
+        ("fail: one iteration's session log missing", frames(), 100, None, "AVC444v2", "fail", h264 | {"codec"},
          {"logs": [iron_ok, None, iron_ok]}),
         ("fail: pictures=0", frames(), 100, None, "AVC444v2", "fail", {"summary"},
-         {"logs": [iron_ok, [decoder, good.replace("pictures=97", "pictures=0")], iron_ok]}),
+         {"logs": [iron_ok, [codec_line, decoder, good.replace("pictures=97", "pictures=0")], iron_ok]}),
         ("fail: failures=1", frames(), 100, None, "AVC444v2", "fail", {"failures"},
-         {"logs": [iron_ok, [decoder, good.replace("failures=0", "failures=1")], iron_ok]}),
+         {"logs": [iron_ok, [codec_line, decoder, good.replace("failures=0", "failures=1")], iron_ok]}),
         ("fail: hardware=mixed", frames(), 100, None, "AVC444v2", "fail", {"hardware"},
-         {"logs": [iron_ok, [decoder, good.replace("hardware=yes", "hardware=mixed")], iron_ok]}),
+         {"logs": [iron_ok, [codec_line, decoder, good.replace("hardware=yes", "hardware=mixed")], iron_ok]}),
         ("fail: an iteration the harness failed", frames(), 100, iron_ok, "AVC444v2", "fail", {"harness"},
          {"results": {2: {"failure": "connectThrew"}}}),
         ("fail: an iteration with two connections", frames(), 100, iron_ok, "AVC444v2", "fail", {"harness"},
@@ -517,11 +560,11 @@ def selftest():
                                     "waitLogin:refused:failed", "cpuWindow:skipped", "shutdown:ok"]}}}),
         ("fail: the run script reported a collection error", frames(), 100, iron_ok, "AVC444v2", "fail", {"run"},
          {"errors": ["rdp-engine-harness exit 1"]}),
-        ("fail: IronRDP result not collected", "missing", None, None, "AVC444v2", "fail", {"run"} | h264, {}),
+        ("fail: IronRDP result not collected", "missing", None, None, "AVC444v2", "fail", {"run", "harness"} | h264, {}),
     ]
     failures = 0
     for name, iron_frames, iron_cpu, iron_log, codec, want, want_failing, extra in cases:
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR") or os.getcwd()) as d:
             free = write_case(d, "freerdp", "case", [perturbed(ref, s, 1) for s in (1, 2, 3)], [100, 90, 110], free_log)
             if iron_frames == "missing":
                 iron_engine = missing_engine(["result.json not collected"])
@@ -529,10 +572,16 @@ def selftest():
                 iron_engine = None
             else:
                 iron_engine = load_engine(write_case(d, "ironrdp", "case", iron_frames, [iron_cpu] * 3, iron_log, **extra))
+            baseline = load_engine(write_case(d, "ironrdp-baseline", "case", frames(), [100, 90, 110], []))
+            baseline["engine"] = "ironrdp"
+            if name == "incomplete: client host differs":
+                iron_engine["host"] = {"hostName": "different"}
             truth_path = os.path.join(d, "screen.xwd")
             write_xwd(truth_path, ref)
             truth = read_xwd(truth_path)
-            report = evaluate(name, codec, load_engine(free), iron_engine, truth=truth, reference=ref)
+            report = evaluate(name, codec, load_engine(free), iron_engine, baseline=baseline,
+                              baseline_codec="AVC444v2", size=(width, height), min_frames=97,
+                              truth=truth, reference=ref)
         failing = {k for k, c in report["checks"].items() if c["status"] == "fail"}
         ok = (report["verdict"] == want and failing == want_failing and "warnings" not in report
               and report["diagnostics"]["screenVsReferenceDb"] == "inf")
@@ -544,18 +593,37 @@ def selftest():
         print(f"{'ok  ' if ok else 'FAIL'} {name}: verdict={report['verdict']} failing={sorted(failing)} "
               f"psnr={report.get('psnrEnginesDb')} cpuRatio={report.get('cpuRatio')}{extra_text}")
     # The FreeRDP reference itself off the screen (seen on B2 1104x704): verdict unchanged, warning set.
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR") or os.getcwd()) as d:
         shifted = right_half_chroma_shift(ref, 16)
         free = write_case(d, "freerdp", "case", [shifted] * 3, [100] * 3, free_log)
         iron = write_case(d, "ironrdp", "case", [shifted] * 3, [100] * 3, iron_ok)
         truth_path = os.path.join(d, "screen.xwd")
         write_xwd(truth_path, ref)
         report = evaluate("pass + warning: FreeRDP reference off the screen", "AVC444v2", load_engine(free),
-                          load_engine(iron), truth=read_xwd(truth_path), reference=ref)
+                          load_engine(iron), baseline=load_engine(iron), baseline_codec="AVC444v2",
+                          size=(width, height), min_frames=97, truth=read_xwd(truth_path), reference=ref)
     ok = report["verdict"] == "pass" and len(report.get("warnings", [])) == 1
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'} {report['case']}: verdict={report['verdict']} warnings={report.get('warnings')}")
-    total = len(cases) + 1
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR") or os.getcwd()) as d:
+        result_path = Path(write_case(d, "ironrdp", "case", [ref], [100], iron_ok))
+        sidecar = result_path.parent / "case-1.final.ppm"
+        manifest = result_path.parent / "SHA256SUMS"
+        manifest.write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                                    for path in (result_path, sidecar)))
+        verify = frozen_file_reader(manifest, result_path.parent)
+        load_engine(result_path, verify, read_logs=False)
+        original = sidecar.read_bytes()
+        sidecar.write_bytes(original + b"changed")
+        try:
+            load_engine(result_path, verify, read_logs=False)
+        except ValueError as error:
+            ok = "SHA-256 mismatch" in str(error)
+        else:
+            ok = False
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} changed frozen frame rejected")
+    total = len(cases) + 2
     print(f"selftest: {total - failures}/{total} cases as expected")
     return 1 if failures else 0
 
@@ -566,7 +634,12 @@ def main():
     ev = sub.add_parser("evaluate")
     ev.add_argument("--case", required=True)
     ev.add_argument("--codec", required=True, choices=["AVC420", "AVC444", "AVC444v2"])
-    ev.add_argument("--freerdp", required=True)
+    ev.add_argument("--size", nargs=2, type=int, required=True)
+    ev.add_argument("--min-frames", type=int, required=True)
+    ev.add_argument("--baseline", required=True)
+    ev.add_argument("--baseline-manifest", required=True)
+    ev.add_argument("--freerdp")
+    ev.add_argument("--freerdp-manifest")
     ev.add_argument("--ironrdp")
     ev.add_argument("--truth", help="server xwd capture of the final screen")
     ev.add_argument("--out")
@@ -574,7 +647,16 @@ def main():
     args = parser.parse_args()
     if args.command == "selftest":
         return selftest()
-    freerdp = load_engine(args.freerdp)
+    if args.min_frames < 1 or min(args.size) < 1 or bool(args.freerdp) != bool(args.freerdp_manifest):
+        ev.error("positive size and frame minimum required; supply both FreeRDP result and manifest")
+    try:
+        baseline = load_engine(args.baseline, frozen_file_reader(args.baseline_manifest, Path(args.baseline).parent),
+                               read_logs=False)
+        freerdp = load_engine(args.freerdp, frozen_file_reader(args.freerdp_manifest,
+                                                              Path(args.freerdp_manifest).parent)) if args.freerdp else None
+    except (OSError, ValueError) as error:
+        print(f"baseline verification failed: {error}", file=sys.stderr)
+        return 1
     ironrdp = None
     if args.ironrdp and os.path.exists(args.ironrdp):
         ironrdp = load_engine(args.ironrdp)
@@ -586,7 +668,9 @@ def main():
                 ironrdp = missing_engine([line.strip() for line in f if line.strip()] + ["no result.json"])
     truth = read_xwd(args.truth) if args.truth else None
     reference = reference_image(truth.width, truth.height) if truth else None
-    report = evaluate(args.case, args.codec, freerdp, ironrdp, truth=truth, reference=reference)
+    report = evaluate(args.case, args.codec, freerdp, ironrdp, baseline=baseline,
+                      baseline_codec=baseline["baselineCodec"], size=tuple(args.size), min_frames=args.min_frames,
+                      truth=truth, reference=reference)
     text = json.dumps(report, indent=2, ensure_ascii=False)
     if args.out:
         with open(args.out, "w") as f:

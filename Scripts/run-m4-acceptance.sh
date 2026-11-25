@@ -9,7 +9,7 @@
 #   HARNESS_BATCH=<batch8> Scripts/run-m4-acceptance.sh down      # remove containers, tunnel, Mac dir, secrets
 #
 # B3-GFX xrdp 0.10.5 + x264 runs IronRDP at 1280x720 and records AVC420 evidence.
-# The offline judge compares against the frozen FreeRDP result and its frame/log sidecars.
+# The judge compares against the verified IronRDP baseline and prints historical FreeRDP diagnostics.
 # B3 logs on with the scenario password (Client Info autologon, no typing): the script watches
 # the server's login results and hands each to its iteration (<run id>-<n>.login on the Mac),
 # and the scenario's waitLogin step sends no key before "ok".
@@ -19,7 +19,7 @@
 #
 # Environment:
 #   HARNESS_BATCH    label value for roster.batch (required except for selftest)
-#   M4_FREERDP_BASELINE  Frozen B3 result JSON with frame and session-log sidecars
+#   M4_FREERDP_BASELINE / M4_FREERDP_MANIFEST  Historical B3 result and checksum manifest
 #   HARNESS_WORK     Linux state dir   (default ~/.cache/m4-acceptance-$HARNESS_BATCH)
 #   HARNESS_MAC      ssh target        (default danivosy@192.168.3.105)
 #   HARNESS_MAC_DIR  dir under Mac ~   (default xcode-work/m4-acceptance-$HARNESS_BATCH)
@@ -34,11 +34,14 @@ M4_DIR="${ROOT_DIR}/Harness/docker/m4"
 JUDGE="${M4_DIR}/judge.py"
 
 if [[ "${1:-}" == selftest ]]; then
-  exec python3 -I "${JUDGE}" selftest
+  exec python3 -IB "${JUDGE}" selftest
 fi
 
 : "${HARNESS_BATCH:?set HARNESS_BATCH (roster batch id, used as the container label)}"
-BASELINE="${M4_FREERDP_BASELINE:-${HOME}/Documents/CNDF-Docs/2026-11-26/ironrdp/freerdp-baseline/m4-k3/b3-1280x720/freerdp/result.json}"
+IRON_BASELINE="${M4_DIR}/baselines/2026-11-23-ironrdp"
+FROZEN_FREERDP="${HOME}/Documents/CNDF-Docs/2026-11-26/ironrdp/freerdp-baseline"
+FREE_BASELINE="${M4_FREERDP_BASELINE:-${FROZEN_FREERDP}/m4-k3/b3-1280x720/freerdp/result.json}"
+FREE_MANIFEST="${M4_FREERDP_MANIFEST:-${FROZEN_FREERDP}/SHA256SUMS}"
 WORK="${HARNESS_WORK:-${HOME}/.cache/m4-acceptance-${HARNESS_BATCH}}"
 MAC="${HARNESS_MAC:-danivosy@192.168.3.105}"
 MAC_DIR="${HARNESS_MAC_DIR:-xcode-work/m4-acceptance-${HARNESS_BATCH}}"
@@ -236,10 +239,14 @@ run_case() {
   docker exec "$(name b3)" sh -c 'tail -200 /var/log/xrdp.log; tail -100 /var/log/xrdp-sesman.log' \
     > "${dir}/server.log" 2>&1 || true
   docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
-  args=(evaluate --case "${case}" --codec AVC420 --freerdp "${BASELINE}"
+  args=(evaluate --case "${case}" --codec AVC420 --size 1280 720 --min-frames 97
+        --baseline "${IRON_BASELINE}/result.json" --baseline-manifest "${IRON_BASELINE}/SHA256SUMS"
         --ironrdp "${dir}/ironrdp/result.json" --out "${dir}/verdict.json")
+  if [[ -n "${M4_FREERDP_BASELINE:-}${M4_FREERDP_MANIFEST:-}" || -e "${FREE_BASELINE}" || -e "${FREE_MANIFEST}" ]]; then
+    args+=(--freerdp "${FREE_BASELINE}" --freerdp-manifest "${FREE_MANIFEST}")
+  fi
   [[ -n "${truth}" && -s "${truth}" ]] && args+=(--truth "${truth}")
-  python3 -I "${JUDGE}" "${args[@]}" || status=$?
+  python3 -IB "${JUDGE}" "${args[@]}" || status=$?
   return "${status}"
 }
 

@@ -22,26 +22,35 @@ from the historical harness revision.
    none arrived for 2 s and writes it as PPM;
 4. shutdown.
 
-The driver captures the final server screen with `xwd -root`. The judge reads the
-frozen reference via `M4_FREERDP_BASELINE`. Its full comparison requires the original
-frame and log sidecars alongside the JSON. The judge checks:
+The driver captures the final server screen with `xwd -root`. The judge verifies
+the IronRDP baseline JSON and frame with the tracked `SHA256SUMS` before reading
+them. The comparison uses the five B3 autologon acceptance iterations from
+`iron-autologon-raw/b3/b3-1280x720/ironrdp/result.json` in CNDF-Docs
+(original SHA-256 `0cae95e82734ea33b3967f9502746755652c6f7768ff7ad18553aa4034a5132e`).
+The B3-GFX fixture fixes AVC420. The five recorded final frame hashes match the
+IronRDP frame retained by `int16-a1-login`, so the baseline stores a single gzip
+copy of those PPM bytes.
 
-| Check | Rule | Without K1 |
-|---|---|---|
-| `psnr` | PSNR(IronRDP last frame, FreeRDP last frame) ≥ 40 dB | not-run |
-| `cpu` | median IronRDP window CPU ≤ 1.2 × median FreeRDP | not-run |
-| `codec` | FreeRDP `Graphics: summary` counted the expected codec | runs |
-| `hardware` | IronRDP log `H.264 decoder: VideoToolbox hardware` and summary `hardware=yes` | not-run |
-| `failures` | IronRDP log `H.264 summary … failures=0` | not-run |
+| Check | Rule |
+|---|---|
+| `psnr` | PSNR of current and frozen IronRDP final frames ≥ 40 dB |
+| `cpu` | Median current IronRDP window CPU ≤ 1.2 × frozen IronRDP median |
+| `codec` | Each current session log identifies the requested codec with `H.264 codec=AVC420` for B3 |
+| `frames` | At least 97 frames during each current CPU window and 97 decoded pictures in each summary |
+| `hardware` | Each current H.264 summary reports `hardware=yes` |
+| `failures` | Each current H.264 summary reports `failures=0` |
 
-Diagnostics (not gating): each engine vs the xwd screen, the xwd screen vs the animator's
-reference picture (checks the capture path, must be `inf`), FreeRDP run-to-run PSNR and
-left/right-half Y/Cb/Cr PSNR. A warning is printed when FreeRDP itself is below 40 dB against
-the screen. Exit status: 0 pass, 3 some check not run, 1 fail.
-`judge.py selftest` (`Scripts/run-m4-acceptance.sh selftest`) runs the same readers and rules on
-synthetic inputs: independent-encode noise, CPU 1.0×/1.2×/1.3×, right-half chroma shifted 16
-columns, size mismatch, software decoder with failures, wrong codec, missing IronRDP, missing K1
-log lines, FreeRDP reference off the screen.
+The judge compares client host identities and validates each frame against the
+scenario resolution. A different comparison host or baseline codec/size leaves
+the comparison incomplete. The current IronRDP runtime logs H.264 decoding and
+summary data. It needs explicit AVC codec logging for real runs to pass this
+gate.
+
+When historical FreeRDP data is present, the judge verifies its JSON, frames and
+session logs using the archive's `SHA256SUMS`, then reports them as diagnostics.
+Exit status is 0 for pass, 3 for incomplete and 1 for failure.
+`Scripts/run-m4-acceptance.sh selftest` exercises the offline judge with synthetic
+data and checks that a changed frozen frame is rejected.
 
 ## FreeRDP baseline 2026-11-23 (`baselines/2026-11-23-freerdp/`)
 

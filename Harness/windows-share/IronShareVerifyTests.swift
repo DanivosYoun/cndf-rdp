@@ -481,7 +481,7 @@ final class IronShareVerifyTests: XCTestCase {
         log = ISVLog(path: "\(out)/\(run).mac.jsonl")
         let password = try String(contentsOfFile: passwordFile, encoding: .utf8).trimmingCharacters(in: .newlines)
         let port = UInt16(env["ISV_PORT"] ?? "33389")!
-        log.write("start", ["mode": mode, "engine": engine.rawValue, "run": run])
+        log.write("start", ["mode": mode, "engine": RDPEngineKind.ironRDP.rawValue, "run": run])
         switch mode {
         case "share": try await runShare(port: port, password: password)
         case "display": try await runDisplay(port: port, password: password)
