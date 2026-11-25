@@ -4,6 +4,8 @@ mod abi;
 mod channels;
 mod clipboard;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
+mod codec_log;
+#[cfg(all(feature = "engine", not(feature = "stub")))]
 mod engine;
 #[cfg(all(feature = "engine", not(feature = "stub")))]
 mod errors;
@@ -141,6 +143,8 @@ struct Connection {
     /// This generation's H.264 decode totals, summarized once when it ends.
     #[cfg(not(feature = "stub"))]
     h264: Arc<h264::Totals>,
+    #[cfg(not(feature = "stub"))]
+    codecs: Arc<codec_log::Totals>,
 }
 
 impl Connection {
@@ -161,9 +165,9 @@ impl Connection {
         }
     }
 
-    /// Ends the generation with the callback gate held: its H.264 summary goes out first, then
+    /// Ends the generation with the callback gate held: its decode summaries go out first, then
     /// `end` runs the failure or disconnect callbacks. After destroy closed the gate, destroy
-    /// logs the summary instead.
+    /// logs the summaries instead.
     fn end(&self, end: impl FnOnce(CNDFIronCallbacks)) {
         self.callbacks.invoke(|table| {
             self.log_summary(table);
@@ -171,11 +175,11 @@ impl Connection {
         });
     }
 
-    /// Seals the generation's H.264 totals; the first call logs their summary.
+    /// Seals the generation's decode totals; the first call logs their summaries.
     /// Call with the callback gate held.
     fn log_summary(&self, table: CNDFIronCallbacks) {
         #[cfg(not(feature = "stub"))]
-        if let Some(summary) = self.h264.seal() {
+        for summary in [self.h264.seal(), self.codecs.seal()].into_iter().flatten() {
             let level = CNDFIronLogLevel::CNDF_IRON_LOG_INFO;
             if let (Some(callback), true) = (table.log, level as u32 >= self.log_level as u32) {
                 callback(
@@ -381,7 +385,7 @@ pub extern "C" fn cndf_iron_version() -> *const c_char {
         let version = concat!(
             "cndf-ironrdp ",
             env!("CARGO_PKG_VERSION"),
-            " ironrdp=293cb4bee90b patches=34\0"
+            " ironrdp=293cb4bee90b patches=35\0"
         );
         version.as_ptr().cast()
     })
@@ -561,6 +565,8 @@ pub unsafe extern "C" fn cndf_iron_connect(
             statistics: Arc::clone(&session.statistics),
             #[cfg(not(feature = "stub"))]
             h264: Arc::default(),
+            #[cfg(not(feature = "stub"))]
+            codecs: Arc::default(),
         });
         let (commands, incoming) = mpsc::sync_channel(128);
         let (start, ready) = mpsc::channel();
@@ -871,6 +877,8 @@ mod tests {
             statistics: Arc::clone(&owner.statistics),
             #[cfg(not(feature = "stub"))]
             h264: Arc::default(),
+            #[cfg(not(feature = "stub"))]
+            codecs: Arc::default(),
         });
         let worker = Arc::clone(&connection);
         let wait = Arc::clone(&release);

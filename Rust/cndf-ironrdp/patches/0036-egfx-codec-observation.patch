@@ -1,0 +1,199 @@
+diff --git a/crates/ironrdp-client/src/config.rs b/crates/ironrdp-client/src/config.rs
+index beac890..0c7ad6e 100644
+--- a/crates/ironrdp-client/src/config.rs
++++ b/crates/ironrdp-client/src/config.rs
+@@ -130,6 +130,7 @@ pub struct Config {
+     pub(crate) tls_upgrader: Option<Arc<dyn TlsUpgrader>>,
+     /// CNDF: see [`Config::with_tls_only_autologon`].
+     pub(crate) tls_only_autologon: Option<Arc<core::sync::atomic::AtomicBool>>,
++    pub(crate) egfx_codec_observer: Option<Arc<dyn Fn(ironrdp_egfx::client::CodecEvent) + Send + Sync>>,
+     #[cfg(feature = "sound")]
+     pub(crate) audio_wave_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+     #[cfg(feature = "entra-auth")]
+@@ -214,6 +215,16 @@ impl Config {
+         self
+     }
+
++    /// Observes EGFX surface codec metadata. The callback runs on the session thread.
++    #[must_use]
++    pub fn with_egfx_codec_observer(
++        mut self,
++        observer: Arc<dyn Fn(ironrdp_egfx::client::CodecEvent) + Send + Sync>,
++    ) -> Self {
++        self.egfx_codec_observer = Some(observer);
++        self
++    }
++
+     /// Observes each wave delivered to the shared playback handler.
+     /// The callback runs on the session thread and must return promptly.
+     #[cfg(feature = "sound")]
+@@ -2879,6 +2890,7 @@ impl ConfigBuilder {
+             certificate_chain_validation_callback: self.certificate_chain_validation_callback,
+             tls_upgrader: None,
+             tls_only_autologon: None,
++            egfx_codec_observer: None,
+             #[cfg(feature = "sound")]
+             audio_wave_observer: None,
+             #[cfg(feature = "entra-auth")]
+diff --git a/crates/ironrdp-client/src/rdp.rs b/crates/ironrdp-client/src/rdp.rs
+index 61f12f4..863095b 100644
+--- a/crates/ironrdp-client/src/rdp.rs
++++ b/crates/ironrdp-client/src/rdp.rs
+@@ -29,7 +29,7 @@ use ironrdp_dvc::DvcChannelListener as _;
+ use ironrdp_dvc::DvcMessageBatch;
+ use ironrdp_dvc::pdu::SoftSyncTunnelType;
+ use ironrdp_echo::client::EchoClient;
+-use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
++use ironrdp_egfx::client::{CodecEvent, GraphicsPipelineClient, GraphicsPipelineHandler};
+ use ironrdp_graphics::pointer::DecodedPointer;
+ use ironrdp_pdu::gcc::{ChannelName, ClientMonitorData, MONITOR_COUNT_MAX, Monitor, MonitorFlags};
+ use ironrdp_pdu::geometry::InclusiveRectangle;
+@@ -2638,13 +2638,19 @@ fn build_connector(
+
+     // The client-side compositor (ironrdp-egfx) holds the surface pixel state and
+     // the session drains it into the framebuffer, so the graphics pipeline's
+-    // per-command notification callbacks are unused here. The graphics pipeline
++    // handler only forwards codec metadata for diagnostics. The graphics pipeline
+     // advertises the AVC capability sets only when the H.264 decoder starts, and AVC444
+     // only when it returns YUV planes. The decoder starts during the connection sequence
+     // and is awaited when the graphics channel opens, so a slow start does not delay
+     // connecting.
+-    struct EgfxHandler;
+-    impl GraphicsPipelineHandler for EgfxHandler {}
++    struct EgfxHandler(Option<Arc<dyn Fn(CodecEvent) + Send + Sync>>);
++    impl GraphicsPipelineHandler for EgfxHandler {
++        fn on_codec_event(&mut self, event: CodecEvent) {
++            if let Some(observer) = &self.0 {
++                observer(event);
++            }
++        }
++    }
+
+     let h264_decoders = config
+         .channels
+@@ -2664,7 +2670,8 @@ fn build_connector(
+             RdpInputProtocolVersion::V300,
+         ))
+         .with_dynamic_channel({
+-            let mut egfx = GraphicsPipelineClient::new(Box::new(EgfxHandler), h264_decoder);
++            let handler = EgfxHandler(config.egfx_codec_observer.clone());
++            let mut egfx = GraphicsPipelineClient::new(Box::new(handler), h264_decoder);
+             if let Some(decoders) = h264_decoders.cloned() {
+                 egfx = egfx.with_h264_decoder_factory(Box::new(move || decoders.create()));
+             }
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index 44fb29f..26649c3 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -251,6 +251,21 @@ pub struct BitmapUpdate {
+ // Handler Trait
+ // ============================================================================
+
++/// Numeric metadata for observing surface PDUs without exposing their payloads.
++#[derive(Clone, Copy, Debug)]
++pub enum CodecEvent {
++    SurfaceUpdate {
++        codec_id: u16,
++        surface_id: u16,
++        width: u16,
++        height: u16,
++    },
++    Avc444Lc(u8),
++    Dropped {
++        decode_failed: bool,
++    },
++}
++
+ /// Handler trait for client-side EGFX events
+ ///
+ /// Implement this trait to receive decoded bitmap data and surface
+@@ -323,6 +338,9 @@ pub trait GraphicsPipelineHandler: Send {
+     /// Called when a surface is mapped to an output position
+     fn on_surface_mapped(&mut self, _surface_id: u16, _origin_x: u32, _origin_y: u32) {}
+
++    /// Observes the codec of an incoming update, its AVC444 LC, or why an update was dropped.
++    fn on_codec_event(&mut self, _event: CodecEvent) {}
++
+     /// Called when decoded bitmap data is available for a surface
+     ///
+     /// This is the primary output path. The `update` contains the
+@@ -1157,8 +1175,15 @@ impl GraphicsPipelineClient {
+     fn handle_wire_to_surface1(&mut self, pdu: crate::pdu::WireToSurface1Pdu) -> PduResult<()> {
+         let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
+             warn!(surface_id = pdu.surface_id, "WireToSurface1 for unknown surface dropped");
++            self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: false });
+             return Ok(());
+         };
++        self.handler.on_codec_event(CodecEvent::SurfaceUpdate {
++            codec_id: pdu.codec_id.into(),
++            surface_id: pdu.surface_id,
++            width: surface.width,
++            height: surface.height,
++        });
+
+         // Validate rectangle ordering (left <= right, top <= bottom)
+         let rect = &pdu.destination_rectangle;
+@@ -1170,6 +1195,7 @@ impl GraphicsPipelineClient {
+                 bottom = rect.bottom,
+                 "invalid destination rectangle ordering"
+             );
++            self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: false });
+             return Err(pdu_other_err!("invalid destination rectangle ordering"));
+         }
+
+@@ -1202,6 +1228,7 @@ impl GraphicsPipelineClient {
+                     .is_some_and(|decoder| decoder.supports_yuv420())
+                 {
+                     trace!("No H.264 decoder returning YUV planes, forwarding AVC444 to handler");
++                    self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: false });
+                     self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                     return Ok(());
+                 }
+@@ -1224,8 +1251,15 @@ impl GraphicsPipelineClient {
+     fn handle_wire_to_surface2(&mut self, pdu: WireToSurface2Pdu) -> PduResult<()> {
+         let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
+             warn!(surface_id = pdu.surface_id, "WireToSurface2 for unknown surface dropped");
++            self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: false });
+             return Ok(());
+         };
++        self.handler.on_codec_event(CodecEvent::SurfaceUpdate {
++            codec_id: pdu.codec_id.into(),
++            surface_id: pdu.surface_id,
++            width: surface.width,
++            height: surface.height,
++        });
+         let (surface_width, surface_height) = (surface.width, surface.height);
+         // A surface the compositor refused paints nothing, so it keeps no Progressive tile state either.
+         if !self.compositor.has_surface(pdu.surface_id) {
+@@ -1234,6 +1268,7 @@ impl GraphicsPipelineClient {
+                 "WireToSurface2 for a surface without pixels -- not decoded"
+             );
+             self.progressive_decoder.delete_surface(pdu.surface_id);
++            self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: false });
+             return Ok(());
+         }
+
+@@ -1325,6 +1360,7 @@ impl GraphicsPipelineClient {
+         bytes: usize,
+         error: &dyn core::fmt::Debug,
+     ) {
++        self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: true });
+         self.dropped_updates = self.dropped_updates.saturating_add(1);
+         if self.dropped_updates == 1 || self.dropped_updates.is_multiple_of(64) {
+             warn!(
+@@ -1344,6 +1380,7 @@ impl GraphicsPipelineClient {
+
+         let Some(decoder) = self.surface_h264_decoder(surface_id)? else {
+             debug!("No H.264 decoder configured, skipping AVC420 frame");
++            self.handler.on_codec_event(CodecEvent::Dropped { decode_failed: false });
+             return Ok(());
+         };
+
+@@ -1504,6 +1541,7 @@ impl GraphicsPipelineClient {
+         let (width, height) = (surface.width, surface.height);
+         let mut cursor = ReadCursor::new(bitmap_data);
+         let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
++        self.handler.on_codec_event(CodecEvent::Avc444Lc(stream.encoding.bits()));
+         let layout = if codec_id == Codec1Type::Avc444 {
+             Avc444Layout::V1
+         } else {

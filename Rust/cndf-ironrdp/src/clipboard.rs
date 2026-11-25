@@ -1256,6 +1256,7 @@ mod real {
                 }),
                 statistics: Arc::default(),
                 h264: Arc::default(),
+                codecs: Arc::default(),
             };
 
             let (input, _events) = RdpInputSender::channel(1);
@@ -1345,6 +1346,7 @@ mod real {
                 }),
                 statistics: Arc::default(),
                 h264: Arc::default(),
+                codecs: Arc::default(),
             };
 
             let (input, _events) = RdpInputSender::channel(1);
@@ -1427,6 +1429,7 @@ mod real {
                 }),
                 statistics: Arc::default(),
                 h264: Arc::default(),
+                codecs: Arc::default(),
             }
         }
 
@@ -1666,6 +1669,7 @@ mod real {
                 }),
                 statistics: Arc::default(),
                 h264: Arc::default(),
+                codecs: Arc::default(),
             }
         }
 
@@ -2705,6 +2709,7 @@ mod real {
                 }),
                 statistics: Arc::default(),
                 h264: Arc::default(),
+                codecs: Arc::default(),
             }
         }
 
