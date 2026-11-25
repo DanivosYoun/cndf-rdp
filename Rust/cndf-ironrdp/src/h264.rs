@@ -66,10 +66,12 @@ struct Tally {
 }
 
 impl Totals {
-    fn add(&self, change: impl FnOnce(&mut Tally)) {
+    fn add<T: Default>(&self, change: impl FnOnce(&mut Tally) -> T) -> T {
         let mut tally = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if !tally.sealed {
-            change(&mut tally);
+            change(&mut tally)
+        } else {
+            T::default()
         }
     }
 
@@ -85,12 +87,16 @@ impl Totals {
         self.add(|tally| tally.idr_waits += 1);
     }
 
-    pub(super) fn session(&self, hardware: Option<bool>) {
-        self.add(|tally| match hardware {
-            Some(true) => tally.hardware += 1,
-            Some(false) => tally.software += 1,
-            None => tally.unknown += 1,
-        });
+    pub(super) fn session(&self, hardware: Option<bool>) -> bool {
+        self.add(|tally| {
+            let first = tally.hardware == 0 && tally.software == 0 && tally.unknown == 0;
+            match hardware {
+                Some(true) => tally.hardware += 1,
+                Some(false) => tally.software += 1,
+                None => tally.unknown += 1,
+            }
+            first
+        })
     }
 
     /// Seals the totals. The first call returns the summary line, if any decode was attempted.
@@ -1039,20 +1045,14 @@ mod vt {
                     }
                     let session = Session::new(format, &self.budget)?;
                     self.stats.sessions += 1;
-                    self.total(|totals| totals.session(session.hardware));
-                    if !self.quiet {
-                        info!(
-                            target: H264_LOG_TARGET,
-                            "H.264 decoder: VideoToolbox {} {}x{} range={}",
-                            match session.hardware {
-                                Some(true) => "hardware",
-                                Some(false) => "software",
-                                None => "unknown",
-                            },
-                            session.format.width,
-                            session.format.height,
-                            if session.format.full_range { "full" } else { "video" },
-                        );
+                    let first = self
+                        .totals
+                        .as_ref()
+                        .is_some_and(|totals| totals.session(session.hardware));
+                    if first && !self.quiet {
+                        let hardware = if session.hardware == Some(true) { "yes" } else { "no" };
+                        let format = if session.format.full_range { "f420" } else { "y420" };
+                        info!(target: H264_LOG_TARGET, "IronRDP h264 decoder: hardware={hardware} format={format}");
                     }
                     self.session = Some(session);
                 }

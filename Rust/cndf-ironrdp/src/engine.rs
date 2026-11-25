@@ -254,7 +254,10 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
         let metadata = event.metadata();
         let own = matches!(
             metadata.target(),
-            DISPLAY_LOG_TARGET | TLS_LOG_TARGET | crate::h264::H264_LOG_TARGET
+            DISPLAY_LOG_TARGET
+                | TLS_LOG_TARGET
+                | crate::h264::H264_LOG_TARGET
+                | crate::codec_log::LOG_TARGET
         );
         if !own && !metadata.target().starts_with("ironrdp") {
             return;
@@ -268,7 +271,7 @@ impl<S: tracing::Subscriber> Layer<S> for Logs {
         };
         if own {
             // These targets contain only display geometry, scale factors, TLS parameters and
-            // H.264 picture sizes and counts.
+            // codec names, surface geometry, and decode counts.
             let mut message = SafeLogMessage::default();
             event.record(&mut message);
             log(&self.connection, self.minimum, level, &message.0);
@@ -408,7 +411,9 @@ fn run(
         return;
     };
     let audio_statistics = Arc::clone(&connection.statistics);
+    let codecs = Arc::clone(&connection.codecs);
     let config = config
+        .with_egfx_codec_observer(Arc::new(move |event| codecs.observe(event)))
         .with_audio_wave_observer(Arc::new(move || {
             lock(&audio_statistics).audio_waves_received += 1;
         }))
@@ -1194,6 +1199,7 @@ mod tests {
             }),
             statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
             h264: Arc::default(),
+            codecs: Arc::default(),
         };
         let error = ironrdp_pdu::PduError::new(
             "graphics update",
@@ -1241,6 +1247,7 @@ mod tests {
             }),
             statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
             h264: Arc::default(),
+            codecs: Arc::default(),
         })
     }
 
@@ -1486,6 +1493,7 @@ mod tests {
             callbacks,
             statistics: Arc::new(Mutex::new(CNDFIronStatistics::default())),
             h264: Arc::default(),
+            codecs: Arc::default(),
         })
     }
 
@@ -2108,14 +2116,17 @@ mod tests {
         drop(output);
         deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now);
 
-        assert_eq!(host.logs, ["fast_path repeated count=2"]);
+        assert_eq!(
+            host.logs,
+            ["fast_path repeated count=2", EMPTY_CODEC_SUMMARY]
+        );
         assert_eq!(
             host.disconnects,
             [(CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER, 0)]
         );
         // The session thread's own flush at the end finds nothing left to log.
         Logs::flush(&connection, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats);
-        assert_eq!(host.logs.len(), 1);
+        assert_eq!(host.logs.len(), 2);
     }
 
     #[test]
@@ -2128,7 +2139,10 @@ mod tests {
         drop(output);
         deliver(&connection, updates, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &repeats, Instant::now);
 
-        assert_eq!(host.logs, ["fast_path repeated count=2"]);
+        assert_eq!(
+            host.logs,
+            ["fast_path repeated count=2", EMPTY_CODEC_SUMMARY]
+        );
         assert_eq!(host.failures.len(), 1);
     }
 
@@ -2141,6 +2155,8 @@ mod tests {
         }
     }
 
+    const EMPTY_CODEC_SUMMARY: &str =
+        "IronRDP codec summary: avc444_lc=0:0,1:0,2:0 decode_failures=0 dropped=0";
     const SUMMARY: &str = "H.264 summary pictures=3 failures=0 idr_waits=0 sessions=1 hardware=yes";
 
     fn summaries(host: &Host) -> Vec<&str> {
@@ -2189,7 +2205,7 @@ mod tests {
             decoded(&connection);
             end(&connection);
             assert!(host.ended, "{name}");
-            assert_eq!(summaries(&host), [SUMMARY], "{name}");
+            assert_eq!(host.logs, [SUMMARY, EMPTY_CODEC_SUMMARY], "{name}");
         }
     }
 
@@ -2230,7 +2246,7 @@ mod tests {
         connection.h264.picture();
         report_disconnect(&connection, CNDFIronDisconnectKind::CNDF_IRON_DISCONNECT_SERVER, 0);
         assert!(host.disconnects.is_empty());
-        assert_eq!(host.logs.len(), 1);
+        assert_eq!(host.logs, [SUMMARY, EMPTY_CODEC_SUMMARY]);
     }
 
     #[test]
@@ -2311,9 +2327,12 @@ mod tests {
 
         unsafe { cndf_iron_session_destroy(session, 1000) };
 
-        assert_eq!(host.logs, ["fast_path repeated count=2"]);
+        assert_eq!(
+            host.logs,
+            ["fast_path repeated count=2", EMPTY_CODEC_SUMMARY]
+        );
         // After destroy the gate is closed and nothing more reaches the host.
         Logs::flush(&connection, CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &pending_repeats());
-        assert_eq!(host.logs.len(), 1);
+        assert_eq!(host.logs.len(), 2);
     }
 }
