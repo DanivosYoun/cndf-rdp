@@ -1,0 +1,36 @@
+--- clipboard.rs.orig	2026-11-22 16:36:14.671192889 +0900
++++ clipboard.rs	2026-11-22 16:36:22.449837031 +0900
+@@ -905,6 +905,12 @@
+             let mut state = lock(&self.channel.state);
+             self.channel.jobs.replace_clipboard();
+             self.stale_answer = false;
++            // SCRATCH 8a11de3b wirelog (measurement only, not a product build).
++            if std::env::var("CNDF_WIRELOG").as_deref() == Ok("1") {
++                let outstanding = state.requests.len();
++                let files = formats.iter().any(|f| f.name.as_ref().is_some_and(|n| n.value() == "FileGroupDescriptorW"));
++                self.channel.queue(move |c| c.clip_log(CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &format!("Clipboard wire FL files={files} outstanding={outstanding}")));
++            }
+             for stream in state.requests.drain() {
+                 self.channel
+                     .queue(move |connection| notify_range(connection, stream, None));
+@@ -986,6 +992,10 @@
+                     .map(|file| (remote_name(file), file.file_size.unwrap_or(0)))
+                     .collect(),
+             );
++            if std::env::var("CNDF_WIRELOG").as_deref() == Ok("1") {
++                let msg = format!("Clipboard wire file list lock={lock_id:?} stale={}", self.stale_answer);
++                self.channel.queue(move |c| c.clip_log(CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &msg));
++            }
+             if lock_id.is_none() {
+                 let negotiated = lock(&self.channel.state)
+                     .negotiated
+@@ -1077,6 +1087,9 @@
+             } else {
+                 // Only a RANGE sent before the newest Format List is no longer awaited.
+                 self.stale_answer = true;
++                if std::env::var("CNDF_WIRELOG").as_deref() == Ok("1") {
++                    self.channel.queue(move |c| c.clip_log(CNDFIronLogLevel::CNDF_IRON_LOG_INFO, &format!("Clipboard wire stale answer after FL stream={stream}")));
++                }
+             }
+         }
+ 

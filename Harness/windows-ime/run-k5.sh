@@ -124,6 +124,7 @@ PS
 # key steps in order, then fetch and log off.
 run() {
   local name="$1" engine="$2" profile="$3" op="$4"
+  [[ "$engine" == ironrdp ]] || { log "expected ironrdp"; return 2; }
   shift 3
   printf 'Set-Content -NoNewline -Path C:\\k5\\runid.txt -Value "%s"\n' "${name}" | ps
   python3 - "${WORK}/results/${name}.scenario.json" "${name}" "${profile}" "$@" <<'PY'

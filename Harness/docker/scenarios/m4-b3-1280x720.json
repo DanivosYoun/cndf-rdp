@@ -1,0 +1,31 @@
+{
+  "name": "m4-b3-1280x720",
+  "runs": [
+    {
+      "id": "m4-b3-1280x720",
+      "host": "127.0.0.1",
+      "port": 33902,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B3GFX_PASS",
+      "repeat": 5,
+      "graphicsMode": "auto",
+      "networkAutoDetect": false,
+      "window": { "width": 1280, "height": 720 },
+      "steps": [
+        { "op": "connect" },
+        { "op": "waitConnected", "timeout": 30 },
+        { "op": "waitFirstFrame", "timeout": 30 },
+        { "op": "waitLogin", "timeout": 30 },
+        { "op": "idle", "seconds": 3 },
+        { "op": "cpuWindow", "seconds": 9, "scanCode": 30 },
+        { "op": "dumpFrame", "seconds": 2, "timeout": 15, "scanCode": 48 },
+        { "op": "shutdown" }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true,
+        "maxShutdownMs": 1000
+      }
+    }
+  ]
+}
