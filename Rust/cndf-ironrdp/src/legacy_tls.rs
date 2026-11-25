@@ -130,7 +130,8 @@ fn context() -> Result<SslContextBuilder, openssl::error::ErrorStack> {
     builder.set_security_level(0);
     builder.set_verify(SslVerifyMode::NONE);
     builder.set_session_cache_mode(SslSessionCacheMode::OFF);
-    builder.set_options(SslOptions::NO_TICKET);
+    // Windows Server 2019 CredSSP over TLS 1.0 needs the CBC empty fragment disabled.
+    builder.set_options(SslOptions::NO_TICKET | SslOptions::DONT_INSERT_EMPTY_FRAGMENTS);
     Ok(builder)
 }
 
@@ -184,12 +185,21 @@ impl TlsUpgrader for LegacyTlsUpgrader {
 
 #[cfg(test)]
 mod tests {
-    use openssl::ssl::SslVersion;
+    use openssl::ssl::{SslContextBuilder, SslMethod, SslOptions, SslVersion};
 
     #[test]
     fn context_offers_tls_1_0_to_1_2() {
         let mut context = super::context().expect("legacy TLS context");
         assert_eq!(context.min_proto_version(), Some(SslVersion::TLS1));
         assert_eq!(context.max_proto_version(), Some(SslVersion::TLS1_2));
+    }
+
+    #[test]
+    fn only_legacy_context_disables_empty_fragments() {
+        let option = SslOptions::DONT_INSERT_EMPTY_FRAGMENTS;
+        let default_context = SslContextBuilder::new(SslMethod::tls_client()).expect("TLS context");
+        let legacy_context = super::context().expect("legacy TLS context");
+        assert!(!default_context.options().contains(option));
+        assert!(legacy_context.options().contains(option));
     }
 }
