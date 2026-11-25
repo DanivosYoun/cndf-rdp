@@ -38,7 +38,7 @@ if [[ "${1:-}" == selftest ]]; then
 fi
 
 : "${HARNESS_BATCH:?set HARNESS_BATCH (roster batch id, used as the container label)}"
-BASELINE="${M4_FREERDP_BASELINE:-${HOME}/Documents/CNDF-Docs/2026-11-26/ironrdp/freerdp-baseline/Harness/docker/m4/baselines/2026-11-23-freerdp/b3-1280x720-freerdp-result.json}"
+BASELINE="${M4_FREERDP_BASELINE:-${HOME}/Documents/CNDF-Docs/2026-11-26/ironrdp/freerdp-baseline/m4-k3/b3-1280x720/freerdp/result.json}"
 WORK="${HARNESS_WORK:-${HOME}/.cache/m4-acceptance-${HARNESS_BATCH}}"
 MAC="${HARNESS_MAC:-danivosy@192.168.3.105}"
 MAC_DIR="${HARNESS_MAC_DIR:-xcode-work/m4-acceptance-${HARNESS_BATCH}}"
