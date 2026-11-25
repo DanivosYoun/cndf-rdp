@@ -5,7 +5,7 @@
 #       build the B5 image, build rdp-engine-harness from <client-tree> on the Mac, replay each
 #       mem-*.json scenario (default: all) against IronRDP, judge on Linux, clean up
 #   Scripts/run-hostile-harness.sh compare <control-tree> <fixed-tree> [scenario ...]
-#       the same for both trees in one Mac work dir (FreeRDP is built once); PASS when every
+#       the same for both trees in one Mac work dir; PASS when every
 #       scenario FAILs its budget on the control tree and PASSes on the fixed tree
 #   Scripts/run-hostile-harness.sh down
 #
@@ -91,7 +91,7 @@ tunnel_up() {
   log "tunnel pid $(cat "${WORK}/tunnel.pid")"
 }
 
-# Builds rdp-engine-harness from the given tree. FreeRDP stays in Vendor across trees; IronRDP
+# Builds rdp-engine-harness from the given tree. IronRDP
 # and .build are rebuilt whenever the tree's Rust/ differs from the last build.
 mac_build() {
   local tree="$1" digest
@@ -111,7 +111,6 @@ mac_build() {
     if [[ \"\$(cat \$M/built.digest 2>/dev/null)\" != ${digest} ]]; then
       rm -rf Vendor/IronRDP .build
     fi
-    [[ -f Vendor/FreeRDP/install/lib/libfreerdp3.dylib ]] || bash Scripts/build-freerdp.sh > \$M/freerdp-build.log 2>&1
     [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh --features legacy-tls > \$M/ironrdp-build.log 2>&1
     swift build -c release --product rdp-engine-harness 2>&1 | tail -3
     echo ${digest} > \$M/built.digest"

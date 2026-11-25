@@ -1,6 +1,6 @@
 # RDP Mac
 
-SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin FreeRDP bridge, Retina-aware dynamic resize, clipboard/file transfer, local folder redirection, and audio playback options.
+SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin IronRDP bridge, Retina-aware dynamic resize, clipboard/file transfer, local folder redirection, and audio playback options.
 
 ## Modules
 
@@ -9,41 +9,26 @@ SwiftPM-based macOS RDP client with an embeddable AppKit view, a thin FreeRDP br
   RDP window, and drains autorelease pools outside XCTest.
 - `RDPMacView`: embeddable AppKit view package for host macOS apps.
 - `RDPClientCore`: Swift session lifecycle wrapper and delegate API.
-- `FreeRDPBridge`: narrow C ABI for FreeRDP integration, linked against the vendored FreeRDP 3.26 build.
+- `IronRDPBridge` exposes the IronRDP C ABI backed by a statically linked Rust library.
 - `ClipboardBridge`: `NSPasteboard` read/write coordination and local-to-remote clipboard dispatch.
 - `FileTransferStaging`: local file staging plus encoded file-list payloads used by the bridge layer.
 
 ## Build
 
-The project builds against a local FreeRDP checkout pinned to `3.26.0`
-(`3f6d7cb1f8973cc84c66b258a9a61c4e2b2f30a6`). Build it before running SwiftPM:
+Build the pinned IronRDP static library before running SwiftPM:
 
 ```sh
-./Scripts/build-freerdp.sh
+./Scripts/build-ironrdp.sh --features legacy-tls
 ```
-
-`Vendor/FreeRDP/src` is a local git checkout created by the build script. `Vendor/FreeRDP/build`
-and `Vendor/FreeRDP/install` are generated and ignored. The build script reapplies the local
-FreeRDP `cliprdr` format-name patch after resetting the checkout to the pinned commit. The
-vendored build enables `cliprdr`, `drdynvc`, `disp`, `rdpgfx`, `rdpdr`, `drive`, `rdpsnd`,
-and the macOS audio backend.
 
 ## Feature Status
 
 The bridge currently provides:
 
-- `rdp_bridge_connect`
-- `rdp_bridge_disconnect`
-- `rdp_bridge_send_local_text`
-- `rdp_bridge_send_local_file_list`
-- `rdp_bridge_request_remote_file_contents`
-- `rdp_bridge_update_desktop_size`
-- `rdp_bridge_send_scroll_at`
-- `rdp_bridge_send_key_ex`
-- optional local folder redirection through FreeRDP `rdpdr`
-- optional audio playback through FreeRDP `rdpsnd`
+- optional local folder redirection through `rdpdr`
+- optional audio playback through `rdpsnd`
 - pointer, scroll, and keyboard input dispatch
-- GDI framebuffer delivery to Swift as BGRA frames
+- Framebuffer delivery to Swift as BGRA frames
 - rendered-frame tap callback as BGRA `CVPixelBuffer` for host-side session sharing/encoding
 - public input injection methods for shared-session mouse, keyboard, and scroll forwarding
 - AppKit layer-backed frame presentation without `MTKView`/`CAMetalLayer` close-time release hazards
@@ -56,28 +41,21 @@ The bridge currently provides:
 - typed connection failure callback for user-facing diagnostics and audit codes
 - disconnect reason callback for audit/reconnect policy
 - optional per-session log file writing
-- WLog root level and per-category filter control
-- package and FreeRDP build info through `RDPMacInfo`
+- log level and IronRDP build info through `RDPMacInfo`
 - `RDPSecureString` for vault-supplied transient passwords
 - reconnect API using retained connection options
 - session statistics for frames, clipboard, file transfer, and activity timestamps
 - Retina-aware desktop resize using the host window backing scale factor by default
 - optional 1x resize mode for low-bandwidth sessions
 - optional fixed remote desktop size for force-display-mode style workflows
-- configurable FreeRDP color depth: 16, 24, or 32 bpp
 - frame presentation disables `CALayer` implicit animations so RDP frames swap immediately without fade/transition effects
-- serialized `RDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
-- hardened FreeRDP teardown that waits for the event-loop thread before freeing native session state
+- serialized `IronRDPSession` bridge access to prevent reconnect/disconnect races with clipboard, resize, input, and file-transfer calls
+- synchronous teardown of the native session
 - explicit `RDPConnectionView.shutdown()` for safe `NSWindow` close and render-surface teardown
 - optional mounted macOS folder visible in the remote session as an RDP redirected drive
 - optional audio playback locally on macOS, remote/server playback, or disabled audio
 - embeddable `RDPConnectionView` for host apps that want a ready-to-use RDP surface
 
-The bridge registers FreeRDP's static addin provider directly because it creates a
-minimal `freerdp_new()` session instead of using the full FreeRDP client wrapper.
-With the local FreeRDP build, `cliprdr` and `drdynvc` load during pre-connect.
-
-The app uses FreeRDP's event loop on a background WinPR thread and displays received GDI frames through AppKit.
 
 Smooth interactive behavior depends on keeping resize, rendering, input, and clipboard work on separate paths:
 
@@ -87,7 +65,6 @@ Smooth interactive behavior depends on keeping resize, rendering, input, and cli
 - the frame layer disables implicit `contents`, `contentsScale`, bounds, and position animations to avoid fade-like frame transitions
 - `onRenderedFrame` is a nil-by-default tap; when attached, each displayed frame is copied into a BGRA `CVPixelBuffer` after the layer update
 - clipboard/file transfers are staged outside the UI path
-- the bridge API has an explicit `rdp_bridge_update_desktop_size` hook for FreeRDP display control integration
 
 Remaining production work:
 
@@ -121,13 +98,12 @@ Typed failures are reported as:
 - `.authenticationFailed`
 - `.certificateRejected`
 - `.configurationInvalid(reason:)`
-- `.freerdp(code:description:)`
+- `.ironrdp(code:description:)`
 
 Disconnect reasons are `.localRequest`, `.serverDisconnect(code:)`, `.timeout`, and `.error`.
 Use `RDPConnectionOptions.logFileURL` to let the package append per-session logs directly.
-Use `RDPConnectionOptions.logLevel` and `logFilters` for WLog root/category control, for example
-`["com.freerdp.channels.cliprdr": .trace]`.
-Use `RDPMacInfo.packageVersion`, `RDPMacInfo.freerdpVersion`, and
+Use `RDPConnectionOptions.logLevel` to set the IronRDP log level.
+Use `RDPMacInfo.packageVersion`, `RDPMacInfo.ironRDPVersion`, and
 `RDPMacInfo.buildConfiguration` in about dialogs and bug reports.
 
 For vault integration, pass `securePassword: RDPSecureString(vaultPassword)` instead of
@@ -154,7 +130,7 @@ BGRA (`kCVPixelFormatType_32BGRA`) and created only when the tap is non-`nil`; h
 buffer. Keep the closure cheap and dispatch encoding work off-main. Set `onRenderedFrame = nil`
 before disconnect/shutdown; `RDPClientView.shutdownRendering()` also clears it defensively.
 
-Shared-session viewers can inject input through the same FreeRDP path used by local AppKit events:
+Shared-session viewers can inject input through the same IronRDP path used by local AppKit events:
 
 ```swift
 rdpView.injectMouse(x: 960, y: 540, button: .left, flags: [.move, .down])
@@ -175,20 +151,17 @@ drains queued main-thread view callbacks, replaces the host window's content vie
 placeholder, and returns `RDPShutdownDiagnostics`. This removes the RDP content tree from AppKit's
 later `window.close()` release path and lets the host's ARC/window-controller ownership release the
 window normally after close.
-Diagnostics include whether a FreeRDP worker was waited, pending main callback count,
-in-flight command buffer count kept for API compatibility, FreeRDP wait duration, and render drain
-duration.
+Diagnostics include session wait and render drain durations, pending main callbacks, and in-flight command buffers.
 After `shutdown()`, the view instance cannot be reconnected; create a new `RDPConnectionView` for a
 new session.
 
 Threading contract:
 
 - `RDPConnectionView.connect(_:)`, `disconnect()`, and view mutation should be called from the main thread.
-- `RDPConnectionView.shutdown()` should be called before host window close. It marshals to the main thread if needed, and can block while FreeRDP worker teardown completes.
-- `RDPSession.connect(_:)`, `disconnect()`, `reconnect()`, input dispatch, resize, clipboard polling, and file offering are internally serialized around the FreeRDP bridge.
+- `RDPConnectionView.shutdown()` should be called before host window close. It marshals to the main thread if needed, and can block while native session teardown completes.
+- `IronRDPSession.connect(_:initialPointSize:scale:)`, `disconnect()`, `reconnect()`, input dispatch, resize, clipboard polling, and file offering are internally serialized around the IronRDP bridge.
 - `RDPConnectionView.injectMouse`, `injectKey`, and `injectScroll` may be called from any queue; they enqueue work on a serial input queue and return immediately.
-- `RDPSession.disconnect()` waits up to five seconds for the FreeRDP event-loop thread to exit before returning an error; `RDPSession` destruction waits until native teardown is complete before freeing bridge state.
-- `RDPSessionDelegate` callbacks are delivered from the FreeRDP worker thread unless explicitly noted by the view wrapper.
+- `IronRDPSession.disconnect()` releases active native work before returning. Session callbacks can arrive on engine threads.
 - `RDPConnectionViewDelegate` frame display is marshalled to the main thread by `RDPConnectionView`; other callbacks should dispatch to the main thread before mutating UI.
 
 Follow-up request status:
@@ -199,8 +172,8 @@ Follow-up request status:
 | 2. Typed error callback | Implemented |
 | 3. Disconnect reason callback | Implemented |
 | 4. Per-session log file URL | Implemented |
-| 5. WLog level/filter control | Implemented |
-| 6. Package and FreeRDP version info | Implemented |
+| 5. IronRDP log level | Implemented |
+| 6. Package and IronRDP version info | Implemented |
 | 7. Thread safety contract docs | Documented |
 | 8. Secure password handling | Implemented |
 | 9. Reconnect API | Implemented |
@@ -208,8 +181,7 @@ Follow-up request status:
 
 ## Test Summary
 
-Live behavior was verified against a Windows RDP test host on 2026-05-21. Package tests were
-rerun on 2026-05-22:
+Historical FreeRDP verification on 2026-05-21 and 2026-05-22:
 
 - FreeRDP addins loaded and connected: `rdpdr`, `rdpsnd`, `cliprdr`, `drdynvc`, `rdpgfx`, `disp`
 - audio playback path connected through `AUDIO_PLAYBACK_DVC`
@@ -260,7 +232,7 @@ Manual checklist for future changes:
 ## Verify
 
 ```sh
-./Scripts/build-freerdp.sh
+./Scripts/build-ironrdp.sh --features legacy-tls
 swift test
 ```
 
@@ -309,7 +281,6 @@ try rdpView.connect(
         audioPlaybackMode: .playLocally,
         logFileURL: URL(fileURLWithPath: "/Users/me/Library/Logs/MyApp/rdp/session.log"),
         logLevel: .info,
-        logFilters: ["com.freerdp.channels.cliprdr": .debug],
         preferDeviceNativeResolution: true,
         colorDepth: .depth32,
         forcedDesktopSize: nil
@@ -330,8 +301,7 @@ let diagnostics = rdpView.shutdown()
 `preferDeviceNativeResolution` defaults to `true` and sends Retina/5K backing pixels to the
 remote side for sharper text. Set it to `false` to force 1x resize updates.
 `forcedDesktopSize` locks the remote desktop to a fixed pixel size such as `1920x1080`; the
-local view scales that framebuffer proportionally. `colorDepth` requests 16, 24, or 32 bpp from
-FreeRDP while the Swift display path continues to receive BGRA frames.
+local view scales that framebuffer proportionally. IronRDP requests 32 bpp when a stored option specifies 24 bpp.
 
 ## External Credentials
 
@@ -348,7 +318,6 @@ RDP_MAC_REDIRECT_FOLDER_NAME=RemoteShare \
 RDP_MAC_AUDIO_MODE=local \
 RDP_MAC_LOG_FILE=/tmp/rdp-session.log \
 RDP_MAC_LOG_LEVEL=debug \
-RDP_MAC_LOG_FILTERS=com.freerdp.channels.cliprdr=trace \
 RDP_MAC_PREFER_NATIVE_RESOLUTION=1 \
 RDP_MAC_COLOR_DEPTH=32 \
 RDP_MAC_FORCED_DESKTOP_SIZE=1920x1080 \

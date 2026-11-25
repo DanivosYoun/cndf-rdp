@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # RDP engine harness driver (design D7 H-A/H-B, D8 C5). Runs on the Linux Docker host.
 #
-#   Scripts/run-engine-harness.sh all        # build images, start B1-B3, build + run the
+#   Scripts/run-engine-harness.sh all        # build images, start B1 and B3, build + run the
 #                                             # harness on the Mac, collect JSON, clean up
 #   Scripts/run-engine-harness.sh images|up|mac-build|scenarios|down
-#   Scripts/run-engine-harness.sh legacy-tls # B4 only: legacy-tls-{freerdp,ironrdp}, clean up
+#   Scripts/run-engine-harness.sh legacy-tls # B4 only: legacy-tls-ironrdp, clean up
 #
 # Servers (Linux Docker, published on the LAN IP only):
 #   B1  IronRDP examples/server, --sec hybrid      :33891 (cert A, later B)  :33892 (chain)
-#   B2  FreeRDP 3.33.1 shadow + Xvfb + Tk probe    :33893
 #   B3  xrdp (danielguerra/ubuntu-xrdp, pinned)    :33894
 #   B4  xrdp 0.9.17, one TLS window per container  :33895 (TLS 1.0)  :33896 (TLS 1.1)
 #                                                   :33897 (TLS 1.2+1.3)
@@ -18,7 +17,6 @@
 #
 # Environment:
 #   HARNESS_BATCH   label value for roster.batch (required; containers carry it)
-#   HARNESS_ENGINE  freerdp (default) | ironrdp; i3-freerdp-then-ironrdp always mixes both
 #   HARNESS_WORK    Linux state dir   (default ~/.cache/rdp-engine-harness-$HARNESS_BATCH)
 #   HARNESS_MAC     ssh target        (default danivosy@192.168.3.105)
 #   HARNESS_MAC_DIR dir under Mac ~   (default xcode-work/rdp-engine-harness-$HARNESS_BATCH)
@@ -30,19 +28,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${HARNESS_BATCH:?set HARNESS_BATCH (roster batch id, used as the container label)}"
-ENGINE="${HARNESS_ENGINE:-freerdp}"
 WORK="${HARNESS_WORK:-${HOME}/.cache/rdp-engine-harness-${HARNESS_BATCH}}"
 MAC="${HARNESS_MAC:-danivosy@192.168.3.105}"
 MAC_DIR="${HARNESS_MAC_DIR:-xcode-work/rdp-engine-harness-${HARNESS_BATCH}}"
 BIND_IP="${HARNESS_BIND_IP:-$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')}"
 LABEL="roster.batch=${HARNESS_BATCH}"
 B1_IMAGE="cndf-harness-b1-ironrdp:${HARNESS_BATCH}"
-B2_IMAGE="cndf-harness-b2-freerdp-shadow:${HARNESS_BATCH}"
 B3_IMAGE="danielguerra/ubuntu-xrdp@sha256:1a00da32f4e486f2f5fd8f656fc23bb235987c219153a587894469cad300b12d"
 B3_M3_IMAGE="cndf-harness-b3-xrdp:${HARNESS_BATCH}"
 PORT_B3_FIXTURE=33898
 B4_IMAGE="cndf-harness-b4-legacy-tls:${HARNESS_BATCH}"
-PORT_B1=33891 PORT_B1_CHAIN=33892 PORT_B2=33893 PORT_B3=33894
+PORT_B1=33891 PORT_B1_CHAIN=33892 PORT_B3=33894
 PORT_B4_TLS10=33895 PORT_B4_TLS11=33896 PORT_B4_TLS12=33897
 MAC_PATH='PATH=$HOME/.cargo/bin:/opt/homebrew/bin:$PATH'
 
@@ -52,7 +48,6 @@ name() { echo "rdp-harness-$1-${HARNESS_BATCH}"; }
 
 images() {
   docker build --label "${LABEL}" -t "${B1_IMAGE}" "${ROOT_DIR}/Harness/docker/b1-ironrdp"
-  docker build --label "${LABEL}" -t "${B2_IMAGE}" "${ROOT_DIR}/Harness/docker/b2-freerdp-shadow"
   docker pull -q "${B3_IMAGE}"
 }
 
@@ -65,7 +60,6 @@ secrets() {
   if [[ ! -f "${WORK}/secrets.env" ]]; then
     {
       echo "HARNESS_B1_PASS=$(openssl rand -hex 12)"
-      echo "HARNESS_B2_PASS=$(openssl rand -hex 12)"
       echo "HARNESS_B3_PASS=$(openssl rand -hex 12)"
     } > "${WORK}/secrets.env"
     chmod 600 "${WORK}/secrets.env"
@@ -125,16 +119,12 @@ up() {
   docker run -d --label "${LABEL}" --name "$(name b1chain)" -p "${BIND_IP}:${PORT_B1_CHAIN}:3389" \
     -v "${WORK}/certs:/certs:ro" "${B1_IMAGE}" \
     --sec hybrid --user harness --pass "${HARNESS_B1_PASS}" --cert /certs/chain.pem --key /certs/chain-key.pem >/dev/null
-  docker rm -fv "$(name b2)" >/dev/null 2>&1 || true
-  docker run -d --label "${LABEL}" --name "$(name b2)" -p "${BIND_IP}:${PORT_B2}:3389" \
-    -e HARNESS_USER=harness -e HARNESS_PASS="${HARNESS_B2_PASS}" "${B2_IMAGE}" >/dev/null
   printf '999 harness %s sudo\n' "$(openssl passwd -6 "${HARNESS_B3_PASS}")" > "${WORK}/users.list"
   chmod 644 "${WORK}/users.list"
   docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
   docker run -d --label "${LABEL}" --name "$(name b3)" -p "${BIND_IP}:${PORT_B3}:3389" --shm-size 1g \
     -v "${WORK}/users.list:/etc/users.list:ro" "${B3_IMAGE}" >/dev/null
   wait_port "${PORT_B1_CHAIN}"
-  wait_port "${PORT_B2}"
   wait_port "${PORT_B3}"
   tunnel_up
 }
@@ -149,11 +139,11 @@ wait_port() {
   return 1
 }
 
-# Forwards the given ports (default B1-B3).
+# Forwards the given ports (default B1 and B3).
 tunnel_up() {
   [[ -f "${WORK}/tunnel.pid" ]] && kill -0 "$(cat "${WORK}/tunnel.pid")" 2>/dev/null && return
   local forwards=() port ports=("$@")
-  (( ${#ports[@]} )) || ports=("${PORT_B1}" "${PORT_B1_CHAIN}" "${PORT_B2}" "${PORT_B3}")
+  (( ${#ports[@]} )) || ports=("${PORT_B1}" "${PORT_B1_CHAIN}" "${PORT_B3}")
   for port in "${ports[@]}"; do
     forwards+=(-R "127.0.0.1:${port}:${BIND_IP}:${port}")
   done
@@ -165,7 +155,7 @@ tunnel_up() {
   log "tunnel pid $(cat "${WORK}/tunnel.pid")"
 }
 
-# Builds FreeRDP and IronRDP (if not built yet) and the rdp-engine-harness product on the Mac.
+# Builds IronRDP and the rdp-engine-harness product on the Mac.
 mac_build() {
   rsync -a --delete --mkpath --exclude .git --exclude .build --exclude Vendor \
     --rsync-path=/opt/homebrew/bin/rsync "${ROOT_DIR}/" "${MAC}:${MAC_DIR}/cndf-rdp/"
@@ -176,25 +166,23 @@ mac_build() {
     mkdir -p \"\$M/tmp\"
     export TMPDIR=\$M/tmp
     cd \$M/cndf-rdp
-    [[ -f Vendor/FreeRDP/install/lib/libfreerdp3.dylib ]] || bash Scripts/build-freerdp.sh > \$M/freerdp-build.log 2>&1
     [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh --features legacy-tls > \$M/ironrdp-build.log 2>&1
     swift build -c release --product rdp-engine-harness 2>&1 | tail -3"
 }
 
-# Runs one scenario on the Mac. FreeRDP's own known_hosts lives under \$HOME, so the
-# harness runs with an isolated HOME shared by all scenarios of this invocation.
+# Runs one IronRDP scenario on the Mac.
 run_scenario() {
   local scenario="$1"; shift
   local base
   base="$(basename "${scenario}" .json)"
-  log "scenario ${base} (engine ${ENGINE})"
+  log "scenario ${base}"
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${scenario}" "${MAC}:${MAC_DIR}/scenarios/"
   set +e
   mac "set -a; source \$HOME/${MAC_DIR}/secrets.env; set +a; M=\$HOME/${MAC_DIR}
     mkdir -p \$M/home \$M/results \$M/work
     rm -f \$M/results/${base}.json
     HOME=\$M/home \$M/cndf-rdp/.build/release/rdp-engine-harness \
-      --scenario \$M/scenarios/${base}.json --out \$M/results/${base}.json --engine ${ENGINE} \
+      --scenario \$M/scenarios/${base}.json --out \$M/results/${base}.json \
       --trust-suite cndf.rdp-engine-harness.${HARNESS_BATCH} --work-dir \$M/work $*" \
     > "${WORK}/results/${base}.stdout.log" 2> "${WORK}/results/${base}.stderr.log"
   local status=$?
@@ -216,25 +204,11 @@ scenarios() {
   run_scenario "${s}/cert-2-changed.json"
   start_b1 a
   run_scenario "${s}/cert-3-rejected.json" --drop-trust 1
-  # Baselines: connect, first frame, idle, (B2: input latency), tap, resize, shutdown x5.
+  # Baselines: connect, first frame, idle, tap, resize, shutdown x5.
   # A fresh HOME and trust store, so B1's certificate is simply "new" again here.
   mac "rm -rf \$HOME/${MAC_DIR}/home"
   run_scenario "${s}/baseline-b1.json" --reset-trust 1
-  run_scenario "${s}/baseline-b2.json"
-  run_scenario "${s}/baseline-b3.json"
-  if [[ "${ENGINE}" == ironrdp ]]; then
-    # The interop pin below is about the FreeRDP client; with IronRDP only I3 is added: the
-    # same server first through FreeRDP, then IronRDP, must not prompt (design I3).
-    mac "rm -rf \$HOME/${MAC_DIR}/home"
-    start_b1 a
-    run_scenario "${s}/i3-freerdp-then-ironrdp.json" --reset-trust 1 --drop-trust 1
-    log "results in ${WORK}/results"
-    return
-  fi
-  # Pins a known interop gap: FreeRDP 3.33.1 client with networkAutoDetect off (the app
-  # default) fails against the 3.33.1 shadow server at capabilities ("MCS message channel
-  # id == 0"); baseline-b2 therefore turns auto-detect on.
-  run_scenario "${s}/interop-b2-autodetect-off.json" --drop-trust 1
+  run_scenario "${s}/baseline-b3.json" --drop-trust 1
   log "results in ${WORK}/results"
 }
 
@@ -265,50 +239,32 @@ legacy_tls_up() {
   tunnel_up "${PORT_B4_TLS10}" "${PORT_B4_TLS11}" "${PORT_B4_TLS12}"
 }
 
-# Each B4 server reached through FreeRDP (expected: connects on every profile) and through
-# IronRDP (expected: TLS 1.0/1.1 connect via legacy TLS, TLS 1.2+ uses modern TLS). xrdp has no
-# sesman here, so the session ends at xrdp's login screen; the password is never checked.
-# The session logs come back too: FreeRDP's TLS ladder stage is only visible there.
+# B4 checks first frames for each TLS profile at the xrdp login screen.
 legacy_tls_scenarios() {
-  local s="${ROOT_DIR}/Harness/docker/b4-legacy-tls/scenarios" engine log stage
+  local s="${ROOT_DIR}/Harness/docker/b4-legacy-tls/scenarios"
   mkdir -p "${WORK}/results"
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
   mac "chmod 600 \$HOME/${MAC_DIR}/secrets.env; rm -rf \$HOME/${MAC_DIR}/home"
-  run_scenario "${s}/legacy-tls-freerdp.json" --reset-trust 1
-  mac "rm -rf \$HOME/${MAC_DIR}/home"
   run_scenario "${s}/legacy-tls-ironrdp.json" --reset-trust 1 --drop-trust 1
   rsync -a --rsync-path=/opt/homebrew/bin/rsync "${MAC}:${MAC_DIR}/work/b4-*.session.log" "${WORK}/results/" 2>/dev/null || true
-  for log in "${WORK}/results"/b4-*-freerdp-*.session.log; do
-    [[ -f "${log}" ]] || continue
-    stage=default
-    grep -q 'previous-default TLS' "${log}" && stage=previous
-    grep -q 'legacy-compatible TLS' "${log}" && stage=legacy
-    log "$(basename "${log}" .session.log): FreeRDP TLS stage reached ${stage}"
-  done
   log "results in ${WORK}/results"
 }
 
 m3_channels() {
-  local engine="$1"
   local scenario="${ROOT_DIR}/Harness/docker/scenarios/m3-b1-channels.json"
-  mkdir -p "${WORK}/results/${engine}"
-  # Start a fresh B1 per engine so its records contain only this scenario's connections.
+  mkdir -p "${WORK}/results/ironrdp"
+  # Start a fresh B1 for this scenario.
   start_b1 a || return
-  ENGINE="$engine" run_scenario "$scenario" --reset-trust 1 --drop-trust 1
-  docker logs "$(name b1)" > "${WORK}/results/${engine}/b1-server.log" 2>&1
-  mv "${WORK}/results"/m3-b1-channels.* "${WORK}/results/${engine}/"
+  run_scenario "$scenario" --reset-trust 1 --drop-trust 1
+  docker logs "$(name b1)" > "${WORK}/results/ironrdp/b1-server.log" 2>&1
+  mv "${WORK}/results"/m3-b1-channels.* "${WORK}/results/ironrdp/"
   python3 "${ROOT_DIR}/Harness/docker/b1-ironrdp/channel-results.py" \
-    "$scenario" "${WORK}/results/${engine}/b1-server.log" > "${WORK}/results/${engine}/b1-channels.json" || return
+    "$scenario" "${WORK}/results/ironrdp/b1-server.log" > "${WORK}/results/ironrdp/b1-channels.json" || return
   python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
-    "${WORK}/results/${engine}/m3-b1-channels.json"
+    "${WORK}/results/ironrdp/m3-b1-channels.json"
 }
 
 m3_b1() {
-  local requested_engine="${1:-both}" failed=0
-  case "$requested_engine" in
-    both|freerdp|ironrdp) ;;
-    *) echo "expected both, freerdp or ironrdp" >&2; return 2 ;;
-  esac
   local avail
   avail="$(free -g | awk '/^Mem:/ {print $7}')"
   (( avail >= 20 )) || { log "less than 20G available"; return 1; }
@@ -317,20 +273,11 @@ m3_b1() {
   mac_build
   rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync "${WORK}/secrets.env" "${MAC}:${MAC_DIR}/secrets.env"
   tunnel_up "${PORT_B1}"
-  if [[ "$requested_engine" != ironrdp ]]; then m3_channels freerdp || failed=1; fi
-  if [[ "$requested_engine" != freerdp ]]; then m3_channels ironrdp || failed=1; fi
-  if [[ "$requested_engine" == both ]]; then
-    diff -u "${WORK}/results/freerdp/b1-channels.json" "${WORK}/results/ironrdp/b1-channels.json" || failed=1
-  fi
-  return "$failed"
+  m3_channels
 }
 
 m3_b3() {
-  local requested_engine="${1:-both}" engine avail failed=0
-  case "$requested_engine" in
-    both|freerdp|ironrdp) ;;
-    *) echo "expected both, freerdp or ironrdp" >&2; return 2 ;;
-  esac
+  local avail failed=0
   avail="$(free -g | awk '/^Mem:/ {print $7}')"
   (( avail >= 20 )) || { log "less than 20G available"; return 1; }
   [[ -c /dev/fuse ]] || { log "B3 drive requires /dev/fuse"; return 1; }
@@ -343,35 +290,28 @@ m3_b3() {
   tunnel_up "${PORT_B3}" "${PORT_B3_FIXTURE}"
   printf '999 harness %s sudo\n' "$(openssl passwd -6 "${HARNESS_B3_PASS}")" > "${WORK}/users.list"
   chmod 644 "${WORK}/users.list"
-  for engine in freerdp ironrdp; do
-    [[ "$requested_engine" == both || "$requested_engine" == "$engine" ]] || continue
-    docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
-    docker run -d --label "${LABEL}" --name "$(name b3)" --device /dev/fuse --cap-add SYS_ADMIN \
-      -p "${BIND_IP}:${PORT_B3}:3389" -p "${BIND_IP}:${PORT_B3_FIXTURE}:8080" \
-      -e HARNESS_B3_FIXTURE_TOKEN="${HARNESS_B3_FIXTURE_TOKEN}" \
-      -v "${WORK}/users.list:/etc/users.list:ro" "${B3_M3_IMAGE}" >/dev/null
-    wait_port "${PORT_B3}"
-    docker exec -d "$(name b3)" python3 /opt/harness-fixture.py
-    wait_port "${PORT_B3_FIXTURE}"
-    mkdir -p "${WORK}/results/${engine}"
-    ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/m3-b3-home.json" --reset-trust 1 --drop-trust 1
-    mv "${WORK}/results"/m3-b3-home.* "${WORK}/results/${engine}/"
-    docker exec "$(name b3)" sh -c 'for file in /var/log/xrdp.log /var/log/xrdp-sesman.log /home/harness/.local/share/xrdp/xrdp-chansrv*.log; do
-      [ ! -f "$file" ] || tail -100 "$file"
-    done' > "${WORK}/results/${engine}/b3-server.log" 2>&1
-    python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
-      "${WORK}/results/${engine}/m3-b3-home.json" || failed=1
-  done
+  docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
+  docker run -d --label "${LABEL}" --name "$(name b3)" --device /dev/fuse --cap-add SYS_ADMIN \
+    -p "${BIND_IP}:${PORT_B3}:3389" -p "${BIND_IP}:${PORT_B3_FIXTURE}:8080" \
+    -e HARNESS_B3_FIXTURE_TOKEN="${HARNESS_B3_FIXTURE_TOKEN}" \
+    -v "${WORK}/users.list:/etc/users.list:ro" "${B3_M3_IMAGE}" >/dev/null
+  wait_port "${PORT_B3}"
+  docker exec -d "$(name b3)" python3 /opt/harness-fixture.py
+  wait_port "${PORT_B3_FIXTURE}"
+  mkdir -p "${WORK}/results/ironrdp"
+  run_scenario "${ROOT_DIR}/Harness/docker/scenarios/m3-b3-home.json" --reset-trust 1 --drop-trust 1
+  mv "${WORK}/results"/m3-b3-home.* "${WORK}/results/ironrdp/"
+  docker exec "$(name b3)" sh -c 'for file in /var/log/xrdp.log /var/log/xrdp-sesman.log /home/harness/.local/share/xrdp/xrdp-chansrv*.log; do
+    [ ! -f "$file" ] || tail -100 "$file"
+  done' > "${WORK}/results/ironrdp/b3-server.log" 2>&1
+  python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
+    "${WORK}/results/ironrdp/m3-b3-home.json" || failed=1
   return "$failed"
 }
 
-# K1 (Korean input design V2): the GCC keyboard fields each engine sends, per profile. B1 (IronRDP
-# server at debug level) logs the decoded Client Core Data; B3 (stock xrdp) logs the keymap it
-# loads for the layout. Fresh containers per engine so each log has only that engine's two
-# connections (standard, then korean). Passes when both runs connect and the extracted fields
-# match between the engines.
+# K1: record the GCC keyboard fields and the xrdp keymaps for both profiles.
 keyboard_fields() {
-  local engine avail failed=0
+  local avail failed=0
   avail="$(free -g | awk '/^Mem:/ {print $7}')"
   (( avail >= 20 )) || { log "less than 20G available"; return 1; }
   docker build --label "${LABEL}" -t "${B1_IMAGE}" "${ROOT_DIR}/Harness/docker/b1-ironrdp"
@@ -385,45 +325,40 @@ keyboard_fields() {
   tunnel_up "${PORT_B1}" "${PORT_B3}"
   printf '999 harness %s sudo\n' "$(openssl passwd -6 "${HARNESS_B3_PASS}")" > "${WORK}/users.list"
   chmod 644 "${WORK}/users.list"
-  for engine in freerdp ironrdp; do
-    mkdir -p "${WORK}/results/${engine}"
-    docker rm -fv "$(name b1)" >/dev/null 2>&1 || true
-    docker run -d --label "${LABEL}" --name "$(name b1)" -p "${BIND_IP}:${PORT_B1}:3389" \
-      -e IRONRDP_LOG=info,ironrdp_acceptor=debug -e NO_COLOR=1 -v "${WORK}/certs:/certs:ro" "${B1_IMAGE}" \
-      --sec hybrid --user harness --pass "${HARNESS_B1_PASS}" --cert /certs/a.pem --key /certs/a-key.pem >/dev/null
-    wait_port "${PORT_B1}"
-    ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/k1-b1-keyboard.json" --reset-trust 1 --drop-trust 1
-    docker logs "$(name b1)" > "${WORK}/results/${engine}/b1-server.log" 2>&1
-    { grep -oE 'keyboard_layout: [0-9]+|keyboard_type: KeyboardType\([0-9]+\)|keyboard_subtype: [0-9]+|keyboard_functional_keys_count: [0-9]+|ime_file_name: "[^"]*"' \
-        "${WORK}/results/${engine}/b1-server.log" || true; } | paste -d' ' - - - - - > "${WORK}/results/${engine}/b1-keyboard.txt"
-    docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
-    docker run -d --label "${LABEL}" --name "$(name b3)" -p "${BIND_IP}:${PORT_B3}:3389" --shm-size 1g \
-      -v "${WORK}/users.list:/etc/users.list:ro" "${B3_IMAGE}" >/dev/null
-    wait_port "${PORT_B3}"
-    ENGINE="$engine" run_scenario "${ROOT_DIR}/Harness/docker/scenarios/k1-b3-keyboard.json" --reset-trust 1 --drop-trust 1
-    docker exec "$(name b3)" cat /var/log/xrdp.log > "${WORK}/results/${engine}/b3-xrdp.log" 2>&1
-    { grep -oE '(Loading|Cannot find) keymap file [^ ]+' "${WORK}/results/${engine}/b3-xrdp.log" || true; } \
-      > "${WORK}/results/${engine}/b3-keyboard.txt"
-    mv "${WORK}/results"/k1-b[13]-keyboard.* "${WORK}/results/${engine}/"
-    local scenario
-    for scenario in k1-b1-keyboard k1-b3-keyboard; do
-      python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
-        "${WORK}/results/${engine}/${scenario}.json" || failed=1
-    done
-    rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync --include '*keyboard*.session.log' --exclude '*' \
-      "${MAC}:${MAC_DIR}/work/" "${WORK}/results/${engine}/sessions/" || failed=1
-    { grep -ohE 'RDP keyboard profile=[a-z]+ layout=0x[0-9a-f]+ type=[0-9]+ subtype=[0-9]+ fn=[0-9]+' \
-        "${WORK}/results/${engine}/sessions/"*.session.log || true; } | sort -u > "${WORK}/results/${engine}/client-keyboard.txt"
+  mkdir -p "${WORK}/results/ironrdp"
+  docker rm -fv "$(name b1)" >/dev/null 2>&1 || true
+  docker run -d --label "${LABEL}" --name "$(name b1)" -p "${BIND_IP}:${PORT_B1}:3389" \
+    -e IRONRDP_LOG=info,ironrdp_acceptor=debug -e NO_COLOR=1 -v "${WORK}/certs:/certs:ro" "${B1_IMAGE}" \
+    --sec hybrid --user harness --pass "${HARNESS_B1_PASS}" --cert /certs/a.pem --key /certs/a-key.pem >/dev/null
+  wait_port "${PORT_B1}"
+  run_scenario "${ROOT_DIR}/Harness/docker/scenarios/k1-b1-keyboard.json" --reset-trust 1 --drop-trust 1
+  docker logs "$(name b1)" > "${WORK}/results/ironrdp/b1-server.log" 2>&1
+  { grep -oE 'keyboard_layout: [0-9]+|keyboard_type: KeyboardType\([0-9]+\)|keyboard_subtype: [0-9]+|keyboard_functional_keys_count: [0-9]+|ime_file_name: "[^"]*"' \
+      "${WORK}/results/ironrdp/b1-server.log" || true; } | paste -d' ' - - - - - > "${WORK}/results/ironrdp/b1-keyboard.txt"
+  docker rm -fv "$(name b3)" >/dev/null 2>&1 || true
+  docker run -d --label "${LABEL}" --name "$(name b3)" -p "${BIND_IP}:${PORT_B3}:3389" --shm-size 1g \
+    -v "${WORK}/users.list:/etc/users.list:ro" "${B3_IMAGE}" >/dev/null
+  wait_port "${PORT_B3}"
+  run_scenario "${ROOT_DIR}/Harness/docker/scenarios/k1-b3-keyboard.json" --reset-trust 1 --drop-trust 1
+  docker exec "$(name b3)" cat /var/log/xrdp.log > "${WORK}/results/ironrdp/b3-xrdp.log" 2>&1
+  { grep -oE '(Loading|Cannot find) keymap file [^ ]+' "${WORK}/results/ironrdp/b3-xrdp.log" || true; } \
+    > "${WORK}/results/ironrdp/b3-keyboard.txt"
+  mv "${WORK}/results"/k1-b[13]-keyboard.* "${WORK}/results/ironrdp/"
+  local scenario
+  for scenario in k1-b1-keyboard k1-b3-keyboard; do
+    python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
+      "${WORK}/results/ironrdp/${scenario}.json" || failed=1
   done
-  for file in client-keyboard.txt b1-keyboard.txt b3-keyboard.txt; do
-    diff -u "${WORK}/results/freerdp/${file}" "${WORK}/results/ironrdp/${file}" || failed=1
-  done
+  rsync -a --mkpath --rsync-path=/opt/homebrew/bin/rsync --include '*keyboard*.session.log' --exclude '*' \
+    "${MAC}:${MAC_DIR}/work/" "${WORK}/results/ironrdp/sessions/" || failed=1
+  { grep -ohE 'RDP keyboard profile=[a-z]+ layout=0x[0-9a-f]+ type=[0-9]+ subtype=[0-9]+ fn=[0-9]+' \
+      "${WORK}/results/ironrdp/sessions/"*.session.log || true; } | sort -u > "${WORK}/results/ironrdp/client-keyboard.txt"
   return "$failed"
 }
 
 down() {
   local n
-  for n in b1 b1chain b2 b3 b4tls10 b4tls11 b4tls12; do
+  for n in b1 b1chain b3 b4tls10 b4tls11 b4tls12; do
     docker rm -fv "$(name "${n}")" >/dev/null 2>&1 || true
   done
   if [[ -f "${WORK}/tunnel.pid" ]]; then
@@ -444,7 +379,7 @@ case "${1:-}" in
   down) down ;;
   m3-b3)
     trap down EXIT
-    m3_b3 "${2:-both}"
+    m3_b3
     ;;
   keyboard)
     trap down EXIT
@@ -452,7 +387,7 @@ case "${1:-}" in
     ;;
   m3-b1)
     trap down EXIT
-    m3_b1 "${2:-both}"
+    m3_b1
     ;;
   legacy-tls)
     trap down EXIT
@@ -468,7 +403,7 @@ case "${1:-}" in
     scenarios
     ;;
   *)
-    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls|m3-b1|m3-b3 [both|freerdp|ironrdp]|keyboard" >&2
+    echo "usage: $0 all|images|up|mac-build|scenarios|down|legacy-tls|m3-b1|m3-b3|keyboard" >&2
     exit 2
     ;;
 esac

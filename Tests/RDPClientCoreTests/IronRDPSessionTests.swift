@@ -394,10 +394,6 @@ final class IronRDPSessionTests: XCTestCase {
                        ClipboardFileOffer(providedCount: 1, providedBytes: 1, omittedCount: 1))
         XCTAssertEqual(attempts, 1)
 
-        // A native FreeRDP offer on this disconnected session would throw.
-        let free = try IronRDPSession(staging: staging)
-        XCTAssertEqual(try free.sendLocalFiles([link]), onlyOmitted)
-        XCTAssertThrowsError(try free.sendLocalFiles([file, link]))
     }
 
     /// T-M5: an empty folder offered through the stub (which echoes names) arrives as an empty directory.

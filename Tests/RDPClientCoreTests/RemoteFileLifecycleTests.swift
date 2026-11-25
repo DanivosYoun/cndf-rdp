@@ -640,29 +640,6 @@ private final class LogRecorder: RDPSessionDelegate {
     func rdpSession(_ session: RDPEngineSession, didReceiveFrame frame: RDPFrame) {}
 }
 
-private final class FakePasteboard: PasteboardClient {
-    private let lock = NSLock()
-    private var count = 0
-    private var payload: ClipboardPayload?
-    private var offMainTextWrites = 0
-
-    var textWritesOffMain: Int { lock.lock(); defer { lock.unlock() }; return offMainTextWrites }
-
-    var changeCount: Int { lock.lock(); defer { lock.unlock() }; return count }
-    var text: String? { if case .text(let text)? = readPayload() { return text }; return nil }
-    var fileURLs: [URL]? { if case .fileURLs(let urls)? = readPayload() { return urls }; return nil }
-
-    func copyLocally(_ text: String) { writeText(text) }
-    func readPayload() -> ClipboardPayload? { lock.lock(); defer { lock.unlock() }; return payload }
-    func writeText(_ text: String) {
-        lock.lock()
-        payload = .text(text)
-        count += 1
-        if !Thread.isMainThread { offMainTextWrites += 1 }
-        lock.unlock()
-    }
-    func writeFileURLs(_ urls: [URL]) { lock.lock(); payload = .fileURLs(urls); count += 1; lock.unlock() }
-}
 
 /// A CF_FILEGROUPDESCRIPTORW with `FD_FILESIZE` entries.
 private func descriptor(_ files: [(String, UInt64)]) -> Data {
