@@ -457,6 +457,11 @@ fn run(
         );
         runtime.block_on(async {
             let retry_config = cfg!(feature = "legacy-tls").then(|| config.clone());
+            #[cfg(feature = "legacy-tls")]
+            let config = config.with_tls_upgrader(Arc::new(crate::legacy_tls::ModernTlsUpgrader {
+                callback: Arc::clone(&legacy_trust),
+                started: AtomicBool::new(false),
+            }));
             let retry = run_attempt(
                 connection,
                 config,
@@ -466,13 +471,13 @@ fn run(
                 &autologon_sent,
                 minimum,
                 retry_config,
-                false,
+                None,
                 clip_jobs,
                 options.channels.drive.as_ref(),
             )
             .await;
             #[cfg(feature = "legacy-tls")]
-            if let Some(config) = retry {
+            if let Some((config, failure)) = retry {
                 let config =
                     config.with_tls_upgrader(Arc::new(crate::legacy_tls::LegacyTlsUpgrader {
                         callback: legacy_trust,
@@ -488,7 +493,7 @@ fn run(
                     &autologon_sent,
                     minimum,
                     None,
-                    true,
+                    Some(failure),
                     clip_jobs,
                     options.channels.drive.as_ref(),
                 )
@@ -523,10 +528,10 @@ async fn run_attempt(
     autologon_sent: &AtomicBool,
     minimum: CNDFIronLogLevel,
     retry_config: Option<Config>,
-    legacy: bool,
+    initial_failure: Option<Failure>,
     clip_jobs: Option<&clipboard::ClipJobs>,
     drive: Option<&(String, String)>,
-) -> Option<Config> {
+) -> Option<(Config, Failure)> {
     let (sender, receiver) = output_channel(128);
     let mut client = RdpClient::new(config, sender)
         .with_desktop_updates()
@@ -560,7 +565,7 @@ async fn run_attempt(
             autologon_sent,
             minimum,
             retry_config,
-            legacy,
+            initial_failure,
         );
         let client = client.run();
         tokio::pin!(bridge, client);
@@ -583,9 +588,11 @@ async fn forward(
     rejected: &AtomicBool,
     autologon_sent: &AtomicBool,
     minimum: CNDFIronLogLevel,
+    #[cfg_attr(not(feature = "legacy-tls"), allow(unused_variables, unused_mut))]
     mut retry_config: Option<Config>,
-    legacy: bool,
-) -> Option<Config> {
+    #[cfg_attr(not(feature = "legacy-tls"), allow(unused_variables, unused_mut))]
+    mut initial_failure: Option<Failure>,
+) -> Option<(Config, Failure)> {
     let mut timer = tokio::time::interval(Duration::from_millis(4));
     let mut stopping = None;
     loop {
@@ -596,8 +603,11 @@ async fn forward(
                     RdpOutputEvent::ConnectionFailure(error) => {
                         if connection.stop.load(Ordering::Acquire) { continue; }
                         let failure = errors::classify(&error, rejected.load(Ordering::Acquire));
-                        if failure.1 == errors::TLS_PROTOCOL_VERSION && retry_config.is_some() {
-                            return retry_config;
+                        #[cfg(feature = "legacy-tls")]
+                        if errors::retries_with_legacy(&error, &failure) {
+                            if let Some(config) = retry_config.take() {
+                                return Some((config, failure));
+                            }
                         }
                         #[cfg(not(feature = "legacy-tls"))]
                         let failure = if failure.1 == errors::TLS_PROTOCOL_VERSION {
@@ -605,15 +615,22 @@ async fn forward(
                         } else {
                             failure
                         };
-                        if legacy {
+                        #[cfg(feature = "legacy-tls")]
+                        let failure = if let Some(initial) = initial_failure.take() {
                             log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
                                 "IronRDP legacy TLS connection failed.");
-                        }
+                            initial.after_legacy_retry(failure)
+                        } else {
+                            failure
+                        };
                         Output::Failure(failure)
                     }
                     RdpOutputEvent::Connected => {
-                        // The modern handshake succeeded. Release its unused retry configuration.
-                        retry_config = None;
+                        #[cfg(feature = "legacy-tls")]
+                        {
+                            retry_config = None;
+                            initial_failure = None;
+                        }
                         Output::Rdp(RdpOutputEvent::Connected)
                     }
                     RdpOutputEvent::LogonError(info) => {
