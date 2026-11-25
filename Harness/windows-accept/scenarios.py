@@ -110,6 +110,8 @@ def feature(name, label, steps, **fields):
 
 for label in ("iron-1", "iron-2", "iron-3", "free-1"):
     mac = args.mac_fixture_dir
+    is_free = label.startswith("free-")
+    expected_cut = "timeout" if is_free else "error"
     feature("gfx", label, [step("idle", seconds=3)], log_level="trace")
     feature("text", label, [
         READY,
@@ -135,9 +137,9 @@ for label in ("iron-1", "iron-2", "iron-3", "free-1"):
         step("clipboardSetLocalFiles", paths=[f"{mac}/cancel.bin"]),
         step("clipboardWaitLocalPrefix", prefix="I8DONE", timeout=45),
     ])
-    feature("sound", label, [
-        READY, command("sound 8"), step("audioExpectWaves", minWaves=1, timeout=15),
-    ], audioMode=1)
+    # The common statistics only expose the IronRDP wave counter.
+    audio_check = step("idle", seconds=10) if is_free else step("audioExpectWaves", minWaves=1, timeout=15)
+    feature("sound", label, [READY, command("sound 8"), audio_check], audioMode=1)
     feature("wheel", label, [
         step("idle", seconds=5),
         step("keys", text="click:300,150 wait:500"),
@@ -159,7 +161,7 @@ for label in ("iron-1", "iron-2", "iron-3", "free-1"):
         step("reconnect", timeout=25),
         step("waitFirstFrame", timeout=15),
         step("idle", seconds=2),
-    ])
+    ], expect=dict(disconnect=expected_cut))
     feature("cut", label, [
         READY,
         files(r"C:\i8\src\cut.bin"),
@@ -170,7 +172,7 @@ for label in ("iron-1", "iron-2", "iron-3", "free-1"):
         step("idle", seconds=4),
         files(WIN_FILE),
         step("clipboardExpectLocalFiles", count=1, timeout=20),
-    ])
+    ], expect=dict(disconnect=expected_cut))
 
     resize = [step("idle", seconds=5)]
     for sequence in SIZES:
