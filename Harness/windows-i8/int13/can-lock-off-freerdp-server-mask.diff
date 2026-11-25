@@ -1,0 +1,12 @@
+--- wl/tree-off/Sources/FreeRDPBridge/FreeRDPBridge.c	2026-11-22 16:36:35.765377906 +0900
++++ wl/tree-off2/Sources/FreeRDPBridge/FreeRDPBridge.c	2026-11-22 18:01:20.436362554 +0900
+@@ -580,7 +580,8 @@
+             (capability->capabilitySetLength >= CB_CAPSTYPE_GENERAL_LEN)) {
+             const CLIPRDR_GENERAL_CAPABILITY_SET *general =
+                 (const CLIPRDR_GENERAL_CAPABILITY_SET *)capability;
+-            session->server_clip_flags = general->generalFlags;
++            // SCRATCH 8a11de3b CAN_LOCK-off: the bridge also treats the server as not locking.
++            session->server_clip_flags = general->generalFlags & ~CB_CAN_LOCK_CLIPDATA;
+             bridge_logf(
+                 session,
+                 "Clipboard server capabilities: version=%u flags=0x%08x.",
