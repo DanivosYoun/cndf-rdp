@@ -112,7 +112,7 @@ mac_build() {
       rm -rf Vendor/IronRDP .build
     fi
     [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh --features legacy-tls > \$M/ironrdp-build.log 2>&1
-    swift build -c release --product rdp-engine-harness -Xswiftc -enable-testing 2>&1 | tail -3
+    swift build --build-system native -c release --product rdp-engine-harness -Xswiftc -enable-testing 2>&1 | tail -3
     echo ${digest} > \$M/built.digest"
 }
 
