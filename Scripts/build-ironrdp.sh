@@ -6,7 +6,7 @@ vendor="$root/Vendor/IronRDP"
 source_dir="$vendor/src"
 patches=("$root"/Rust/cndf-ironrdp/patches/*.patch)
 IRONRDP_REPO=https://github.com/Devolutions/IronRDP.git
-IRONRDP_COMMIT=15b4a03ff552b80463287495ff940de3c1989807
+IRONRDP_COMMIT=293cb4bee90baddfd7b8ea08d2f46e31947a3888
 
 if [[ ! -e "$source_dir" ]]; then
     mkdir -p "$vendor"

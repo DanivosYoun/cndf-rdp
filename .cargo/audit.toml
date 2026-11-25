@@ -1,0 +1,13 @@
+[advisories]
+ignore = [
+    # macOS engine and legacy-tls use only password credentials (src/engine.rs:378).
+    # CredSSP binds the peer's public key with the negotiated session key
+    # (sspi 0.23.1 src/credssp/mod.rs:1364, :1544). Kerberos password preauth uses
+    # symmetric crypto (src/kerberos/pa_datas.rs:30, :90). Smartcard PKINIT is
+    # disabled and Negotiate's PKU2U identity selection is Windows-only
+    # (src/negotiate/mod.rs:569). The client cannot reach rsa private-key operations.
+    "RUSTSEC-2023-0071",
+    # The macOS DNS resolver path in sspi 0.23.1 requires async-dnssd 0.5.1,
+    # which requires pin-utils 0.1.1 (Rust/cndf-ironrdp/Cargo.lock:89, :3238).
+    "RUSTSEC-2026-0441",
+]

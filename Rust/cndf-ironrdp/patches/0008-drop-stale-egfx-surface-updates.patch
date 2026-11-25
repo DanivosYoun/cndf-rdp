@@ -1,5 +1,5 @@
 diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
-index f5d510f..746b3dd 100644
+index 1376ceba..fd9c7480 100644
 --- a/crates/ironrdp-egfx/src/client.rs
 +++ b/crates/ironrdp-egfx/src/client.rs
 @@ -1155,10 +1155,10 @@ impl GraphicsPipelineClient {
@@ -30,9 +30,9 @@ index f5d510f..746b3dd 100644
 +            return Ok(());
 +        };
          let (surface_width, surface_height) = (surface.width, surface.height);
- 
-         let tiles = match self.progressive_decoder.decode_bitmap(
-@@ -1468,6 +1468,11 @@ impl GraphicsPipelineClient {
+         // A surface the compositor refused paints nothing, so it keeps no Progressive tile state either.
+         if !self.compositor.has_surface(pdu.surface_id) {
+@@ -1477,6 +1477,11 @@ impl GraphicsPipelineClient {
      ///
      /// [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
      fn decode_avc444(&mut self, codec_id: Codec1Type, surface_id: u16, bitmap_data: &[u8]) -> PduResult<()> {
@@ -44,7 +44,7 @@ index f5d510f..746b3dd 100644
          let mut cursor = ReadCursor::new(bitmap_data);
          let stream = Avc444BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
          let layout = if codec_id == Codec1Type::Avc444 {
-@@ -1475,11 +1480,6 @@ impl GraphicsPipelineClient {
+@@ -1484,11 +1489,6 @@ impl GraphicsPipelineClient {
          } else {
              Avc444Layout::V2
          };
@@ -56,7 +56,7 @@ index f5d510f..746b3dd 100644
  
          trace!(surface_id, ?codec_id, encoding = ?stream.encoding, "AVC444 update");
          let (main, auxiliary) = match stream.encoding {
-@@ -3448,6 +3448,40 @@ mod tests {
+@@ -3457,6 +3457,40 @@ mod tests {
          assert_eq!(client.dropped_updates, 1);
      }
  

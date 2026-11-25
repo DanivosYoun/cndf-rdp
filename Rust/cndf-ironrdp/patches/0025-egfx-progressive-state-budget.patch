@@ -1,21 +1,8 @@
 diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
-index 746b3dd..c66faee 100644
+index 2d0945f8..59c75dc6 100644
 --- a/crates/ironrdp-egfx/src/client.rs
 +++ b/crates/ironrdp-egfx/src/client.rs
-@@ -1227,6 +1227,12 @@ impl GraphicsPipelineClient {
-             return Ok(());
-         };
-         let (surface_width, surface_height) = (surface.width, surface.height);
-+        // Progressive state persists per surface, so a surface the compositor refused a canvas
-+        // (too large or over budget) would keep growing it while drawing nothing.
-+        if !self.compositor.has_canvas(pdu.surface_id) {
-+            debug!(surface_id = pdu.surface_id, "WireToSurface2 for a surface without a canvas dropped");
-+            return Ok(());
-+        }
- 
-         let tiles = match self.progressive_decoder.decode_bitmap(
-             pdu.surface_id,
-@@ -3621,6 +3627,50 @@ mod tests {
+@@ -3639,6 +3639,50 @@ mod tests {
          assert_eq!(client.dropped_updates, 1);
      }
  
@@ -63,28 +50,12 @@ index 746b3dd..c66faee 100644
 +        assert_eq!(client.dropped_updates, 1, "the returned budget admits the tile again");
 +    }
 +
-     // ========================================================================
-     // AVC420 region rectangles (regionRects) -- issue #2042
-     //
-diff --git a/crates/ironrdp-egfx/src/compositor.rs b/crates/ironrdp-egfx/src/compositor.rs
-index 00a0216..0e3b68a 100644
---- a/crates/ironrdp-egfx/src/compositor.rs
-+++ b/crates/ironrdp-egfx/src/compositor.rs
-@@ -342,6 +342,11 @@ impl Compositor {
-         self.allocated_bytes = self.allocated_bytes.saturating_sub(len);
-     }
- 
-+    /// Whether the compositor holds a canvas for surface `id`; it has none for a surface it refused.
-+    pub(crate) fn has_canvas(&self, id: u16) -> bool {
-+        self.surfaces.contains_key(&id)
-+    }
-+
-     /// Reserve `len` bytes for a buffer kept beside surface `id`, such as a codec's reference picture.
-     ///
-     /// Refused when the compositor holds no canvas for the surface (it was too large or over budget)
+     /// A surface the compositor refused paints nothing, so its Progressive updates aren't decoded into bitmap updates.
+     // oracle: mutant decoding Progressive for a surface the compositor refused
+     #[test]
 diff --git a/crates/ironrdp-egfx/tests/progressive_canvas.rs b/crates/ironrdp-egfx/tests/progressive_canvas.rs
 new file mode 100644
-index 0000000..6bd650d
+index 00000000..6bd650d2
 --- /dev/null
 +++ b/crates/ironrdp-egfx/tests/progressive_canvas.rs
 @@ -0,0 +1,131 @@
@@ -220,7 +191,7 @@ index 0000000..6bd650d
 +    assert_eq!(client.dropped_updates(), 0, "a surface without a canvas is not an undecodable update");
 +}
 diff --git a/crates/ironrdp-graphics/src/progressive.rs b/crates/ironrdp-graphics/src/progressive.rs
-index deeb983..066a537 100644
+index deeb983a..066a5376 100644
 --- a/crates/ironrdp-graphics/src/progressive.rs
 +++ b/crates/ironrdp-graphics/src/progressive.rs
 @@ -1128,6 +1128,12 @@ impl SurfaceTiles {
@@ -664,7 +635,7 @@ index deeb983..066a537 100644
              .decode_bitmap(
 diff --git a/crates/ironrdp-graphics/tests/progressive_state_budget.rs b/crates/ironrdp-graphics/tests/progressive_state_budget.rs
 new file mode 100644
-index 0000000..2d2749a
+index 00000000..2d2749af
 --- /dev/null
 +++ b/crates/ironrdp-graphics/tests/progressive_state_budget.rs
 @@ -0,0 +1,303 @@
