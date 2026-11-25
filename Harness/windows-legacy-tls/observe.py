@@ -24,7 +24,13 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(3)) as capt
         ip = capture.recv(65535)
         if len(ip) < 40 or ip[0] >> 4 != 4 or ip[9] != 6:
             continue
-        tcp = ip[(ip[0] & 15) * 4:]
+        # A minimum-size Ethernet frame can have padding beyond the IPv4 packet.
+        # Ignore it before deduplicating TCP segments by their sequence number.
+        header_length = (ip[0] & 15) * 4
+        packet_length = int.from_bytes(ip[2:4], "big")
+        tcp = ip[header_length:packet_length]
+        if len(tcp) < 20 or int.from_bytes(ip[6:8], "big") & 0x1fff:
+            continue
         src = int.from_bytes(tcp[:2], "big")
         dst = int.from_bytes(tcp[2:4], "big")
         seq = int.from_bytes(tcp[4:8], "big")
