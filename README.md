@@ -41,7 +41,7 @@ The bridge currently provides:
 - typed connection failure callback for user-facing diagnostics and audit codes
 - disconnect reason callback for audit/reconnect policy
 - optional per-session log file writing
-- log level and IronRDP build info through `RDPMacInfo`
+- log level, with package and engine version information
 - `RDPSecureString` for vault-supplied transient passwords
 - reconnect API using retained connection options
 - session statistics for frames, clipboard, file transfer, and activity timestamps
@@ -103,8 +103,7 @@ Typed failures are reported as:
 Disconnect reasons are `.localRequest`, `.serverDisconnect(code:)`, `.timeout`, and `.error`.
 Use `RDPConnectionOptions.logFileURL` to let the package append per-session logs directly.
 Use `RDPConnectionOptions.logLevel` to set the IronRDP log level.
-Use `RDPMacInfo.packageVersion`, `RDPMacInfo.ironRDPVersion`, and
-`RDPMacInfo.buildConfiguration` in about dialogs and bug reports.
+Use `RDPMacInfo.packageVersion` and `IronRDPSession.engineVersion` in about dialogs and bug reports.
 
 For vault integration, pass `securePassword: RDPSecureString(vaultPassword)` instead of
 `password:`. The secure string provides explicit `zeroize()` and only exposes a temporary C string
