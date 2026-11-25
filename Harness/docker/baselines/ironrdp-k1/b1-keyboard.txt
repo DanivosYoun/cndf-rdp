@@ -1,0 +1,2 @@
+keyboard_layout: 0 keyboard_type: KeyboardType(4) keyboard_subtype: 0 keyboard_functional_keys_count: 12 ime_file_name: ""
+keyboard_layout: 1042 keyboard_type: KeyboardType(8) keyboard_subtype: 3 keyboard_functional_keys_count: 12 ime_file_name: ""

@@ -1,0 +1,2 @@
+RDP keyboard profile=korean layout=0x412 type=8 subtype=3 fn=12
+RDP keyboard profile=standard layout=0x0 type=4 subtype=0 fn=12

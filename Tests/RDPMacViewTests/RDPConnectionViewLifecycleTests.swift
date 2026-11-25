@@ -5,6 +5,28 @@ import RDPClientCore
 
 @MainActor
 final class RDPConnectionViewLifecycleTests: XCTestCase {
+    func testLiveDelegateTrustsOnlyPinnedLeaf() async {
+        let view = RDPConnectionView(frame: .zero)
+        let fingerprint = RDPCertificateTrustString.freeRDPCompatible(derChain: [Data("abc".utf8)])
+        let unpinned = LifecycleDelegate()
+        let rejected = await unpinned.rdpConnectionView(
+            view, shouldTrustCertificateFingerprint: fingerprint, hostname: "localhost", port: 3389
+        )
+        XCTAssertFalse(rejected)
+
+        let pinned = LifecycleDelegate()
+        pinned.expectedCertificateSHA256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        let accepted = await pinned.rdpConnectionView(
+            view, shouldTrustCertificateFingerprint: fingerprint, hostname: "localhost", port: 3389
+        )
+        XCTAssertTrue(accepted)
+        let wrongLeaf = await pinned.rdpConnectionView(
+            view, shouldTrustCertificateFingerprint: RDPCertificateTrustString.freeRDPCompatible(derChain: [Data("xyz".utf8)]),
+            hostname: "localhost", port: 3389
+        )
+        XCTAssertFalse(wrongLeaf)
+    }
+
     func testShutdownIsIdempotent() {
         let view = RDPConnectionView(frame: NSRect(x: 0, y: 0, width: 320, height: 200))
 
@@ -174,6 +196,7 @@ final class RDPConnectionViewLifecycleTests: XCTestCase {
                 )
                 let view = RDPConnectionView(frame: window.contentView?.bounds ?? .zero)
                 let delegate = LifecycleDelegate()
+                delegate.expectedCertificateSHA256 = environment["RDP_WINDOW_CLOSE_CERT_SHA256"]
                 releasedView = view
                 releasedWindow = window
                 view.delegate = delegate
@@ -252,9 +275,20 @@ private func makeLiveConnectionOptions(environment: [String: String]) -> RDPConn
 }
 
 private final class LifecycleDelegate: RDPConnectionViewDelegate {
+    var expectedCertificateSHA256: String?
     var connectedChanges: [Bool] = []
     var logs: [String] = []
     var remoteTexts: [String] = []
+
+
+    func rdpConnectionView(
+        _ view: RDPConnectionView,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool {
+        RDPCertificateTrustString.matchesLeafSHA256(fingerprint, expected: expectedCertificateSHA256)
+    }
 
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {
         connectedChanges.append(connected)

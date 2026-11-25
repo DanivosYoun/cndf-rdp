@@ -253,6 +253,12 @@ legacy_tls_scenarios() {
   log "results in ${WORK}/results"
 }
 
+compare_ironrdp_baseline() {
+  local baseline="${ROOT_DIR}/Harness/docker/baselines" file="$1"
+  (cd "$baseline" && sha256sum --check --strict SHA256SUMS-ironrdp-m3-k1) || return
+  diff -u "$baseline/$file" "${WORK}/results/ironrdp/${file##*/}"
+}
+
 m3_channels() {
   local scenario="${ROOT_DIR}/Harness/docker/scenarios/m3-b1-channels.json"
   mkdir -p "${WORK}/results/ironrdp"
@@ -264,7 +270,8 @@ m3_channels() {
   python3 "${ROOT_DIR}/Harness/docker/b1-ironrdp/channel-results.py" \
     "$scenario" "${WORK}/results/ironrdp/b1-server.log" > "${WORK}/results/ironrdp/b1-channels.json" || return
   python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
-    "${WORK}/results/ironrdp/m3-b1-channels.json"
+    "${WORK}/results/ironrdp/m3-b1-channels.json" || return
+  compare_ironrdp_baseline 2026-11-21-ironrdp-m3-macos/b1-channels.json
 }
 
 m3_b1() {
@@ -347,7 +354,7 @@ keyboard_fields() {
   { grep -oE '(Loading|Cannot find) keymap file [^ ]+' "${WORK}/results/ironrdp/b3-xrdp.log" || true; } \
     > "${WORK}/results/ironrdp/b3-keyboard.txt"
   mv "${WORK}/results"/k1-b[13]-keyboard.* "${WORK}/results/ironrdp/"
-  local scenario
+  local scenario file
   for scenario in k1-b1-keyboard k1-b3-keyboard; do
     python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["passed"])' \
       "${WORK}/results/ironrdp/${scenario}.json" || failed=1
@@ -356,6 +363,9 @@ keyboard_fields() {
     "${MAC}:${MAC_DIR}/work/" "${WORK}/results/ironrdp/sessions/" || failed=1
   { grep -ohE 'RDP keyboard profile=[a-z]+ layout=0x[0-9a-f]+ type=[0-9]+ subtype=[0-9]+ fn=[0-9]+' \
       "${WORK}/results/ironrdp/sessions/"*.session.log || true; } | sort -u > "${WORK}/results/ironrdp/client-keyboard.txt"
+  for file in b1-keyboard.txt b3-keyboard.txt client-keyboard.txt; do
+    compare_ironrdp_baseline "ironrdp-k1/$file" || failed=1
+  done
   return "$failed"
 }
 

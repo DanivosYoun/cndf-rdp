@@ -119,13 +119,17 @@ Manual window-close verification for terminal integration:
 6. Repeat once more by calling `shutdown()` immediately after `connect(_:)`, before the first frame.
 7. Confirm no new app crash report appears in `~/Library/Logs/DiagnosticReports`.
 
-Standalone stress verification:
+Both live checks require the expected server leaf certificate SHA-256 in
+`RDP_WINDOW_CLOSE_CERT_SHA256`. Set it to the 64 hex digits of the SHA-256
+digest of the trusted leaf certificate's DER bytes. The delegates reject
+connections when the pin is absent or differs.
 
 ```sh
 RDP_MAC_HOST=192.168.1.10 \
 RDP_MAC_PORT=3389 \
 RDP_MAC_USERNAME=user \
 RDP_MAC_PASSWORD=secret \
+RDP_WINDOW_CLOSE_CERT_SHA256="$trusted_leaf_sha256" \
 RDP_WINDOW_CLOSE_STRESS_CYCLES=100 \
 swift run window-close-stress-test
 ```
@@ -138,6 +142,7 @@ RDP_MAC_HOST=192.168.1.10 \
 RDP_MAC_PORT=3389 \
 RDP_MAC_USERNAME=user \
 RDP_MAC_PASSWORD=secret \
+RDP_WINDOW_CLOSE_CERT_SHA256="$trusted_leaf_sha256" \
 swift test --filter RDPConnectionViewLifecycleTests/testRealSessionShutdownThenWindowCloseSurvivesAutoreleaseDrain
 ```
 

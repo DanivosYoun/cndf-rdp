@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The certificate trust key both engines hand to `shouldTrustCertificateFingerprint`.
@@ -13,6 +14,18 @@ public enum RDPCertificateTrustString {
     public static func freeRDPCompatible(derChain: [Data]) -> String {
         guard let leaf = derChain.first else { return "" }
         return ([leaf] + derChain).map(pem).joined()
+    }
+
+    // The live window-close tools pin the SHA-256 of the server leaf's DER.
+    package static func matchesLeafSHA256(_ fingerprint: String, expected: String?) -> Bool {
+        guard let expected, expected.count == 64,
+              let leafPEM = fingerprint.components(separatedBy: "-----END CERTIFICATE-----").first,
+              leafPEM.hasPrefix("-----BEGIN CERTIFICATE-----\n"),
+              let leaf = Data(base64Encoded: String(leafPEM.dropFirst("-----BEGIN CERTIFICATE-----\n".count)),
+                              options: .ignoreUnknownCharacters),
+              !leaf.isEmpty else { return false }
+        let digest = SHA256.hash(data: leaf).map { String(format: "%02x", $0) }.joined()
+        return digest == expected.lowercased()
     }
 
     private static func pem(_ der: Data) -> String {

@@ -3,8 +3,23 @@ import RDPClientCore
 import RDPMacView
 
 private final class StressDelegate: RDPConnectionViewDelegate {
+    let expectedCertificateSHA256: String?
+
+    init(expectedCertificateSHA256: String?) {
+        self.expectedCertificateSHA256 = expectedCertificateSHA256
+    }
     var connected = false
     var logs: [String] = []
+
+
+    func rdpConnectionView(
+        _ view: RDPConnectionView,
+        shouldTrustCertificateFingerprint fingerprint: String,
+        hostname: String,
+        port: UInt16
+    ) async -> Bool {
+        RDPCertificateTrustString.matchesLeafSHA256(fingerprint, expected: expectedCertificateSHA256)
+    }
 
     func rdpConnectionView(_ view: RDPConnectionView, didChangeConnected connected: Bool) {
         self.connected = connected
@@ -125,7 +140,7 @@ private func waitForConnection(view: RDPConnectionView, delegate: StressDelegate
     throw StressError.connectionTimeout
 }
 
-private func runCycle(index: Int, options: RDPConnectionOptions, waitAfterConnect: TimeInterval) throws {
+private func runCycle(index: Int, options: RDPConnectionOptions, waitAfterConnect: TimeInterval, certificateSHA256: String?) throws {
     try autoreleasepool {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
@@ -134,7 +149,7 @@ private func runCycle(index: Int, options: RDPConnectionOptions, waitAfterConnec
             defer: false
         )
         let view = RDPConnectionView(frame: window.contentView?.bounds ?? .zero)
-        let delegate = StressDelegate()
+        let delegate = StressDelegate(expectedCertificateSHA256: certificateSHA256)
         view.delegate = delegate
         window.title = "RDP close stress \(index)"
         window.contentView = view
@@ -169,7 +184,10 @@ do {
     let waitAfterConnect = TimeInterval(environment["RDP_WINDOW_CLOSE_STRESS_WAIT_SECONDS"] ?? "1.0") ?? 1.0
 
     for index in 1...cycles {
-        try runCycle(index: index, options: options, waitAfterConnect: waitAfterConnect)
+        try runCycle(
+            index: index, options: options, waitAfterConnect: waitAfterConnect,
+            certificateSHA256: environment["RDP_WINDOW_CLOSE_CERT_SHA256"]
+        )
     }
     print("window-close-stress-test completed \(cycles) cycles")
 } catch {

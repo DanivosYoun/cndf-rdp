@@ -127,10 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, RDPS
         DispatchQueue.main.async { [weak self] in
             self?.connectionBar?.setStatus(message)
             self?.connectionBar?.setConnected(session.isConnected)
-            if message == "IronRDP connected." || message == "Display control channel connected." {
+            let displayControlReady = message.hasPrefix("Display control capabilities received:")
+            if message == "IronRDP connected." || displayControlReady {
                 self?.clientView?.sendForcedDesktopSize()
             }
-            if message == "Display control channel connected." {
+            if displayControlReady {
                 self?.runExplorerFilePasteAutotestIfNeeded()
                 self?.runExplorerFolderPasteAutotestIfNeeded()
             }

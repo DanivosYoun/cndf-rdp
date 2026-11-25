@@ -5,3 +5,6 @@ DerivedData/
 .DS_Store
 
 /Vendor/IronRDP/
+
+# Old artifacts from the removed FreeRDP engine.
+/Vendor/FreeRDP/
