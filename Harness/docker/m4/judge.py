@@ -234,7 +234,13 @@ def missing_engine(errors):
 
 SUMMARY_FREERDP = re.compile(r"Graphics: summary .*?AVC420=(\d+) AVC444=(\d+) AVC444v2=(\d+)")
 SUMMARY_IRON = re.compile(r"H\.264 summary pictures=(\d+) failures=(\d+) idr_waits=(\d+) sessions=(\d+) hardware=(\w+)")
-DECODER_IRON = re.compile(r"H\.264 decoder: VideoToolbox (hardware|software)")
+LOG_PREFIX = r"^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z )?"
+DECODER_IRON = re.compile(LOG_PREFIX + r"IronRDP h264 decoder: hardware=(yes|no) format=\S+$", re.M)
+CODEC_SUMMARY_LINE = re.compile(LOG_PREFIX + r"IronRDP codec summary:(.*)$", re.M)
+CODEC_SUMMARY_FIELDS = re.compile(
+    r"((?: [A-Za-z][A-Za-z0-9]*=\d+)*) avc444_lc=0:(\d+),1:(\d+),2:(\d+) decode_failures=(\d+) dropped=(\d+)"
+)
+AVC_CODECS = {"AVC420", "AVC444", "AVC444v2"}
 
 
 def freerdp_codec_counts(logs):
@@ -272,6 +278,26 @@ def iteration_h264(log):
     if sessions == 0:
         return summary, "sessions=0"
     return summary, None
+
+
+def iteration_codec(log):
+    """Returns the summary and any parsing problem for one current session."""
+    if log is None:
+        return None, "no session log"
+    lines = CODEC_SUMMARY_LINE.findall(log)
+    if len(lines) != 1:
+        return None, f"{len(lines)} codec summaries"
+    fields = CODEC_SUMMARY_FIELDS.fullmatch(lines[0])
+    if fields is None:
+        return None, "malformed codec summary"
+    pairs = [field.split("=") for field in fields[1].split()]
+    counts = {name: int(value) for name, value in pairs}
+    lc0, lc1, lc2, failures, dropped = map(int, fields.groups()[1:])
+    if (len(counts) != len(pairs) or failures > dropped
+            or lc0 + lc1 + lc2 > counts.get("AVC444", 0) + counts.get("AVC444v2", 0)):
+        return None, "inconsistent codec summary"
+    return {"codecCounts": counts, "avc444Lc": [lc0, lc1, lc2],
+            "decodeFailures": failures, "dropped": dropped}, None
 
 
 def harness_problems(engine):
@@ -314,9 +340,6 @@ def check(status, detail):
     return {"status": status, "detail": detail}
 
 
-CODEC_IRON = re.compile(r"\bH\.264 codec=(AVC444v2|AVC444|AVC420)\b")
-
-
 def evaluate(case, codec, freerdp, ironrdp, *, baseline, baseline_codec, size, min_frames,
              truth=None, reference=None):
     report = {"case": case, "codec": codec, "thresholds": {"psnrMinDb": PSNR_MIN_DB,
@@ -333,12 +356,15 @@ def evaluate(case, codec, freerdp, ironrdp, *, baseline, baseline_codec, size, m
     report["freerdpCodecCounts"] = freerdp_codec_counts(freerdp["logs"]) if freerdp else None
     for name in ("cpu", "psnr", "codec", "frames", "size", "host"):
         checks[name] = check("not-run", "no current IronRDP result")
-    if ironrdp and ironrdp["iterations"]:
-        iterations = ironrdp["perIteration"]
-        codecs = [set(CODEC_IRON.findall(it["log"] or "")) for it in iterations]
-        invalid_codec = [it["name"] for it, observed in zip(iterations, codecs) if len(observed) != 1]
+    iterations = ironrdp["perIteration"] if ironrdp else []
+    codec_results = [iteration_codec(it["log"]) for it in iterations]
+    if iterations:
+        codecs = [{name for name, count in summary["codecCounts"].items() if count and name in AVC_CODECS}
+                  if summary else set() for summary, _ in codec_results]
+        invalid_codec = [f"{it['name']}: {problem or 'missing or mixed AVC codec'}"
+                         for it, observed, (_, problem) in zip(iterations, codecs, codec_results) if len(observed) != 1]
         if invalid_codec or any(observed != codecs[0] for observed in codecs):
-            checks["codec"] = check("fail", "missing or mixed codec: " + (", ".join(invalid_codec) or "across iterations"))
+            checks["codec"] = check("fail", "; ".join(invalid_codec) or "mixed AVC codecs across iterations")
         elif codecs[0] != {codec}:
             checks["codec"] = check("not-run", f"observed {next(iter(codecs[0]))}, scenario requires {codec}")
         else:
@@ -393,8 +419,13 @@ def evaluate(case, codec, freerdp, ironrdp, *, baseline, baseline_codec, size, m
         for name in ("summary", "hardware", "failures"):
             checks[name] = check("not-run", "no IronRDP run")
     else:
-        per = [(it["name"], *iteration_h264(it["log"])) for it in ironrdp["perIteration"]]
-        report["ironrdpIterations"] = [{"iteration": n, "summary": s, "problem": p} for n, s, p in per]
+        per = [(it["name"], *iteration_h264(it["log"])) for it in iterations]
+        decoders = [DECODER_IRON.findall(it["log"] or "") for it in iterations]
+        report["ironrdpIterations"] = [
+            {"iteration": n, "summary": summary, "problem": problem, "decoderHardware": decoder,
+             "codecSummary": codec_summary, "codecProblem": codec_problem}
+            for (n, summary, problem), decoder, (codec_summary, codec_problem) in zip(per, decoders, codec_results)
+        ]
         if not per:
             for name in ("summary", "hardware", "failures"):
                 checks[name] = check("fail", "IronRDP ran no iteration")
@@ -403,9 +434,14 @@ def evaluate(case, codec, freerdp, ironrdp, *, baseline, baseline_codec, size, m
             bad = [f"{n}: {problem or low_picture_count}"
                    for n, summary, problem in per if problem or summary["pictures"] < min_frames]
             checks["summary"] = check("fail" if bad else "pass", "; ".join(bad) or f"{len(per)} iterations, one summary each")
-            hw = [f"{n}: hardware={s['hardware'] if s else 'none'}" for n, s, _ in per if not s or s["hardware"] != "yes"]
+            hw = [f"{n}: first decoder={decoder}, summary hardware={s['hardware'] if s else 'none'}"
+                  for (n, s, _), decoder in zip(per, decoders)
+                  if decoder != ["yes"] or not s or s["hardware"] != "yes"]
             checks["hardware"] = check("fail" if hw else "pass", "; ".join(hw) or "hardware=yes in every iteration")
-            fl = [f"{n}: failures={s['failures'] if s else 'none'}" for n, s, _ in per if not s or s["failures"] != 0]
+            fl = [f"{n}: H.264 failures={s['failures'] if s else 'none'}"
+                  for n, s, _ in per if not s or s["failures"] != 0]
+            fl += [f"{n}: EGFX decode_failures={summary['decodeFailures']}"
+                   for (n, _, _), (summary, _) in zip(per, codec_results) if summary and summary["decodeFailures"]]
             checks["failures"] = check("fail" if fl else "pass", "; ".join(fl) or "failures=0 in every iteration")
 
     diagnostics = {}
@@ -506,10 +542,11 @@ def selftest():
     width, height = 256, 128
     ref = reference_image(width, height)
     free_log = ["Graphics: summary rdpgfx=10.7 mode=auto AVC420=0 AVC444=0 AVC444v2=97 surfaceCommands:x."]
-    decoder = "2026-11-23T02:00:00Z H.264 decoder: VideoToolbox hardware 256x128 range=full"
+    decoder = "2026-11-23T02:00:00Z IronRDP h264 decoder: hardware=yes format=f420"
     good = "2026-11-23T02:00:09Z H.264 summary pictures=97 failures=0 idr_waits=0 sessions=1 hardware=yes"
-    codec_line = "H.264 codec=AVC444v2"
-    iron_ok = [codec_line, decoder, good]
+    codec_line = ("2026-11-23T02:00:09Z IronRDP codec summary: ClearCodec=3 Progressive=8 AVC444v2=97 "
+                  "avc444_lc=0:31,1:60,2:6 decode_failures=0 dropped=0")
+    iron_ok = [decoder, good, codec_line]
     h264 = {"summary", "hardware", "failures"}
     frames = lambda: [perturbed(ref, s, 1) for s in (7, 8, 9)]  # noqa: E731
     # name, iron frames, iron cpu, iron log, codec, expected verdict, expected failing checks, write_case extras
@@ -521,12 +558,26 @@ def selftest():
         ("fail: frame size differs", [Image(width - 16, height, ref.rgb[:(width - 16) * height * 3])] * 3, 100, iron_ok,
          "AVC444v2", "fail", {"size"}, {}),
         ("fail: software decoder, 2 failures", frames(), 100,
-         [codec_line, "H.264 decoder: VideoToolbox software 256x128 range=full",
+         [codec_line, decoder.replace("hardware=yes", "hardware=no"),
           "H.264 summary pictures=97 failures=2 idr_waits=1 sessions=2 hardware=no"], "AVC444v2", "fail",
          {"hardware", "failures"}, {}),
         ("incomplete: observed codec differs", frames(), 100, iron_ok, "AVC420", "incomplete", set(), {}),
-        ("fail: only historical codec present", frames(), 100, [decoder, good],
+        ("fail: only historical codec present", frames(), 100, [decoder, good, "H.264 codec=AVC444v2"],
          "AVC444v2", "fail", {"codec"}, {}),
+        ("fail: codec first line without summary", frames(), 100,
+         [decoder, good, "IronRDP codec first: AVC444v2 surface=0 size=256x128"], "AVC444v2", "fail", {"codec"}, {}),
+        ("fail: one iteration has duplicated codec summaries", frames(), 100, None, "AVC444v2", "fail", {"codec"},
+         {"logs": [iron_ok, iron_ok + [codec_line], iron_ok]}),
+        ("fail: one iteration has invalid LC", frames(), 100, None, "AVC444v2", "fail", {"codec"},
+         {"logs": [iron_ok, [decoder, good, codec_line.replace("0:31", "0:99")], iron_ok]}),
+        ("fail: mixed AVC codecs", frames(), 100,
+         [decoder, good, codec_line.replace("AVC444v2=97", "AVC420=1 AVC444v2=97")],
+         "AVC444v2", "fail", {"codec"}, {}),
+        ("fail: first decoder is missing", frames(), 100, [good, codec_line], "AVC444v2", "fail", {"hardware"}, {}),
+        ("fail: first decoder is duplicated", frames(), 100, iron_ok + [decoder], "AVC444v2", "fail", {"hardware"}, {}),
+        ("fail: EGFX decode error", frames(), 100,
+         [decoder, good, codec_line.replace("decode_failures=0 dropped=0", "decode_failures=1 dropped=1")],
+         "AVC444v2", "fail", {"failures"}, {}),
         ("fail: CPU window has one frame", frames(), 100, iron_ok, "AVC444v2", "fail", {"frames"},
          {"results": {1: {"cpuWindows": [{"userMs": 80, "systemMs": 20, "framesReceived": 1}]}}}),
         ("fail: summary has one decoded picture", frames(), 100,

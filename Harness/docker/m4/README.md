@@ -35,16 +35,15 @@ copy of those PPM bytes.
 |---|---|
 | `psnr` | PSNR of current and frozen IronRDP final frames ≥ 40 dB |
 | `cpu` | Median current IronRDP window CPU ≤ 1.2 × frozen IronRDP median |
-| `codec` | Each current session log identifies the requested codec with `H.264 codec=AVC420` for B3 |
-| `frames` | At least 97 frames during each current CPU window and 97 decoded pictures in each summary |
-| `hardware` | Each current H.264 summary reports `hardware=yes` |
-| `failures` | Each current H.264 summary reports `failures=0` |
+| `codec` | Each current `IronRDP codec summary:` has a positive count for the requested AVC codec (AVC420 for B3) and no other AVC codec |
+| `frames` | At least 97 frames during each current CPU window and 97 decoded pictures in each `H.264 summary` |
+| `hardware` | The first decoder line and the H.264 summary both report `hardware=yes` in each current session |
+| `failures` | Each current codec summary reports `decode_failures=0` and each H.264 summary reports `failures=0` |
 
 The judge compares client host identities and validates each frame against the
 scenario resolution. A different comparison host or baseline codec/size leaves
-the comparison incomplete. The current IronRDP runtime logs H.264 decoding and
-summary data. It needs explicit AVC codec logging for real runs to pass this
-gate.
+the comparison incomplete. The verdict includes each current session's codec PDU
+counts, AVC444 LC counts and dropped surface updates.
 
 When historical FreeRDP data is present, the judge verifies its JSON, frames and
 session logs using the archive's `SHA256SUMS`, then reports them as diagnostics.
