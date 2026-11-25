@@ -77,24 +77,24 @@ Remaining production work:
 
 ```swift
 func rdpSession(
-    _ session: RDPSession,
+    _ session: RDPEngineSession,
     shouldTrustCertificateFingerprint fingerprint: String,
     hostname: String,
     port: UInt16
 ) async -> Bool
 
-func rdpSession(_ session: RDPSession, didFailWith error: RDPSessionError)
-func rdpSession(_ session: RDPSession, didDisconnectWith reason: RDPDisconnectReason)
+func rdpSession(_ session: RDPEngineSession, didFailWith error: RDPSessionError)
+func rdpSession(_ session: RDPEngineSession, didDisconnectWith reason: RDPDisconnectReason)
 ```
 
-The default certificate callback returns `true` for TOFU auto-accept behavior. Host apps with a
-known-host store should compare `fingerprint`, store on first use, and return `false` for rejected
-changes. A rejected certificate is reported as `.certificateRejected`.
+The default certificate callback rejects certificates. Host apps implement a trust policy in
+the delegate and can persist the approved `fingerprint` for subsequent connections.
+A rejected certificate is reported as `.certificateRejected`.
 
 Typed failures are reported as:
 
-- `.networkUnreachable(underlying:)`
-- `.tlsHandshakeFailed(reason:)`
+- `.networkUnreachable(underlying:code:stage:)`
+- `.tlsHandshakeFailed(reason:code:stage:)`
 - `.authenticationFailed`
 - `.certificateRejected`
 - `.configurationInvalid(reason:)`
@@ -109,8 +109,8 @@ For vault integration, pass `securePassword: RDPSecureString(vaultPassword)` ins
 `password:`. The secure string provides explicit `zeroize()` and only exposes a temporary C string
 during `connect`. `password:` remains for compatibility.
 
-`RDPSession.reconnect()` and `RDPConnectionView.reconnect()` perform a clean disconnect followed by
-a connect with the retained options. `RDPSession.statistics` and `RDPConnectionView.statistics`
+`IronRDPSession.reconnect()` and `RDPConnectionView.reconnect()` perform a clean disconnect followed by
+a connect with the retained options. `IronRDPSession.statistics` and `RDPConnectionView.statistics`
 expose `RDPConnectionStatistics` counters for frames, frame bytes, clipboard text events, file
 counts, file bytes, session start, and last activity.
 
@@ -292,7 +292,7 @@ let stats = rdpView.statistics
 let diagnostics = rdpView.shutdown()
 ```
 
-`RDPConnectionView` owns the `RDPSession`, renders frames through an AppKit layer-backed view, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
+`RDPConnectionView` owns an `IronRDPSession`, renders frames through an AppKit layer-backed view, forwards mouse and keyboard input, polls `NSPasteboard`, supports Finder drag/drop, and sends dynamic desktop resize updates. Use `RDPConnectionViewDelegate` if the host app needs logs, connection state, or remote clipboard notifications.
 
 `redirectedFolderPath` mounts one macOS folder into the remote session using the provided
 `redirectedFolderName` share name. Leave it `nil` to disable local folder mounting.
