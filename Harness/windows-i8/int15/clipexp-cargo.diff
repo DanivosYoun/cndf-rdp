@@ -1,0 +1,20 @@
+diff --git a/crates/ironrdp/Cargo.toml b/crates/ironrdp/Cargo.toml
+index 9c02e9ec..995ba29a 100644
+--- a/crates/ironrdp/Cargo.toml
++++ b/crates/ironrdp/Cargo.toml
+@@ -103,7 +103,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+ tokio-rustls = "0.26"
+ rand = "0.9"
+-opus2 = "0.4"
+ 
+ [package.metadata.docs.rs]
+ cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+@@ -121,3 +120,7 @@ required-features = ["cliprdr", "connector", "rdpsnd", "server"]
+ 
+ [lints]
+ workspace = true
++
++[[example]]
++name = "clipexp"
++required-features = ["cliprdr", "connector", "session", "graphics", "svc", "pdu"]

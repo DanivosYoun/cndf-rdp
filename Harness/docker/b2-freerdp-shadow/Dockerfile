@@ -1,6 +1,7 @@
 # B2: FreeRDP 3.33.1 shadow server on Xvfb, an independent RDP server implementation
 # (design D7 H-B2). NTLM NLA through a SAM file, GFX (Progressive / AVC444 via ffmpeg),
 # and a Tk probe window whose square changes colour on every key press (input->display).
+# x11-apps provides xwd for the M4 reference screen capture (Harness/docker/m4).
 FROM debian:13 AS build
 ARG FREERDP_TAG=3.33.1
 ARG FREERDP_COMMIT=65bcca1913a28cbdd7eb913599f692bd2b707991
@@ -32,7 +33,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       libx11-6 libxext6 libxfixes3 libxdamage1 libxtst6 libxinerama1 libxrandr2 libxkbfile1 \
       libxcursor1 libxi6 libxrender1 libxv1 \
       libavcodec61 libavutil59 libswscale8 libswresample5 \
-      xvfb python3-tk procps \
+      xvfb python3-tk procps x11-apps \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/freerdp /opt/freerdp
 ENV LD_LIBRARY_PATH=/opt/freerdp/lib PATH=/opt/freerdp/bin:$PATH

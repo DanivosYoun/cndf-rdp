@@ -1,0 +1,50 @@
+{
+  "name": "m4-b3-login-ok",
+  "runs": [
+    {
+      "id": "m4-b3-login-ok",
+      "host": "127.0.0.1",
+      "port": 33902,
+      "username": "harness",
+      "passwordEnv": "HARNESS_B3GFX_PASS",
+      "repeat": 1,
+      "graphicsMode": "auto",
+      "networkAutoDetect": false,
+      "logLevel": "trace",
+      "window": {
+        "width": 1280,
+        "height": 720
+      },
+      "steps": [
+        {
+          "op": "connect"
+        },
+        {
+          "op": "waitConnected",
+          "timeout": 30
+        },
+        {
+          "op": "waitFirstFrame",
+          "timeout": 30
+        },
+        {
+          "op": "waitLogin",
+          "timeout": 30,
+          "text": "ok"
+        },
+        {
+          "op": "idle",
+          "seconds": 3
+        },
+        {
+          "op": "shutdown"
+        }
+      ],
+      "expect": {
+        "connected": true,
+        "firstFrame": true,
+        "maxShutdownMs": 1000
+      }
+    }
+  ]
+}
