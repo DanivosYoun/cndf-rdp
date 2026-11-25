@@ -12,5 +12,5 @@ ssh -o BatchMode=yes $MAC "set -euo pipefail; export PATH=\$HOME/.cargo/bin:/opt
   date '+start %H:%M:%S'
   [[ -f Vendor/IronRDP/install/lib/libcndf_ironrdp.a ]] || bash Scripts/build-ironrdp.sh --features legacy-tls > \$M/$tree-ironrdp-build.log 2>&1
   date '+ironrdp %H:%M:%S'
-  swift build -c release --product rdp-engine-harness -Xswiftc -enable-testing $extra 2>&1 | tail -5
+  swift build --build-system native -c release --product rdp-engine-harness -Xswiftc -enable-testing $extra 2>&1 | tail -5
   date '+swift %H:%M:%S'"
