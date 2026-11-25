@@ -3,7 +3,7 @@
 # the attacks needs none of the fork's client patches). cargo-lock.patch only adds this
 # crate's own entry to the workspace lock, so the build stays --locked.
 FROM rust:1.94.1-bookworm AS build
-ARG IRONRDP_COMMIT=15b4a03ff552b80463287495ff940de3c1989807
+ARG IRONRDP_COMMIT=293cb4bee90baddfd7b8ea08d2f46e31947a3888
 RUN git init -q /src && cd /src \
  && git remote add origin https://github.com/Devolutions/IronRDP.git \
  && git fetch -q --depth 1 origin "${IRONRDP_COMMIT}" \

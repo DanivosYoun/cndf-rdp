@@ -1,7 +1,7 @@
 # B1: IronRDP examples/server (hybrid = TLS + CredSSP/NLA), pinned to the commit the
 # cndf-ironrdp crate uses (design D1). Certificates are mounted at run time (/certs).
 FROM rust:1.94.1-bookworm AS build
-ARG IRONRDP_COMMIT=15b4a03ff552b80463287495ff940de3c1989807
+ARG IRONRDP_COMMIT=293cb4bee90baddfd7b8ea08d2f46e31947a3888
 # libopus_sys (rdpsnd in the example) builds bundled opus with cmake.
 RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 RUN git init -q /src && cd /src \
