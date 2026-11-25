@@ -172,9 +172,6 @@ impl TlsUpgrader for LegacyTlsUpgrader {
                 negotiated.version.as_deref().unwrap_or("unknown"),
                 negotiated.cipher_suite.as_deref().unwrap_or("unknown"),
             );
-            if negotiated.version.as_deref() == Some("TLSv1.2") {
-                tracing::info!(target: TLS_LOG_TARGET, "RDP legacy TLS may be unnecessary for this server");
-            }
             // Judge before returning: the connector sends CredSSP right after this future ends.
             let der: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
             ironrdp_tls::verify_certificate_chain(&der, &server_name, &endpoint, callback)?;

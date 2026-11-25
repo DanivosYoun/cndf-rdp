@@ -33,12 +33,15 @@ pub(super) const TLS_PROTOCOL_VERSION: u32 = 0x4952000B;
 
 #[cfg(feature = "legacy-tls")]
 #[derive(Debug)]
-struct RetryableHandshake(std::io::Error);
+struct RetryableHandshake {
+    error: std::io::Error,
+    reason: &'static str,
+}
 
 #[cfg(feature = "legacy-tls")]
 impl std::fmt::Display for RetryableHandshake {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.error.fmt(f)
     }
 }
 
@@ -50,53 +53,54 @@ pub(super) fn mark_legacy_retry(error: std::io::Error, received: usize) -> std::
     use rustls::{AlertDescription, Error as TlsError, PeerIncompatible};
     use std::io::ErrorKind;
 
-    let retry = match error
+    let reason = match error
         .get_ref()
         .and_then(|source| source.downcast_ref::<TlsError>())
     {
         // This rustls error is raised while processing the initial ServerHello.
-        Some(TlsError::PeerIncompatible(PeerIncompatible::ServerDoesNotSupportTls12Or13)) => true,
-        // A plaintext alert occupies one five-byte header and a two-byte payload.
-        Some(TlsError::AlertReceived(
-            AlertDescription::ProtocolVersion
-            | AlertDescription::HandshakeFailure
-            | AlertDescription::InsufficientSecurity,
-        )) => received == 7,
-        // Win2019 can reset the connection without sending any TLS records.
-        None => {
-            received == 0
-                && matches!(
-                    error.kind(),
-                    ErrorKind::UnexpectedEof
-                        | ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                )
+        Some(TlsError::PeerIncompatible(PeerIncompatible::ServerDoesNotSupportTls12Or13)) => {
+            Some("ServerDoesNotSupportTls12Or13")
         }
-        _ => false,
+        // A plaintext alert occupies one five-byte header and a two-byte payload.
+        Some(TlsError::AlertReceived(alert)) if received == 7 => match alert {
+            AlertDescription::ProtocolVersion => Some("ProtocolVersion"),
+            AlertDescription::HandshakeFailure => Some("HandshakeFailure"),
+            AlertDescription::InsufficientSecurity => Some("InsufficientSecurity"),
+            _ => None,
+        },
+        // Win2019 can reset the connection without sending any TLS records.
+        None if received == 0 => match error.kind() {
+            ErrorKind::UnexpectedEof => Some("UnexpectedEof received=0"),
+            ErrorKind::ConnectionReset => Some("ConnectionReset received=0"),
+            ErrorKind::ConnectionAborted => Some("ConnectionAborted received=0"),
+            _ => None,
+        },
+        _ => None,
     };
-    if retry {
-        std::io::Error::new(error.kind(), RetryableHandshake(error))
-    } else {
-        error
+    match reason {
+        Some(reason) => std::io::Error::new(error.kind(), RetryableHandshake { error, reason }),
+        None => error,
     }
 }
 
 #[cfg(feature = "legacy-tls")]
-pub(super) fn retries_with_legacy(error: &ConnectorError, failure: &Failure) -> bool {
-    failure.0 == CNDF_IRON_FAILURE_TLS
-        && error
-            .source()
-            .and_then(|source| source.downcast_ref::<std::io::Error>())
-            .and_then(std::io::Error::get_ref)
-            .is_some_and(|source| source.is::<RetryableHandshake>())
+pub(super) fn legacy_retry_reason(error: &ConnectorError, failure: &Failure) -> Option<&'static str> {
+    if failure.0 != CNDF_IRON_FAILURE_TLS {
+        return None;
+    }
+    error
+        .source()
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::get_ref)
+        .and_then(|source| source.downcast_ref::<RetryableHandshake>())
+        .map(|retry| retry.reason)
 }
 
 #[cfg(feature = "legacy-tls")]
 impl Failure {
     pub(super) fn after_legacy_retry(mut self, legacy: Self) -> Self {
         match legacy.0 {
-            CNDF_IRON_FAILURE_CERTIFICATE | CNDF_IRON_FAILURE_AUTHENTICATION => legacy,
-            _ => {
+            CNDF_IRON_FAILURE_TLS => {
                 self.3 = if self.1 == TLS_PROTOCOL_VERSION {
                     "TLS protocol negotiation failed. IronRDP legacy TLS connection failed."
                 } else {
@@ -104,6 +108,7 @@ impl Failure {
                 };
                 self
             }
+            _ => legacy,
         }
     }
 }
@@ -253,7 +258,7 @@ pub(super) fn classify(error: &ConnectorError, rejected: bool) -> Failure {
             .and_then(|io| io.get_ref());
         #[cfg(feature = "legacy-tls")]
         let source = match source.and_then(|source| source.downcast_ref::<RetryableHandshake>()) {
-            Some(retry) => retry.0.get_ref(),
+            Some(retry) => retry.error.get_ref(),
             None => source,
         };
         #[cfg(feature = "legacy-tls")]
@@ -389,8 +394,8 @@ mod tests {
                     .with_source(mark_legacy_retry(source, received));
                 let failure = classify(&error, false);
                 assert_eq!(failure.1, code);
-                assert_eq!(retries_with_legacy(&error, &failure), received == 7);
-                assert!(!retries_with_legacy(&error, &classify(&error, true)));
+                assert_eq!(legacy_retry_reason(&error, &failure).is_some(), received == 7);
+                assert!(!legacy_retry_reason(&error, &classify(&error, true)).is_some());
             }
         }
 
@@ -399,14 +404,14 @@ mod tests {
         ));
         let error = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
             .with_source(mark_legacy_retry(source, 128));
-        assert!(retries_with_legacy(&error, &classify(&error, false)));
+        assert!(legacy_retry_reason(&error, &classify(&error, false)).is_some());
 
         let source = std::io::Error::other(TlsError::InvalidCertificate(
             rustls::CertificateError::UnknownIssuer,
         ));
         let error = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
             .with_source(mark_legacy_retry(source, 128));
-        assert!(!retries_with_legacy(&error, &classify(&error, false)));
+        assert!(!legacy_retry_reason(&error, &classify(&error, false)).is_some());
     }
 
     #[cfg(feature = "legacy-tls")]
@@ -427,35 +432,38 @@ mod tests {
                 .with_source(mark_legacy_retry(kind.into(), received));
             let failure = classify(&error, false);
             assert_eq!(failure.1, 0x49520006);
-            assert_eq!(retries_with_legacy(&error, &failure), retry, "{kind:?}");
+            assert_eq!(legacy_retry_reason(&error, &failure).is_some(), retry, "{kind:?}");
         }
         for context in ["TCP connect", "Negotiate security", "CredSSP"] {
             let error = ConnectorError::new(context, ConnectorErrorKind::General)
                 .with_source(std::io::Error::from(UnexpectedEof));
-            assert!(!retries_with_legacy(&error, &classify(&error, false)));
+            assert!(!legacy_retry_reason(&error, &classify(&error, false)).is_some());
         }
     }
 
     #[cfg(feature = "legacy-tls")]
     #[test]
-    fn preserves_initial_tls_code_if_legacy_cannot_connect() {
-        let initial = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
-            .with_source(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-        let retry = ConnectorError::new("TCP connect", ConnectorErrorKind::General);
-        let failure = classify(&initial, false).after_legacy_retry(classify(&retry, false));
-        assert_eq!(failure.1, 0x49520006);
-        assert!(failure.3.contains("IronRDP legacy TLS connection failed."));
-
-        let rejection = classify(&retry, true);
-        let authentication = ConnectorError::new("CredSSP", ConnectorErrorKind::AccessDenied);
-        assert_eq!(
-            classify(&initial, false).after_legacy_retry(classify(&retry, true)),
-            rejection
-        );
-        assert_eq!(
-            classify(&initial, false).after_legacy_retry(classify(&authentication, false)),
-            classify(&authentication, false),
-        );
+    fn preserves_initial_tls_code_only_if_legacy_tls_fails() {
+        for source in [
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            std::io::Error::other(rustls::Error::AlertReceived(
+                rustls::AlertDescription::ProtocolVersion,
+            )),
+        ] {
+            let initial = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
+                .with_source(source);
+            let retry_tls = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General);
+            let retry_tcp = ConnectorError::new("TCP connect", ConnectorErrorKind::General);
+            let retry_auth = ConnectorError::new("CredSSP", ConnectorErrorKind::AccessDenied);
+            let expected_code = classify(&initial, false).1;
+            let failure = classify(&initial, false).after_legacy_retry(classify(&retry_tls, false));
+            assert_eq!(failure.1, expected_code);
+            assert!(failure.3.contains("IronRDP legacy TLS connection failed."));
+            for (error, rejected) in [(&retry_tcp, false), (&retry_tls, true), (&retry_auth, false)] {
+                let failure = classify(&initial, false).after_legacy_retry(classify(error, rejected));
+                assert_eq!(failure, classify(error, rejected));
+            }
+        }
     }
 
     #[test]

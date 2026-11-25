@@ -604,8 +604,10 @@ async fn forward(
                         if connection.stop.load(Ordering::Acquire) { continue; }
                         let failure = errors::classify(&error, rejected.load(Ordering::Acquire));
                         #[cfg(feature = "legacy-tls")]
-                        if errors::retries_with_legacy(&error, &failure) {
+                        if let Some(reason) = errors::legacy_retry_reason(&error, &failure) {
                             if let Some(config) = retry_config.take() {
+                                log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+                                    &format!("Retrying IronRDP with legacy TLS: {reason} [0x{:08X}].", failure.1));
                                 return Some((config, failure));
                             }
                         }
@@ -618,7 +620,8 @@ async fn forward(
                         #[cfg(feature = "legacy-tls")]
                         let failure = if let Some(initial) = initial_failure.take() {
                             log(connection, minimum, CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
-                                "IronRDP legacy TLS connection failed.");
+                                &format!("IronRDP connection failed on legacy TLS retry: {} [0x{:08X}].",
+                                    failure.3, failure.1));
                             initial.after_legacy_retry(failure)
                         } else {
                             failure
@@ -933,6 +936,205 @@ mod tests {
         let message = unsafe { std::slice::from_raw_parts(bytes, len) };
         let messages = unsafe { &mut *context.cast::<Vec<String>>() };
         messages.push(String::from_utf8_lossy(message).into_owned());
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    async fn forward_failure(
+        error: ironrdp_connector::ConnectorError,
+        retry_config: Option<Config>,
+        initial_failure: Option<Failure>,
+    ) -> (Option<(Config, Failure)>, Option<Failure>, Vec<String>) {
+        let mut messages = Vec::new();
+        let connection = logging_connection(&mut messages);
+        connection.connected.store(false, Ordering::Relaxed);
+        let (_commands, commands) = mpsc::channel();
+        let (sender, receiver) = output_channel(1);
+        let (input, _input_events) = ironrdp_client::rdp::RdpInputSender::channel(1);
+        let (output, mut updates) = async_channel::channel(1);
+        sender
+            .send(RdpOutputEvent::ConnectionFailure(error))
+            .await
+            .unwrap();
+        drop(sender);
+        let retry = forward(
+            &connection,
+            &input,
+            &commands,
+            receiver,
+            &output,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+            retry_config,
+            initial_failure,
+        )
+        .await;
+        let failure = match updates.try_recv() {
+            Ok(Output::Failure(failure)) => Some(failure),
+            Err(async_channel::error::TryRecvError::Empty) => None,
+            _ => panic!("unexpected bridge output"),
+        };
+        (retry, failure, messages)
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    fn modern_tls_failure() -> Failure {
+        use ironrdp_connector::{ConnectorError, ConnectorErrorKind};
+        errors::classify(
+            &ConnectorError::new("TLS upgrade", ConnectorErrorKind::General),
+            false,
+        )
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    #[tokio::test]
+    async fn legacy_retry_preserves_framebuffer_failure() {
+        use ironrdp_connector::{ConnectorError, ConnectorErrorKind};
+        use ironrdp_pdu::desktop_framebuffer::DesktopFramebufferError;
+        let error = ConnectorError::new("prepare desktop framebuffer", ConnectorErrorKind::General)
+            .with_source(DesktopFramebufferError::Dimensions);
+        let expected = errors::classify(&error, false);
+        let (retry, failure, _) = forward_failure(error, None, Some(modern_tls_failure())).await;
+        assert!(retry.is_none());
+        assert_eq!(failure, Some(expected));
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    #[tokio::test]
+    async fn legacy_retry_preserves_rdp_negotiation_failure() {
+        use ironrdp_connector::{ConnectorError, ConnectorErrorKind};
+        for context in ["MCS Connect Response", "Negotiate security"] {
+            let error = ConnectorError::new(context, ConnectorErrorKind::General);
+            let expected = errors::classify(&error, false);
+            let (_, failure, _) = forward_failure(error, None, Some(modern_tls_failure())).await;
+            assert_eq!(failure, Some(expected), "{context}");
+        }
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    #[tokio::test]
+    async fn legacy_retry_preserves_credssp_failure() {
+        use ironrdp_connector::{sspi, ConnectorError, ConnectorErrorKind};
+        let mut cause = sspi::Error::new(sspi::ErrorKind::InternalError, "private source sentinel");
+        cause.nstatus = Some(sspi::credssp::NStatusCode(0xC0000234));
+        let error = ConnectorError::new("CredSSP", ConnectorErrorKind::Credssp(cause));
+        let expected = errors::classify(&error, false);
+        let (_, failure, messages) = forward_failure(error, None, Some(modern_tls_failure())).await;
+        assert_eq!(failure, Some(expected));
+        assert!(!messages.join("\n").contains("private source sentinel"));
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    #[tokio::test]
+    async fn legacy_retry_logs_actual_failure_code() {
+        use ironrdp_connector::{ConnectorError, ConnectorErrorKind};
+        let openssl = openssl::x509::X509::from_pem(b"invalid certificate").unwrap_err();
+        let errors = [
+            (
+                ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
+                    .with_source(std::io::Error::other(openssl)),
+                "0x4952000D",
+            ),
+            (
+                ConnectorError::new("TCP connect", ConnectorErrorKind::General)
+                    .with_source(std::io::Error::other("private source sentinel")),
+                "0x49520005",
+            ),
+        ];
+        for (error, code) in errors {
+            let (_, _, messages) = forward_failure(error, None, Some(modern_tls_failure())).await;
+            let messages = messages.join("\n");
+            assert!(messages.contains(code), "{messages}");
+            assert!(!messages.contains("private source sentinel"));
+        }
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    #[tokio::test]
+    async fn legacy_retry_logs_why_the_modern_handshake_failed() {
+        use ironrdp_connector::{ConnectorError, ConnectorErrorKind};
+        use rustls::{AlertDescription, Error as TlsError, PeerIncompatible};
+        let config = ConfigBuilder::new()
+            .with_destination(Destination::from_parts("localhost", 3389))
+            .with_client_build(420)
+            .with_client_dir("")
+            .with_platform(ironrdp_pdu::rdp::capability_sets::MajorPlatformType::OSX)
+            .with_client_name("test")
+            .with_username("user")
+            .with_password("password")
+            .build()
+            .unwrap();
+        for (source, received, reason) in [
+            (
+                std::io::ErrorKind::ConnectionReset.into(),
+                0,
+                "ConnectionReset received=0",
+            ),
+            (
+                std::io::Error::other(TlsError::AlertReceived(AlertDescription::HandshakeFailure)),
+                7,
+                "HandshakeFailure",
+            ),
+            (
+                std::io::Error::other(TlsError::PeerIncompatible(
+                    PeerIncompatible::ServerDoesNotSupportTls12Or13,
+                )),
+                128,
+                "ServerDoesNotSupportTls12Or13",
+            ),
+        ] {
+            let error = ConnectorError::new("TLS upgrade", ConnectorErrorKind::General)
+                .with_source(errors::mark_legacy_retry(source, received));
+            let (retry, failure, messages) = forward_failure(error, Some(config.clone()), None).await;
+            assert!(retry.is_some());
+            assert!(failure.is_none());
+            assert!(messages.join("\n").contains(reason), "{messages:?}");
+        }
+    }
+
+    #[cfg(feature = "legacy-tls")]
+    #[tokio::test]
+    async fn legacy_tls_12_logs_the_cipher_without_an_unnecessary_hint() {
+        use ironrdp_client::config::TlsUpgrader as _;
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVersion};
+        let mut peer = SslContextBuilder::new(SslMethod::tls_server()).unwrap();
+        peer.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        peer.set_cipher_list("AES256-SHA256").unwrap();
+        let certificate = openssl::x509::X509::from_der(include_bytes!("../tests/data/tls/peer-cert.der"))
+            .unwrap();
+        let key = openssl::pkey::PKey::private_key_from_der(include_bytes!("../tests/data/tls/peer-key.der"))
+            .unwrap();
+        peer.set_certificate(&certificate).unwrap();
+        peer.set_private_key(&key).unwrap();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let mut server = tokio_openssl::SslStream::new(Ssl::new(&peer.build()).unwrap(), server).unwrap();
+        let mut messages = Vec::new();
+        let connection = logging_connection(&mut messages);
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(Logs {
+            connection,
+            minimum: CNDFIronLogLevel::CNDF_IRON_LOG_INFO,
+            repeats: Arc::default(),
+        }));
+        let upgrader = crate::legacy_tls::LegacyTlsUpgrader {
+            callback: Arc::new(|_, _, _| true),
+        };
+        let (client, server) = tokio::time::timeout(
+            Duration::from_secs(5),
+            async {
+                tokio::join!(
+                    upgrader.upgrade(Box::new(client), "localhost".into(), "localhost:3389".into()),
+                    std::pin::Pin::new(&mut server).accept(),
+                )
+            },
+        )
+        .await
+        .unwrap();
+        server.unwrap();
+        client.unwrap();
+        assert!(messages.iter().any(|line| {
+            line.contains("profile=legacy version=TLSv1.2 cipher=AES256-SHA256")
+        }));
+        assert!(!messages.iter().any(|line| line.contains("may be unnecessary")));
     }
 
     #[test]
